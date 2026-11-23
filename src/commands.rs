@@ -1196,45 +1196,15 @@ fn cmd_step(
         isolated: true,
         program: std::path::PathBuf::new(),
         dest: None,
+        in_tree: false,
     })
 }
-/// Where a deploy's checks run, and how the plan names that place. When HEAD has the
-/// deployed commit's tree, that is this checkout; otherwise a detached checkout of the
-/// commit at `.edition/check-tree`, made afresh for every plan so nothing a previous
-/// check left there carries over. Its path is fixed, so the dry run and the apply hash
-/// to the same plan.
-fn check_tree(c: &Ctx, commit: &str) -> Result<(std::path::PathBuf, String), String> {
-    let root = &c.l.root;
-    let want = c.git.tree(commit).ok_or_else(|| format!("cannot read the tree of {}", short(commit)))?;
-    let head = c.git.resolve("HEAD");
-    if head.as_deref().and_then(|h| c.git.tree(h)).as_deref() == Some(want.as_str()) {
-        let at = head.as_deref().map(short).unwrap_or_default();
-        return Ok((root.clone(), format!("this checkout (HEAD {at} has the tree of {})", short(commit))));
-    }
-    let state = root.join(".edition");
-    crate::steps::ensure_private_dir(&state)?;
-    let ignore = state.join(".gitignore");
-    if std::fs::symlink_metadata(&ignore).is_err() {
-        let _ = std::fs::write(&ignore, "*\n");
-    }
-    let dir = state.join("check-tree");
-    let path = dir.to_str().ok_or("the repository path is not UTF-8")?;
-    if std::fs::symlink_metadata(&dir).is_ok() {
-        c.git.run(&["worktree", "remove", "--force", "--force", path]).map_err(|e| {
-            format!("{} is in the way and is not Edition's check checkout ({e}); remove it", dir.display())
-        })?;
-    }
-    let _ = c.git.run(&["worktree", "prune"]);
-    c.git.run(&["worktree", "add", "--quiet", "--detach", "--force", path, commit])?;
-    let at = head.as_deref().map(short).unwrap_or("no commit");
-    Ok((
-        dir.clone(),
-        format!(
-            "a checkout of {} at {}, not this checkout (HEAD {at} has a different tree)",
-            short(commit),
-            dir.strip_prefix(root).unwrap_or(&dir).display()
-        ),
-    ))
+/// The build label a registry channel takes from its version: only a well-formed final
+/// version (`1.4.0`, never `abc`, `01.2.3`, `1.2.3.4` or `1.4.0-rc.1`) qualifies.
+pub fn registry_build(version: &str) -> Option<String> {
+    let v = Version::parse(version).ok().filter(Version::is_final)?;
+    let label = v.to_string();
+    (label == version && valid_build(&label)).then_some(label)
 }
 
 /// A platform's build number at a commit, from its configured build file.
@@ -1321,7 +1291,7 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
     // A library published to a registry has no build number of its own: its version is
     // the build, unless --build or a build file says otherwise.
     if build.is_none() && ch.is_registry() && !dev {
-        if let Some(v) = verdict.version.clone().filter(|v| valid_build(v)) {
+        if let Some(v) = verdict.version.as_deref().and_then(registry_build) {
             verdict.notes.push(format!("build: {v} (a registry channel's build is its version)"));
             build = Some(v);
         }
@@ -1414,30 +1384,48 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
     for p in &pins {
         plan.fact("pin", &format!("{}={}", p.name, p.commit.clone().unwrap_or_default()));
     }
-    // Checks run on the deployed commit's tree: in this checkout when it has that tree,
-    // else in a detached checkout of the commit that Edition makes for them.
+    // Checks run on the deployed commit's tree, never on this checkout: Edition writes
+    // that tree into a directory of its own once the receipt is spent (see `checktree`).
     let has_command_checks = ch.checks.iter().any(|n| l.cfg.checks.get(n).is_some_and(|ck| ck.kind == "command"));
-    let (check_dir, check_place) = if has_command_checks {
-        match check_tree(c, &commit) {
-            Ok((dir, place)) => {
-                plan.fact("checks-tree", &c.git.tree(&commit).unwrap_or_default());
-                plan.fact("checks-cwd", &dir.display().to_string());
-                (dir, Some(place))
-            }
-            Err(e) => return refuse(&[format!("channel {channel}: {e}")]),
-        }
+    let tree_entries = if has_command_checks {
+        let Some(tree) = c.git.tree(&commit) else {
+            return refuse(&[format!("cannot read the tree of {}", short(&commit))]);
+        };
+        let entries = match crate::checktree::list(&c.git, &tree) {
+            Ok(e) => e,
+            Err(e) => return refuse(&[format!("channel {channel}: the checks cannot run on {}: {e}", short(&commit))]),
+        };
+        plan.fact("checks-tree", &tree);
+        plan.fact("checks-method", crate::checktree::METHOD);
+        plan.check_tree = Some(steps::CheckTree { commit: commit.clone(), tree });
+        Some(entries)
     } else {
-        (l.root.clone(), None)
+        None
     };
     let built: Result<Vec<Step>, String> = (|| {
         let mut steps = Vec::new();
-        if let Some(place) = &check_place {
-            steps.push(Step::note(&format!("the checks run on the tree of {} in {place}", short(&commit))));
+        if let Some(ct) = &plan.check_tree {
+            steps.push(Step::note(&format!(
+                "the checks run on the tree of {} ({}), written by Edition into {}/<receipt> after the receipt is spent; not on this checkout, and without its untracked or ignored files, git metadata, submodules or filters",
+                short(&commit),
+                short(&ct.tree),
+                crate::checktree::DIR
+            )));
         }
         for name in &ch.checks {
             if let Some(ck) = l.cfg.checks.get(name).filter(|ck| ck.kind == "command") {
                 let mut s = cmd_step(c, Kind::Check, &format!("check {name}"), &ck.run, &ck.env, &vals)?;
-                s.cwd = check_dir.clone();
+                s.in_tree = true;
+                let prog = s.argv.first().cloned().unwrap_or_default();
+                if prog.contains('/') && !std::path::Path::new(&prog).is_absolute() {
+                    let ok = tree_entries.as_ref().is_some_and(|e| crate::checktree::is_executable(e, &prog));
+                    if !ok {
+                        return Err(format!(
+                            "check {name}: {prog} is not an executable file in the tree of {}",
+                            short(&commit)
+                        ));
+                    }
+                }
                 steps.push(s);
             }
         }
@@ -1463,7 +1451,8 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
         }
         steps.push(run);
         if !ch.probe.is_empty() {
-            steps.push(cmd_step(c, Kind::After, "probe", &ch.probe, ch.probe_env(), &vals)?);
+            let what = if ch.probe_shares_env() { "probe (with the channel's env)" } else { "probe" };
+            steps.push(cmd_step(c, Kind::After, what, &ch.probe, &ch.probe_env(), &vals)?);
         }
         Ok(steps)
     })();

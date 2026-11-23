@@ -9,6 +9,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Receives each blob from `Git::cat_blobs`: `(object id, raw bytes)`.
+pub type BlobSink<'a> = dyn FnMut(&str, &[u8]) -> Result<(), String> + 'a;
+
 /// `(name, commit)` pairs.
 pub type Refs = Vec<(String, String)>;
 
@@ -169,6 +172,72 @@ impl Git {
                 String::from_utf8_lossy(&out.stderr).trim()
             )))
         }
+    }
+
+    /// Raw stdout of a read-only command that must never fetch a missing object.
+    pub fn run_bytes(&self, args: &[&str]) -> Result<Vec<u8>, String> {
+        let out =
+            self.command(args).env("GIT_NO_LAZY_FETCH", "1").output().map_err(|e| format!("cannot run git: {e}"))?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(crate::util::redact(&format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
+    }
+
+    /// Streams the raw bytes of each blob, in order, through `each(oid, bytes)`, with
+    /// `git cat-file --batch`: no filters or conversions, and never a lazy fetch.
+    pub fn cat_blobs(&self, oids: &[String], each: &mut BlobSink<'_>) -> Result<(), String> {
+        use std::io::{BufRead, Read, Write};
+        use std::process::Stdio;
+        if oids.is_empty() {
+            return Ok(());
+        }
+        if let Some(bad) = oids.iter().find(|o| !crate::util::valid_commit(o)) {
+            return Err(format!("{bad:?} is not an object id"));
+        }
+        let mut child = self
+            .command(&["cat-file", "--batch"])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot run git: {e}"))?;
+        let mut stdin = child.stdin.take().ok_or("no stdin for git cat-file")?;
+        let input: String = oids.iter().map(|o| format!("{o}\n")).collect();
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let mut out = std::io::BufReader::new(child.stdout.take().ok_or("no stdout for git cat-file")?);
+        let mut result = Ok(());
+        for want in oids {
+            let mut header = String::new();
+            if out.read_line(&mut header).map_err(|e| e.to_string())? == 0 {
+                result = Err("git cat-file ended early".to_string());
+                break;
+            }
+            let parts: Vec<&str> = header.trim_end().split(' ').collect();
+            let [oid, "blob", size] = parts.as_slice() else {
+                result = Err(format!("object {want} is not a blob here ({})", header.trim_end()));
+                break;
+            };
+            let size: usize = size.parse().map_err(|_| "unexpected git cat-file output".to_string())?;
+            let mut data = vec![0u8; size];
+            out.read_exact(&mut data).map_err(|e| e.to_string())?;
+            let mut nl = [0u8; 1];
+            out.read_exact(&mut nl).map_err(|e| e.to_string())?;
+            if let Err(e) = each(oid, &data) {
+                result = Err(e);
+                break;
+            }
+        }
+        drop(out);
+        let _ = writer.join();
+        let _ = child.wait();
+        result
     }
 
     pub fn ok(&self, args: &[&str]) -> bool {

@@ -212,9 +212,11 @@ remote tip is enough.
   environment**: `PATH` (from `[run] path`, or `/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`),
   `HOME`, `LANG`, `TMPDIR`, and the variables the channel or check declares in `env`.
   Nothing else is inherited, so a script that needs a credential must declare the
-  variable (for example `env = { DEPLOY_TOKEN = "{var.deploy_token}" }`). A channel's
-  probe gets the channel's `env` too, so a probe can read a private registry with the
-  same credential; `probe_env` gives it its own instead (`probe_env = {}` for none). The
+  variable (for example `env = { DEPLOY_TOKEN = "{var.deploy_token}" }`). A probe
+  gets no declared variables unless the channel says so: `probe_env = { NAME = "..." }`
+  gives it its own, and `probe_env = "channel"` gives it the channel's `env` (for a probe
+  that reads a private registry with the deploy credential; the plan marks such a probe
+  `probe (with the channel's env)`). The
   program is resolved to an absolute path when the plan is made, and that path is part of
   the plan hash.
 
@@ -318,12 +320,23 @@ are three kinds of gate:
 
 - **Command checks** (`[checks.NAME] run = [...]`): a test suite, a release-candidate
   gate script. The exit code is the evidence. Checks run on the tree of the commit being
-  deployed, never on whatever this checkout holds: when HEAD has that tree they run here;
-  otherwise Edition checks the commit out, detached, at `.edition/check-tree` (afresh for
-  every plan, dry run included) and runs them there. The plan says which, in a note
-  before the checks and in each check's `cd`. A check that needs installed dependencies
-  (`node_modules`, a build cache) should install them itself, or run the deploy from a
-  branch at the tagged commit.
+  deployed, never in this checkout, even when HEAD has that tree: untracked and ignored
+  files there cannot change the result. The tree is bound in the plan, with the method
+  that writes it, and written only under `--apply`, once the receipt is spent (a dry run
+  writes nothing), into `.edition/checks/<receipt>`. Edition writes the files itself from
+  `git ls-tree -r` and the raw blobs of `git cat-file --batch`, with `GIT_NO_LAZY_FETCH=1`.
+  So no checkout happens, and no filter, `.gitattributes` conversion, hook, submodule,
+  LFS download or lazy fetch runs (`git archive` and `git worktree add` both run smudge
+  filters). The directory has no git metadata; a submodule's place is an empty directory.
+  It must not exist beforehand: a link, a leftover worktree or any other directory there
+  refuses the run and is left alone. A lock file beside it is held while the checks run.
+  The directory is compared file by file with the bound tree after it is written and
+  before the first check (exactly: nothing more), and before each later check (every
+  bound file unchanged; output an earlier check added may stay). A mismatch stops the run
+  before the deploy. The directory is removed when the run ends, failed or not; one left
+  by a killed run, with its unlocked lock file, is removed by the next run. A check that
+  needs installed dependencies (`node_modules`, a build cache) or git history must set
+  them up itself.
 - **The parity gate** (`kind = "parity"`): Edition asks Concordance
   (`concordance track --format json`) for the release that matches the version and
   refuses while any item the release carries is not ready on the platforms the release

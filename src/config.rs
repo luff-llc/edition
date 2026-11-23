@@ -156,10 +156,10 @@ pub struct Channel {
     /// A read-only command run after a successful deploy (health check).
     #[serde(default)]
     pub probe: Vec<String>,
-    /// The probe's environment. When absent the probe gets the channel's `env`, so a
-    /// probe can read a private registry with the same credential; `probe_env = {}`
-    /// runs it with none.
-    pub probe_env: Option<BTreeMap<String, String>>,
+    /// The probe's environment. When absent the probe gets nothing beyond the base
+    /// variables. A table gives it exactly those variables; `"channel"` gives it the
+    /// channel's `env` (so it can read a private registry with the deploy credential).
+    pub probe_env: Option<ProbeEnv>,
     /// Prod tier only: a pre-release tag (`-rc.N`) is acceptable here (store review builds).
     #[serde(default)]
     pub allow_prerelease: bool,
@@ -172,15 +172,36 @@ pub struct Channel {
     pub note: Option<String>,
 }
 
+/// A probe's declared environment: its own table, or `"channel"` for the channel's `env`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ProbeEnv {
+    Same(String),
+    Own(BTreeMap<String, String>),
+}
+
+/// The only string `probe_env` accepts.
+pub const PROBE_ENV_CHANNEL: &str = "channel";
+
 /// Channel kinds that publish a library package to a registry (Maven, npm, crates.io).
 /// A library has no build number of its own, so a deploy to one of these records its
 /// version as the build unless `--build` or a platform `build_file` says otherwise.
 pub const REGISTRY_KINDS: &[&str] = &["registry"];
 
 impl Channel {
-    /// The environment the probe runs with: `probe_env` when declared, else `env`.
-    pub fn probe_env(&self) -> &BTreeMap<String, String> {
-        self.probe_env.as_ref().unwrap_or(&self.env)
+    /// The environment the probe declares: none unless `probe_env` says otherwise. A
+    /// probe never inherits the deploy's credentials implicitly.
+    pub fn probe_env(&self) -> std::borrow::Cow<'_, BTreeMap<String, String>> {
+        match &self.probe_env {
+            None => std::borrow::Cow::Owned(BTreeMap::new()),
+            Some(ProbeEnv::Own(m)) => std::borrow::Cow::Borrowed(m),
+            Some(ProbeEnv::Same(_)) => std::borrow::Cow::Borrowed(&self.env),
+        }
+    }
+
+    /// True when the probe is configured to get the channel's `env`.
+    pub fn probe_shares_env(&self) -> bool {
+        matches!(&self.probe_env, Some(ProbeEnv::Same(_)))
     }
 
     pub fn is_registry(&self) -> bool {
@@ -807,7 +828,14 @@ impl Loaded {
                 errs.push(format!("channel `{name}`: names use lowercase letters, digits and hyphens"));
             }
             check_cmd(&format!("channel {name} run"), &ch.run, &ch.env, &mut errs);
-            check_cmd(&format!("channel {name} probe"), &ch.probe, ch.probe_env(), &mut errs);
+            if let Some(ProbeEnv::Same(s)) = &ch.probe_env {
+                if s != PROBE_ENV_CHANNEL {
+                    errs.push(format!(
+                        "channel {name}: probe_env is a table of variables or \"{PROBE_ENV_CHANNEL}\", not {s:?}"
+                    ));
+                }
+            }
+            check_cmd(&format!("channel {name} probe"), &ch.probe, &ch.probe_env(), &mut errs);
             if ch.allow_prerelease && !REVIEW_KINDS.contains(&ch.kind.as_str()) {
                 errs.push(format!(
                     "channel {name}: allow_prerelease is only for review or testing kinds ({}), not `{}`",

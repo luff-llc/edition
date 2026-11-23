@@ -69,6 +69,16 @@ pub struct Step {
     pub program: PathBuf,
     /// Where an outward step goes (a push URL, a repository, a channel target).
     pub dest: Option<String>,
+    /// Runs in the plan's check tree (see `checktree`), not in `cwd`: the directory is
+    /// written once the receipt is spent, and a relative program is taken from it.
+    pub in_tree: bool,
+}
+
+/// The tree a plan's checks run on: bound in the plan hash with how it is written.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CheckTree {
+    pub commit: String,
+    pub tree: String,
 }
 
 /// The `PATH` configured commands get when `edition.toml` does not set `[run] path`.
@@ -113,6 +123,7 @@ impl Step {
             isolated: false,
             program: PathBuf::new(),
             dest: None,
+            in_tree: false,
         }
     }
 
@@ -159,7 +170,12 @@ impl Step {
         let mut s = format!("  [{}] {}", self.kind.label(), self.what);
         if !self.argv.is_empty() {
             let line = self.shown.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
-            s.push_str(&format!("\n      $ (cd {} && {line})", shell_quote(&self.cwd.display().to_string())));
+            let dir = if self.in_tree {
+                format!("{}/<receipt>", crate::checktree::DIR)
+            } else {
+                shell_quote(&self.cwd.display().to_string())
+            };
+            s.push_str(&format!("\n      $ (cd {dir} && {line})"));
             if !self.env.is_empty() {
                 let names: Vec<&str> = self.env.iter().map(|(k, _)| k.as_str()).collect();
                 s.push_str(&format!("\n      env: {}", names.join(", ")));
@@ -209,6 +225,8 @@ pub struct Plan {
     pub allowed_findings: Vec<String>,
     /// The audited git configuration this plan was made with (bound through `facts`).
     pub git_config: crate::gitcfg::Chain,
+    /// The tree the `in_tree` steps run on.
+    pub check_tree: Option<CheckTree>,
 }
 
 impl Plan {
@@ -221,6 +239,12 @@ impl Plan {
     pub fn resolve(&mut self) -> Result<(), String> {
         for s in self.steps.iter_mut().filter(|s| !s.argv.is_empty()) {
             let path = self.run_path.clone();
+            // A relative program in the check tree was checked against the tree when the
+            // plan was made; it is joined to the tree's directory when it runs.
+            if s.in_tree && s.argv[0].contains('/') {
+                s.program = PathBuf::from(&s.argv[0]);
+                continue;
+            }
             s.program = resolve_program(&s.argv[0], &s.cwd, &path).map_err(|e| {
                 let hint = if self.skipped_dirs.is_empty() {
                     String::new()
@@ -290,12 +314,19 @@ impl Plan {
         if let Some((branch, url)) = &self.record_to {
             t.push_str(&format!("record {branch:?} {url:?}\n"));
         }
+        if let Some(ct) = &self.check_tree {
+            t.push_str(&format!("check-tree {} {} {:?}\n", ct.commit, ct.tree, crate::checktree::METHOD));
+        }
         for f in &self.facts {
             t.push_str(&format!("fact {f:?}\n"));
         }
         for s in self.steps.iter().filter(|s| s.kind != Kind::Note) {
             t.push_str(&format!("step {} {:?}\n", s.kind.label(), s.what));
-            t.push_str(&format!("  cwd {:?}\n", s.cwd.display().to_string()));
+            if s.in_tree {
+                t.push_str("  cwd check-tree\n");
+            } else {
+                t.push_str(&format!("  cwd {:?}\n", s.cwd.display().to_string()));
+            }
             t.push_str(&format!("  program {:?}\n", s.program.display().to_string()));
             for (k, v) in s.run_env(&self.run_path, &self.tool_env) {
                 t.push_str(&format!("  env {k:?}={v:?}\n"));
@@ -608,10 +639,59 @@ pub fn execute(
     }
     let mut outcomes = Vec::new();
     let mut stopped = None;
+    // The check tree is written only now, under --apply and after the receipt is spent.
+    let mut tree: Option<crate::checktree::Materialised> = None;
+    if let Some(ct) = &plan.check_tree {
+        let name = match &receipt {
+            Some(r) => r.clone(),
+            None => crate::util::random_hex(16)?,
+        };
+        let _ = crate::checktree::sweep(root);
+        crate::say!(
+            "> [local] write the tree of {} to {}/{name}",
+            crate::util::short(&ct.commit),
+            crate::checktree::DIR
+        );
+        match git.tree(&ct.commit).filter(|t| *t == ct.tree) {
+            None => stopped = Some(format!("{} no longer has the tree the plan was made with", ct.commit)),
+            Some(_) => match crate::checktree::materialise(git, root, &ct.tree, &name) {
+                Ok(m) => tree = Some(m),
+                Err(e) => stopped = Some(format!("the check tree was not written: {e}")),
+            },
+        }
+        if let Some(why) = &stopped {
+            crate::warn!("edition: {why}; nothing was run");
+            return Ok(Ran::Ran { outcomes, receipt, stopped });
+        }
+    }
+    let mut first_in_tree = true;
     for (i, s) in plan.steps.iter().enumerate() {
         if s.kind == Kind::Note || s.argv.is_empty() {
             continue;
         }
+        let (cwd, program) = if s.in_tree {
+            let Some(m) = &tree else {
+                stopped = Some(format!("{}: the plan has no check tree", s.what));
+                break;
+            };
+            // Exactly the bound tree before the first check; before later ones, every
+            // bound file unchanged (an earlier check may have added output).
+            if let Err(e) = m.verify(first_in_tree) {
+                let why = format!(
+                    "{}: the check tree no longer matches {} ({e}); nothing further was run",
+                    s.what,
+                    plan.check_tree.as_ref().map(|c| c.tree.as_str()).unwrap_or("")
+                );
+                crate::warn!("edition: {why}");
+                stopped = Some(why);
+                break;
+            }
+            first_in_tree = false;
+            let program = if s.program.is_relative() { m.dir.join(&s.program) } else { s.program.clone() };
+            (m.dir.clone(), program)
+        } else {
+            (s.cwd.clone(), s.program.clone())
+        };
         if s.kind == Kind::Outward {
             if let Some(why) = check_expects(git, &plan.remote, &s.expects) {
                 crate::warn!("edition: {why}");
@@ -620,8 +700,8 @@ pub fn execute(
             }
         }
         crate::say!("> [{}] {}", s.kind.label(), s.what);
-        let mut c = Command::new(&s.program);
-        c.args(&s.argv[1..]).current_dir(&s.cwd);
+        let mut c = Command::new(&program);
+        c.args(&s.argv[1..]).current_dir(&cwd);
         c.env_clear();
         c.envs(s.run_env(&plan.run_path, &plan.tool_env));
         // Edition's own git and gh output can name the remote URL: capture it and print it
@@ -659,5 +739,6 @@ pub fn execute(
             break;
         }
     }
+    drop(tree);
     Ok(Ran::Ran { outcomes, receipt, stopped })
 }

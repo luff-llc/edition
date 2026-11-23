@@ -86,9 +86,10 @@ run = ["{var.deploy_script}", "release", "{commit}"]
 env = { HOME_SITE = "production" }
 probe = ["curl", "-fsS", "https://home.example.com/healthz"]
 
-# Publishes @inkwell/core from the release tag. The probe gets the channel's env, so it
-# can read the registry with the same token (`probe_env` would give it its own). The
-# checks run on the tagged commit's tree, even from a main checkout.
+# Publishes @inkwell/core from the release tag; its build is its version, so no --build.
+# A probe gets no credentials unless it asks: `probe_env = "channel"` lends it the
+# channel's env, so it can read the registry with the same token. The checks run on the
+# tagged commit's tree, written by Edition, even from a main checkout.
 [channels.npm]
 tier = "prod"
 kind = "registry"
@@ -98,3 +99,4 @@ checks = ["test"]
 run = ["scripts/publish.sh", "npm", "{commit}"]
 env = { NPM_TOKEN = "{var.npm_token}" }
 probe = ["scripts/publish.sh", "npm", "{commit}", "--verify"]
+probe_env = "channel"
