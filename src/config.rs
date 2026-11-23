@@ -704,9 +704,11 @@ impl Loaded {
         }
         for d in &c.run.trust_group_writable {
             let canonical = std::fs::canonicalize(d).map(|p| p.display().to_string()).ok();
-            if !d.starts_with('/') || d.contains(['*', '?', '[']) || canonical.as_deref() != Some(d.as_str()) {
+            // A listed directory that does not exist on this machine is simply unused.
+            let mismatch = canonical.as_deref().is_some_and(|c| c != d);
+            if !d.starts_with('/') || d.contains(['*', '?', '[']) || mismatch {
                 errs.push(format!(
-                    "run.trust_group_writable: {d:?} must be an existing directory's exact canonical path{}",
+                    "run.trust_group_writable: {d:?} must be an exact canonical path{}",
                     canonical.map(|c| format!(" (did you mean {c:?}?)")).unwrap_or_default()
                 ));
             }
