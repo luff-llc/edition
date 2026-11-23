@@ -90,20 +90,20 @@ fn parse(args: &[String]) -> Result<Opts, String> {
 
 pub fn run(args: &[String]) -> i32 {
     if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
-        println!("{USAGE}");
+        crate::say!("{USAGE}");
         return if args.is_empty() { 2 } else { 0 };
     }
     let o = match parse(args) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("edition: {e}\n\n{USAGE}");
+            crate::warn!("edition: {e}\n\n{USAGE}");
             return 2;
         }
     };
     match dispatch(o) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("edition: {}", crate::util::redact(&e));
+            crate::warn!("edition: {}", crate::util::redact(&e));
             2
         }
     }

@@ -1,4 +1,33 @@
-//! Small helpers: UTC time, shell quoting, path expansion.
+//! Small helpers: UTC time, shell quoting, path expansion, and redacted output.
+//!
+//! Every line Edition prints goes through [`say!`] or [`warn!`], which pass the text
+//! through [`redact`], so a credential in a URL never reaches the terminal, whatever
+//! config value or error it came from. Execution always uses the raw values.
+
+/// Prints a line to standard output with URL credentials removed.
+#[macro_export]
+macro_rules! say {
+    () => { println!() };
+    ($($t:tt)*) => { println!("{}", $crate::util::redact(&format!($($t)*))) };
+}
+
+/// Prints a line to standard error with URL credentials removed.
+#[macro_export]
+macro_rules! warn {
+    ($($t:tt)*) => { eprintln!("{}", $crate::util::redact(&format!($($t)*))) };
+}
+
+/// Prints text without a newline to standard output with URL credentials removed.
+#[macro_export]
+macro_rules! say_raw {
+    ($($t:tt)*) => { print!("{}", $crate::util::redact(&format!($($t)*))) };
+}
+
+/// Prints text without a newline to standard error with URL credentials removed.
+#[macro_export]
+macro_rules! warn_raw {
+    ($($t:tt)*) => { eprint!("{}", $crate::util::redact(&format!($($t)*))) };
+}
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -215,7 +215,7 @@ impl Ctx {
                 ("by", &e.by),
             ],
         );
-        println!("recorded {} ({}) in {}", e.id, e.result, self.l.cfg.ledger);
+        crate::say!("recorded {} ({}) in {}", e.id, e.result, self.l.cfg.ledger);
         Ok(written)
     }
 
@@ -272,7 +272,7 @@ impl Ctx {
 fn refuse(problems: &[String]) -> Res {
     let problems: Vec<String> = problems.iter().map(|p| crate::util::redact(p)).collect();
     for p in &problems {
-        eprintln!("refused: {p}");
+        crate::warn!("refused: {p}");
     }
     crate::util::emit_event("refused", &[("reason", &problems.join("; "))]);
     Ok(1)
@@ -282,16 +282,16 @@ fn refuse(problems: &[String]) -> Res {
 pub fn status(c: &Ctx) -> Res {
     let l = &c.l;
     let view = c.view()?;
-    println!("Edition: {} ({})", l.cfg.product, l.root.display());
+    crate::say!("Edition: {} ({})", l.cfg.product, l.root.display());
     let main = &l.cfg.main;
     match view.branch(main) {
         Some(tip) => {
             let v = policy::agreed_version(l, &c.git, Some(tip))
                 .map(|v| v.unwrap_or_else(|| "-".into()))
                 .unwrap_or_else(|e| e);
-            println!("main   {}/{main} {} builds as {v}", l.cfg.remote, short(tip));
+            crate::say!("main   {}/{main} {} builds as {v}", l.cfg.remote, short(tip));
         }
-        None => println!("main   {}/{main} unknown (fetch first)", l.cfg.remote),
+        None => crate::say!("main   {}/{main} unknown (fetch first)", l.cfg.remote),
     }
     let mut any = false;
     for (name, tip) in &view.branches {
@@ -304,7 +304,7 @@ pub fn status(c: &Ctx) -> Res {
         let last =
             c.finals_on_line(&view, line).first().map(|(n, _)| n.clone()).unwrap_or_else(|| "no final tag".into());
         let unmerged = view.branch(main).map(|m| c.git.log_range(&format!("{m}..{tip}")).len()).unwrap_or(0);
-        println!(
+        crate::say!(
             "line   {}/{name} {} latest {last}; {}",
             l.cfg.remote,
             short(tip),
@@ -316,11 +316,11 @@ pub fn status(c: &Ctx) -> Res {
         );
     }
     if !any {
-        println!("line   none");
+        crate::say!("line   none");
     }
     let entries = ledger::load(&l.ledger_path())?;
     let current = ledger::current_by_channel(&entries);
-    println!("\nchannels:");
+    crate::say!("\nchannels:");
     for (name, ch) in &l.cfg.channels {
         let held = current
             .iter()
@@ -329,12 +329,12 @@ pub fn status(c: &Ctx) -> Res {
             .unwrap_or_else(
                 || if ch.tier == Tier::Dev { "not recorded (dev)".into() } else { "nothing recorded".into() },
             );
-        println!("  {name:<22} {:<8} {:<10} {:<40} {held}", ch.tier.name(), ch.kind, ch.target);
+        crate::say!("  {name:<22} {:<8} {:<10} {:<40} {held}", ch.tier.name(), ch.kind, ch.target);
     }
     if !l.cfg.platforms.is_empty() {
         let names: Vec<&String> = l.cfg.platforms.keys().collect();
-        println!("\nplatforms (version, build) per tier, from the ledger:");
-        println!("  {:<10} {}", "", names.iter().map(|n| format!("{n:<24}")).collect::<String>());
+        crate::say!("\nplatforms (version, build) per tier, from the ledger:");
+        crate::say!("  {:<10} {}", "", names.iter().map(|n| format!("{n:<24}")).collect::<String>());
         for tier in [Tier::Staging, Tier::Prod] {
             let cells: String = names
                 .iter()
@@ -357,13 +357,13 @@ pub fn status(c: &Ctx) -> Res {
                     format!("{cell:<24}")
                 })
                 .collect();
-            println!("  {:<10} {cells}", tier.name());
+            crate::say!("  {:<10} {cells}", tier.name());
         }
     }
     if !l.todos.is_empty() {
-        println!("\n{} open to-do marker(s) in {}:", l.todos.len(), crate::config::FILE_NAME);
+        crate::say!("\n{} open to-do marker(s) in {}:", l.todos.len(), crate::config::FILE_NAME);
         for t in &l.todos {
-            println!("  {t}");
+            crate::say!("  {t}");
         }
     }
     Ok(0)
@@ -380,19 +380,19 @@ pub fn plan(c: &Ctx, version: &str) -> Res {
     let view = c.view()?;
     let line = v.line();
     let branch = l.line_branch_name(&line);
-    println!("Release {} {v}", l.cfg.product);
+    crate::say!("Release {} {v}", l.cfg.product);
     let tip = view.branch(&branch).map(str::to_string);
     match &tip {
         Some(t) => {
             let fv = policy::agreed_version(l, &c.git, Some(t)).map(|x| x.unwrap_or_default()).unwrap_or_else(|e| e);
-            println!("  line {branch}: cut, tip {} builds as {fv}", short(t));
+            crate::say!("  line {branch}: cut, tip {} builds as {fv}", short(t));
         }
-        None => println!("  line {branch}: not cut (edition cut {line})"),
+        None => crate::say!("  line {branch}: not cut (edition cut {line})"),
     }
     let final_name = l.final_tag_name(&v.to_string());
-    println!("  final tag {final_name}: {}", if c.tag_exists(&view, &final_name) { "exists" } else { "not yet" });
+    crate::say!("  final tag {final_name}: {}", if c.tag_exists(&view, &final_name) { "exists" } else { "not yet" });
     let next = c.next_pre(&view, &v);
-    println!(
+    crate::say!(
         "  pre-release tags: {}",
         if next == 1 {
             "none".to_string()
@@ -404,12 +404,14 @@ pub fn plan(c: &Ctx, version: &str) -> Res {
         let since = c.finals_on_line(&view, &format!("{}.{}", v.major, v.minor.saturating_sub(1)));
         if let Some((prev, _)) = since.first() {
             let n = c.git.log_range(&format!("{prev}..{m}")).len();
-            println!("  {}/{} is {n} commit(s) ahead of {prev}", l.cfg.remote, l.cfg.main);
+            crate::say!("  {}/{} is {n} commit(s) ahead of {prev}", l.cfg.remote, l.cfg.main);
         }
     }
     match &l.cfg.concordance {
         None => {
-            println!("  carries: Edition keeps no feature list; no [concordance] catalog is configured for this repo")
+            crate::say!(
+                "  carries: Edition keeps no feature list; no [concordance] catalog is configured for this repo"
+            )
         }
         Some(_) => match crate::concordance::releases(l) {
             Ok(rs) => {
@@ -417,7 +419,7 @@ pub fn plan(c: &Ctx, version: &str) -> Res {
                 match rs.iter().find(|r| r.id == rid) {
                     Some(r) => {
                         let ready = r.carries.iter().filter(|x| x.ready).count();
-                        println!(
+                        crate::say!(
                             "  Concordance {rid}: {} \"{}\", {ready}/{} carried items ready, builds {:?}",
                             r.state,
                             r.title.clone().unwrap_or_default(),
@@ -425,18 +427,18 @@ pub fn plan(c: &Ctx, version: &str) -> Res {
                             r.builds
                         );
                         for x in r.carries.iter().filter(|x| !x.ready) {
-                            println!("    not ready: {}", x.id);
+                            crate::say!("    not ready: {}", x.id);
                         }
                     }
                     None => {
-                        println!("  Concordance: no release {rid} in the tracker (add it to tracker/releases.yaml)")
+                        crate::say!("  Concordance: no release {rid} in the tracker (add it to tracker/releases.yaml)")
                     }
                 }
             }
-            Err(e) => println!("  Concordance: {e}"),
+            Err(e) => crate::say!("  Concordance: {e}"),
         },
     }
-    println!("\n  channels:");
+    crate::say!("\n  channels:");
     for (name, ch) in &l.cfg.channels {
         let takes = match ch.tier {
             Tier::Dev => "any ref (local only)".to_string(),
@@ -444,15 +446,15 @@ pub fn plan(c: &Ctx, version: &str) -> Res {
             Tier::Prod if ch.allow_prerelease => format!("{final_name} or a pre-release tag of it"),
             Tier::Prod => final_name.clone(),
         };
-        println!("    {name:<22} {:<8} takes {takes}", ch.tier.name());
+        crate::say!("    {name:<22} {:<8} takes {takes}", ch.tier.name());
     }
-    println!("\n  steps:");
+    crate::say!("\n  steps:");
     if tip.is_none() {
-        println!("    edition cut {line}");
+        crate::say!("    edition cut {line}");
     }
-    println!("    edition rc {v}        # optional, for store review builds");
-    println!("    edition tag {v}");
-    println!("    edition deploy <prod channel> {final_name}");
+    crate::say!("    edition rc {v}        # optional, for store review builds");
+    crate::say!("    edition tag {v}");
+    crate::say!("    edition deploy <prod channel> {final_name}");
     Ok(0)
 }
 
@@ -478,18 +480,18 @@ pub fn bump(c: &Ctx, version: &str) -> Res {
         changes.retain(|(p, _, _)| *p != path);
         changes.push((path, out, before + n));
     }
-    println!("Set version {v} in:");
+    crate::say!("Set version {v} in:");
     for (p, _, n) in &changes {
-        println!("  [local] {} ({n} occurrence(s))", p.strip_prefix(&l.root).unwrap_or(p).display());
+        crate::say!("  [local] {} ({n} occurrence(s))", p.strip_prefix(&l.root).unwrap_or(p).display());
     }
     if !c.mode.apply {
-        println!("\nDry run: nothing was written. To write it: --apply");
+        crate::say!("\nDry run: nothing was written. To write it: --apply");
         return Ok(0);
     }
     for (p, out, _) in &changes {
         std::fs::write(p, out).map_err(|e| format!("{}: {e}", p.display()))?;
     }
-    println!("written; review with git diff, then commit (lock files may need regenerating by their tool)");
+    crate::say!("written; review with git diff, then commit (lock files may need regenerating by their tool)");
     Ok(0)
 }
 
@@ -537,7 +539,7 @@ pub fn cut(c: &Ctx, line: &str) -> Res {
     let want_dev = format!("{line}.0-{}", l.cfg.lines.dev_suffix);
     match policy::agreed_version(l, &c.git, Some(&from_commit)) {
         Ok(Some(v)) if v == want_dev => {}
-        Ok(Some(v)) => println!("warning: main builds as {v}, not {want_dev}; check you are cutting the right line"),
+        Ok(Some(v)) => crate::say!("warning: main builds as {v}, not {want_dev}; check you are cutting the right line"),
         Ok(None) => {}
         Err(e) => problems.push(e),
     }
@@ -866,12 +868,12 @@ pub fn forward(c: &Ctx) -> Res {
         }
         let missing = c.git.log_range(&format!("{main_tip}..{tip}"));
         if missing.is_empty() {
-            println!("{}/{name}: merged forward", l.cfg.remote);
+            crate::say!("{}/{name}: merged forward", l.cfg.remote);
             continue;
         }
-        println!("{}/{name}: {} commit(s) not in {}:", l.cfg.remote, missing.len(), l.cfg.main);
+        crate::say!("{}/{name}: {} commit(s) not in {}:", l.cfg.remote, missing.len(), l.cfg.main);
         for m in &missing {
-            println!("    {m}");
+            crate::say!("    {m}");
         }
         match forward_step(c, &view, name, tip, &main_tip) {
             Ok(step) => plan.steps.push(step),
@@ -885,10 +887,10 @@ pub fn forward(c: &Ctx) -> Res {
         return refuse(&problems);
     }
     if plan.steps.is_empty() {
-        println!("Every release line is merged forward.");
+        crate::say!("Every release line is merged forward.");
         return Ok(0);
     }
-    println!();
+    crate::say!();
     c.run(&plan, records, &[])
 }
 
@@ -1089,7 +1091,7 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
         verdict.notes.push(format!("remote state unverified: {} was not read (dev tier only)", l.cfg.remote));
     }
     for n in &verdict.notes {
-        println!("policy: {n}");
+        crate::say!("policy: {n}");
     }
     if !problems.is_empty() {
         return refuse(&problems);
@@ -1254,7 +1256,7 @@ pub fn promote(c: &Ctx, from: &str, to: &str) -> Res {
         }
         _ => held.commit.clone(),
     };
-    println!("promote: {from} holds {} ({}); deploying {r} to {to}\n", held.ref_, short(&held.commit));
+    crate::say!("promote: {from} holds {} ({}); deploying {r} to {to}\n", held.ref_, short(&held.commit));
     deploy(c, to, &r)
 }
 
@@ -1265,7 +1267,7 @@ pub fn ledger_cmd(c: &Ctx, channel: Option<&str>) -> Res {
     let mut n = 0;
     for e in entries.iter().filter(|e| channel.is_none_or(|ch| e.channel.as_deref() == Some(ch))) {
         n += 1;
-        println!(
+        crate::say!(
             "{}  {:<11} {:<20} {:<16} {} {} by {}",
             e.at,
             e.action,
@@ -1277,7 +1279,7 @@ pub fn ledger_cmd(c: &Ctx, channel: Option<&str>) -> Res {
         );
     }
     if n == 0 {
-        println!("(no entries in {})", c.l.cfg.ledger);
+        crate::say!("(no entries in {})", c.l.cfg.ledger);
     }
     Ok(0)
 }
@@ -1292,7 +1294,7 @@ pub fn hooks_install(c: &Ctx) -> Res {
     let path = dir.join("pre-push");
     if let Ok(existing) = std::fs::read_to_string(&path) {
         if existing == HOOK {
-            println!("pre-push hook already installed: {}", path.display());
+            crate::say!("pre-push hook already installed: {}", path.display());
             return Ok(0);
         }
         return refuse(&[format!(
@@ -1300,13 +1302,13 @@ pub fn hooks_install(c: &Ctx) -> Res {
             path.display()
         )]);
     }
-    println!(
+    crate::say!(
         "Install the pre-push hook:\n  [local] write {}\n{}",
         path.display(),
         HOOK.lines().map(|l| format!("      {l}\n")).collect::<String>()
     );
     if !c.mode.apply {
-        println!("Dry run: nothing was written. To write it: --apply");
+        crate::say!("Dry run: nothing was written. To write it: --apply");
         return Ok(0);
     }
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1316,6 +1318,6 @@ pub fn hooks_install(c: &Ctx) -> Res {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
     }
-    println!("installed");
+    crate::say!("installed");
     Ok(0)
 }

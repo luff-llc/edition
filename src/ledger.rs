@@ -167,6 +167,40 @@ pub fn check_chain(git: &Git, entries: &[Entry]) -> Result<(), (usize, String)> 
     Ok(())
 }
 
+/// The entry with URL credentials removed from every free-text field: nothing recorded
+/// may carry them.
+fn redacted(e: &Entry) -> Entry {
+    let r = crate::util::redact;
+    let o = |v: &Option<String>| v.as_deref().map(r);
+    let l = |v: &[String]| v.iter().map(|x| r(x)).collect::<Vec<_>>();
+    Entry {
+        id: r(&e.id),
+        at: e.at.clone(),
+        by: r(&e.by),
+        action: r(&e.action),
+        product: r(&e.product),
+        channel: o(&e.channel),
+        tier: o(&e.tier),
+        target: o(&e.target),
+        ref_: r(&e.ref_),
+        commit: e.commit.clone(),
+        tree: e.tree.clone(),
+        version: o(&e.version),
+        platform: o(&e.platform),
+        build: o(&e.build),
+        result: e.result.clone(),
+        prev: e.prev.clone(),
+        receipt: e.receipt.clone(),
+        approved_by: o(&e.approved_by),
+        command: l(&e.command),
+        evidence: l(&e.evidence),
+        pins: l(&e.pins),
+        steps: l(&e.steps),
+        overrides: l(&e.overrides),
+        note: o(&e.note),
+    }
+}
+
 /// Appends one entry under a lock, setting its `prev` to the hash of the last entry.
 /// Creates the file (with its header) if needed. Refuses a symlink or an invalid ledger.
 pub fn append(git: &Git, path: &Path, e: &Entry) -> Result<Entry, String> {
@@ -190,7 +224,7 @@ pub fn append(git: &Git, path: &Path, e: &Entry) -> Result<Entry, String> {
     let entries =
         parse(&existing).map_err(|err| format!("refusing to append to an invalid ledger {}: {err}", path.display()))?;
     check_chain(git, &entries).map_err(|(_, m)| format!("refusing to append to a broken ledger chain: {m}"))?;
-    let mut e = e.clone();
+    let mut e = redacted(e);
     e.prev = match entries.last() {
         Some(last) => entry_hash(git, last)?,
         None => GENESIS.to_string(),

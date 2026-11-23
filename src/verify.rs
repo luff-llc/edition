@@ -18,15 +18,15 @@ pub struct Report {
 impl Report {
     pub fn print(&self) {
         for s in &self.ok {
-            println!("ok    {s}");
+            crate::say!("ok    {s}");
         }
         for s in &self.warnings {
-            println!("warn  {s}");
+            crate::say!("warn  {s}");
         }
         for s in &self.errors {
-            println!("ERROR {s}");
+            crate::say!("ERROR {s}");
         }
-        println!("\n{} ok, {} warning(s), {} error(s)", self.ok.len(), self.warnings.len(), self.errors.len());
+        crate::say!("\n{} ok, {} warning(s), {} error(s)", self.ok.len(), self.warnings.len(), self.errors.len());
     }
 }
 

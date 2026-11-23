@@ -341,6 +341,56 @@ pub struct Loaded {
     pub todos: Vec<String>,
     /// The configuration file's bytes, for the plan digest.
     pub raw: String,
+    /// The checked `PATH` for every command Edition runs.
+    pub run_path: String,
+}
+
+/// Resolves `[run] path` (or the default) into the `PATH` every command runs with.
+/// A leading `~/` needs `HOME` to be absolute and free of `:`. Every entry must end up
+/// absolute, without `:`, canonical, and not writable by others; entries that do not
+/// exist are dropped. Planning runs git before any receipt exists, so this is checked
+/// before anything runs.
+pub fn checked_run_path(configured: Option<&str>) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let p = configured.unwrap_or(crate::steps::DEFAULT_PATH);
+    let mut out: Vec<String> = Vec::new();
+    for d in p.split(':').filter(|d| !d.is_empty()) {
+        let expanded = match d.strip_prefix("~/") {
+            Some(rest) => {
+                let home = std::env::var("HOME").map_err(|_| "run.path uses ~/ but HOME is not set".to_string())?;
+                if !home.starts_with('/') || home.contains(':') || home.chars().any(char::is_control) {
+                    return Err(format!("run.path uses ~/ but HOME ({home:?}) is not an absolute path without `:`"));
+                }
+                format!("{}/{rest}", home.trim_end_matches('/'))
+            }
+            None => d.to_string(),
+        };
+        if !expanded.starts_with('/') || expanded.contains(':') {
+            return Err(format!("run.path entry {expanded:?} must be an absolute directory"));
+        }
+        let canon = match std::fs::canonicalize(&expanded) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let meta = std::fs::metadata(&canon).map_err(|e| format!("run.path entry {expanded}: {e}"))?;
+        if !meta.is_dir() {
+            continue;
+        }
+        if meta.permissions().mode() & 0o002 != 0 {
+            return Err(format!(
+                "run.path entry {} is writable by others; refusing to run commands from it",
+                canon.display()
+            ));
+        }
+        let c = canon.display().to_string();
+        if c.contains(':') {
+            return Err(format!("run.path entry {c:?} contains `:`"));
+        }
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    Ok(out.join(":"))
 }
 
 /// Channel kinds that are review or testing tracks, where a release candidate may go.
@@ -376,7 +426,7 @@ impl Loaded {
         let pre_tag = Template::parse(&cfg.tags.prerelease)?;
         let line_branch = Template::parse(&cfg.lines.branch)?;
         let hotfix_branch = Template::parse(&cfg.lines.hotfix_branch)?;
-        let loaded = Loaded {
+        let mut loaded = Loaded {
             cfg,
             root,
             path: path.to_path_buf(),
@@ -386,8 +436,11 @@ impl Loaded {
             hotfix_branch,
             todos,
             raw: text.clone(),
+            run_path: String::new(),
         };
         loaded.validate()?;
+        loaded.run_path =
+            checked_run_path(loaded.cfg.run.path.as_deref()).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(loaded)
     }
 
@@ -544,7 +597,7 @@ impl Loaded {
             }
         }
         if let Some(p) = &c.run.path {
-            if p.split(':').any(|d| !d.starts_with('/') && !d.starts_with("~/")) {
+            if p.split(':').any(|d| !d.is_empty() && !d.starts_with('/') && !d.starts_with("~/")) {
                 errs.push("run.path must list absolute directories (or ones under ~/)".into());
             }
         }
@@ -617,17 +670,9 @@ impl Loaded {
         self.cfg.receipts.ttl_minutes.unwrap_or(crate::steps::RECEIPT_TTL_DEFAULT)
     }
 
-    /// `PATH` for every command, with a leading `~/` expanded per directory.
+    /// `PATH` for every command, checked when the configuration loads.
     pub fn run_path(&self) -> String {
-        let p = self.cfg.run.path.clone().unwrap_or_else(|| crate::steps::DEFAULT_PATH.to_string());
-        let home = std::env::var("HOME").unwrap_or_default();
-        p.split(':')
-            .map(|d| match d.strip_prefix("~/") {
-                Some(rest) if !home.is_empty() => format!("{home}/{rest}"),
-                _ => d.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(":")
+        self.run_path.clone()
     }
 
     pub fn is_public(&self, remote: &str) -> bool {

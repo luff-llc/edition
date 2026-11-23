@@ -221,9 +221,9 @@ impl Plan {
     }
 
     pub fn print(&self) {
-        println!("{}", self.title);
+        crate::say!("{}", self.title);
         for s in &self.steps {
-            println!("{}", s.display());
+            crate::say!("{}", s.display());
         }
     }
 
@@ -485,13 +485,13 @@ pub fn execute(
     let receipts = Receipts::at(root);
     let _ = git;
     if !mode.apply {
-        println!();
+        crate::say!();
         if outward {
             let r = receipts.issue(&plan.digest(config_digest), ttl_minutes)?;
-            println!("Receipt: {r} (valid {ttl_minutes} minutes, once)");
-            println!("Dry run: nothing was run. To run exactly this plan: --apply --confirm {r}");
+            crate::say!("Receipt: {r} (valid {ttl_minutes} minutes, once)");
+            crate::say!("Dry run: nothing was run. To run exactly this plan: --apply --confirm {r}");
         } else {
-            println!("Dry run: nothing was run. To run it: --apply");
+            crate::say!("Dry run: nothing was run. To run it: --apply");
         }
         return Ok(Ran::DryRun);
     }
@@ -511,12 +511,12 @@ pub fn execute(
         }
         if s.kind == Kind::Outward {
             if let Some(why) = check_expects(git, &plan.remote, &s.expects) {
-                eprintln!("edition: {why}");
+                crate::warn!("edition: {why}");
                 stopped = Some(why);
                 break;
             }
         }
-        println!("> [{}] {}", s.kind.label(), s.what);
+        crate::say!("> [{}] {}", s.kind.label(), s.what);
         let mut c = Command::new(&s.program);
         c.args(&s.argv[1..]).current_dir(&s.cwd);
         c.env_clear();
@@ -527,19 +527,19 @@ pub fn execute(
             match c.status() {
                 Ok(st) => st.code(),
                 Err(e) => {
-                    eprintln!("edition: cannot run {}: {e}", s.shown.first().cloned().unwrap_or_default());
+                    crate::warn!("edition: cannot run {}: {e}", s.shown.first().cloned().unwrap_or_default());
                     None
                 }
             }
         } else {
             match c.output() {
                 Ok(out) => {
-                    print!("{}", crate::util::redact(&String::from_utf8_lossy(&out.stdout)));
-                    eprint!("{}", crate::util::redact(&String::from_utf8_lossy(&out.stderr)));
+                    crate::say_raw!("{}", crate::util::redact(&String::from_utf8_lossy(&out.stdout)));
+                    crate::warn_raw!("{}", crate::util::redact(&String::from_utf8_lossy(&out.stderr)));
                     out.status.code()
                 }
                 Err(e) => {
-                    eprintln!("edition: cannot run {}: {e}", s.shown.first().cloned().unwrap_or_default());
+                    crate::warn!("edition: cannot run {}: {e}", s.shown.first().cloned().unwrap_or_default());
                     None
                 }
             }
@@ -548,7 +548,7 @@ pub fn execute(
         let ok = o.ok();
         outcomes.push(o);
         if !ok {
-            eprintln!("edition: step failed ({}), stopping", s.what);
+            crate::warn!("edition: step failed ({}), stopping", s.what);
             break;
         }
     }

@@ -314,9 +314,9 @@ pub fn verify(l: &Loaded, git: &Git, r: &mut Report) {
 /// <remote sha>` lines from standard input (or checks HEAD when there are none).
 pub fn check_push(l: &Loaded, git: &Git, remote: &str) -> Result<i32, String> {
     if !l.is_public(remote) {
-        println!("edition: {remote} is not marked public; content not checked");
+        crate::say!("edition: {remote} is not marked public; content not checked");
         if let Err(e) = crate::policy::agreed_version(l, git, Some("HEAD")) {
-            eprintln!("edition: versions (reported, not blocking): {e}");
+            crate::warn!("edition: versions (reported, not blocking): {e}");
         }
         return Ok(0);
     }
@@ -346,7 +346,7 @@ pub fn check_push(l: &Loaded, git: &Git, remote: &str) -> Result<i32, String> {
         match s.scan_commits(git, r) {
             Ok(f) => found.extend(f),
             Err(e) => {
-                eprintln!("edition: {e}; push blocked (the scan fails closed)");
+                crate::warn!("edition: {e}; push blocked (the scan fails closed)");
                 return Ok(1);
             }
         }
@@ -362,24 +362,24 @@ pub fn check_push(l: &Loaded, git: &Git, remote: &str) -> Result<i32, String> {
         }
     }
     if found.is_empty() && other.is_empty() {
-        println!("edition: content, version and pin checks passed for {remote}");
+        crate::say!("edition: content, version and pin checks passed for {remote}");
         return Ok(0);
     }
     for o in &other {
-        eprintln!("edition: {o} (reported, not blocking)");
+        crate::warn!("edition: {o} (reported, not blocking)");
     }
     if found.is_empty() {
         return Ok(0);
     }
-    eprintln!("edition: {} line(s) about to go to public remote {remote} match the deny-list:", found.len());
+    crate::warn!("edition: {} line(s) about to go to public remote {remote} match the deny-list:", found.len());
     for f in &found {
-        eprintln!("  {} {} [{}] {}", f.id, f.place, f.pattern, f.excerpt);
+        crate::warn!("  {} {} [{}] {}", f.id, f.place, f.pattern, f.excerpt);
     }
     if l.cfg.content.action == "block" {
-        eprintln!("edition: push blocked (content.action = \"block\"); edit the commits or the deny-list");
+        crate::warn!("edition: push blocked (content.action = \"block\"); edit the commits or the deny-list");
         Ok(1)
     } else {
-        eprintln!("edition: reported only (content.action = \"report\")");
+        crate::warn!("edition: reported only (content.action = \"report\")");
         Ok(0)
     }
 }

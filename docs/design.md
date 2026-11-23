@@ -208,9 +208,13 @@ Edition's own git and gh calls, read-only or outward, are bound the same way:
   effective URL (or, when git rewrites it to a local path, its configured URL); a plan
   whose URL does not name a forge repository is refused.
 - The plan shows the destination of every outward step.
-- URLs are kept verbatim only for hashing and execution. Everything Edition prints,
-  records or emits (plans, errors, git's own output from Edition's steps, the ledger, the
-  event stream) has userinfo (`user:token@`) and query strings removed.
+- URLs are kept verbatim only for hashing and execution. Redaction is structural: every
+  line Edition prints goes through one redacting printer, every ledger entry is redacted
+  field by field when it is appended, and every event value is redacted, so userinfo
+  (`user:token@`) and query strings never appear in plans, titles, status, errors, git's
+  own output from Edition's steps, the ledger or the event stream, wherever in the
+  configuration the URL came from. Output that configured commands write themselves goes
+  straight to the terminal.
 
 The trusted base is the user's global git configuration and what it names: credential
 helpers, ssh configuration and `includeIf` files. Edition does not and cannot vet those.
@@ -360,7 +364,7 @@ offset. Edition never reads it back.
 | `[content] deny`, `allow_paths`, `action` | the content check's patterns (`<word>` matches one word), exempt path globs, `block` (default) or `report` |
 | `[concordance] catalog`, `release`, `bin` | the Concordance catalog; the release id template (`{version}`) |
 | `[vars] NAME` | values for `{var.NAME}`; an empty value must come from `EDITION_VAR_NAME` on the machine and is treated as secret |
-| `[run] path` | `PATH` for every command Edition runs, including git and gh (absolute directories, or under `~/`) |
+| `[run] path` | `PATH` for every command Edition runs, including git and gh: absolute directories, or under `~/` (which needs an absolute, colon-free `HOME`); each is canonicalized, missing ones are dropped, and one writable by others refuses the configuration |
 | `[run] tool_env` | variables git and gh may inherit, such as `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GPG_TTY`, `GNUPGHOME` |
 | `[receipts] ttl_minutes` | receipt lifetime, 1 to 60 (default 30) |
 | `[verify] tags_since` | older tags are not checked against version files |

@@ -809,3 +809,69 @@ fn declared_enterprise_tokens_reach_gh_but_the_host_comes_from_the_url() {
     assert_eq!(refused.code, 2);
     assert!(refused.stderr.contains("GH_HOST may not be passed"), "{}", refused.stderr);
 }
+
+#[test]
+fn credentials_in_any_config_text_never_reach_output_ledger_or_events() {
+    let cfg = BASE_CONFIG
+        .replace("target = \"https://staging.example.com\"", "target = \"https://user:SECRET@staging.example.com/\"")
+        .replace(
+            "run = [\"scripts/record.sh\", \"staging-deploys.txt\", \"{commit}\"]\nprobe = [\"true\"]",
+            "run = [\"scripts/fail.sh\", \"https://user:SECRET@deploy.example.com/x?token=SECRET\", \"{var.site}\", \"{commit}\"]\nenv = { SITE = \"https://user:SECRET@env.example.com/\" }\nprobe = [\"true\", \"https://user:SECRET@probe.example.com/\"]",
+        )
+        .replace("[checks.unit]", "[vars]\nsite = \"https://user:SECRET@var.example.com/\"\n\n[checks.unit]");
+    let (root, work) = project("creds-config", &cfg, "0.6.0-dev");
+    executable(&work, "scripts/fail.sh", "#!/bin/sh\nexit 3\n");
+    commit_all(&work, "Failing deploy script");
+    git(&work, &["push", "-q", "origin", "main"]);
+    let events = root.join("events.jsonl");
+    let ev = events.to_str().expect("utf8").to_string();
+    let env = [("EDITION_EVENTS", ev.as_str())];
+    let note = "see https://user:SECRET@notes.example.com/page";
+    let status = edition_env(&work, &["status"], &env);
+    assert_eq!(status.code, 0, "{}", status.all());
+    assert!(status.stdout.contains("https://staging.example.com/"), "{}", status.stdout);
+    let plan = edition_env(&work, &["plan", "0.6.0"], &env);
+    let dry = edition_env(&work, &["deploy", "staging-home", "main", "--note", note], &env);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    assert!(dry.stdout.contains("https://deploy.example.com/x"), "{}", dry.stdout);
+    let failed = edition_env(
+        &work,
+        &["deploy", "staging-home", "main", "--note", note, "--apply", "--confirm", &dry.receipt()],
+        &env,
+    );
+    assert_eq!(failed.code, 1, "{}", failed.all());
+    let verify = edition_env(&work, &["verify", "--online"], &env);
+    assert_no_secret(&work, &[&status, &plan, &dry, &failed, &verify], &events);
+    let ledger = std::fs::read_to_string(work.join("releases/ledger.toml")).expect("ledger");
+    assert!(ledger.contains("result = \"failed\""), "{ledger}");
+    assert!(ledger.contains("notes.example.com/page"), "{ledger}");
+}
+
+fn home_config(path: &str) -> String {
+    format!("{BASE_CONFIG}\n[run]\npath = \"{path}\"\n")
+}
+
+#[test]
+fn run_path_refuses_an_untrustworthy_home_or_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, work) = project("run-path", BASE_CONFIG, "0.6.0-dev");
+    write(&work, "edition.toml", &home_config("~/bin:/usr/bin:/bin"));
+    let relative = edition_env(&work, &["status"], &[("HOME", "relative/home")]);
+    assert_eq!(relative.code, 2, "{}", relative.all());
+    assert!(relative.stderr.contains("not an absolute path"), "{}", relative.stderr);
+    let colon = edition_env(&work, &["status"], &[("HOME", "/tmp/a:/tmp/b")]);
+    assert_eq!(colon.code, 2, "{}", colon.all());
+    assert!(colon.stderr.contains("without `:`"), "{}", colon.stderr);
+    let fine = edition_env(&work, &["status"], &[("HOME", root.to_str().expect("utf8"))]);
+    assert_eq!(fine.code, 0, "{}", fine.all());
+
+    let open = root.join("open-bin");
+    std::fs::create_dir(&open).expect("mkdir");
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+    write(&work, "edition.toml", &home_config(&format!("{}:/usr/bin:/bin", open.display())));
+    let writable = edition(&work, &["status"]);
+    assert_eq!(writable.code, 2, "{}", writable.all());
+    assert!(writable.stderr.contains("writable by others"), "{}", writable.stderr);
+    write(&work, "edition.toml", &home_config("bin:/usr/bin"));
+    assert_eq!(edition(&work, &["status"]).code, 2);
+}
