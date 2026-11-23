@@ -121,7 +121,7 @@ fn dispatch(o: Opts) -> Result<i32, String> {
         let dir = crate::util::resolve_path(&cwd, r);
         l.root = dir.canonicalize().map_err(|e| format!("--root {}: {e}", dir.display()))?;
     }
-    let git = Git::new(&l.root);
+    let git = Git::with_env(&l.root, &l.run_path(), &l.cfg.run.tool_env);
     let by =
         o.by.clone()
             .or_else(|| std::env::var("EDITION_ACTOR").ok().filter(|s| !s.is_empty()))

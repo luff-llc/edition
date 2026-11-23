@@ -531,12 +531,7 @@ fn pushes_are_compare_and_swap() {
     let (root, work) = project("cas", BASE_CONFIG, "0.7.0-dev");
     line_with_version(&work, "0.6", "0.6.0");
     let dry = edition(&work, &["tag", "0.6.0"]);
-    assert!(
-        dry.stdout.contains("push --atomic '--force-with-lease=refs/tags/v0.6.0:' origin refs/tags/v0.6.0")
-            || dry.stdout.contains("push --atomic --force-with-lease=refs/tags/v0.6.0: origin refs/tags/v0.6.0"),
-        "{}",
-        dry.stdout
-    );
+    assert!(dry.stdout.contains("push --atomic --force-with-lease=refs/tags/v0.6.0: "), "{}", dry.stdout);
     let cut = edition(&work, &["cut", "0.7"]);
     assert!(cut.stdout.contains("--force-with-lease=refs/heads/release/0.7:"), "{}", cut.stdout);
     // The lease refuses a tag that appeared on the remote meanwhile.
@@ -629,4 +624,93 @@ fn redemption_is_atomic_under_contention() {
         let wins = handles.into_iter().map(|h| h.join().expect("thread")).filter(|w| *w).count();
         assert_eq!(wins, 1, "a receipt was redeemed {wins} times");
     }
+}
+
+fn mirror_of(root: &Path) -> String {
+    let mirror = root.join("mirror.git");
+    git(
+        root,
+        &["clone", "-q", "--bare", root.join("origin.git").to_str().expect("utf8"), mirror.to_str().expect("utf8")],
+    );
+    mirror.display().to_string()
+}
+
+fn tag_ready(name: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+    let (root, work) = project(name, BASE_CONFIG, "0.7.0-dev");
+    line_with_version(&work, "0.6", "0.6.0");
+    let mirror = mirror_of(&root);
+    (root, work, mirror)
+}
+
+#[test]
+fn a_remote_redirected_by_config_invalidates_the_receipt() {
+    let (root, work, mirror) = tag_ready("redirect");
+    let origin = root.join("origin.git").display().to_string();
+    let dry = edition(&work, &["tag", "0.6.0"]);
+    assert!(dry.stdout.contains(&format!("destination: {origin}")), "{}", dry.stdout);
+
+    // url.<mirror>.insteadOf rewrites origin to an identical mirror.
+    let r1 = dry.receipt();
+    git(&work, &["config", &format!("url.{mirror}.insteadOf"), &origin]);
+    let out = edition(&work, &["tag", "0.6.0", "--apply", "--confirm", &r1]);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.stderr.contains("does not match this plan"), "{}", out.stderr);
+    git(&work, &["config", "--unset", &format!("url.{mirror}.insteadOf")]);
+
+    // remote.origin.pushurl sends pushes elsewhere.
+    let r2 = edition(&work, &["tag", "0.6.0"]).receipt();
+    git(&work, &["config", "remote.origin.pushurl", &mirror]);
+    let out2 = edition(&work, &["tag", "0.6.0", "--apply", "--confirm", &r2]);
+    assert_eq!(out2.code, 2, "{}", out2.all());
+    assert!(out2.stderr.contains("does not match this plan"), "{}", out2.stderr);
+    git(&work, &["config", "--unset", "remote.origin.pushurl"]);
+    assert!(!git(&work, &["ls-remote", "--tags", &mirror]).contains("v0.6.0"));
+}
+
+#[test]
+fn the_callers_git_and_gh_environment_has_no_effect() {
+    let (root, work, mirror) = tag_ready("env-redirect");
+    let origin = root.join("origin.git").display().to_string();
+    let env = [
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "remote.origin.pushurl"),
+        ("GIT_CONFIG_VALUE_0", mirror.as_str()),
+        ("GIT_DIR", "/nonexistent"),
+        ("GIT_SSH_COMMAND", "false"),
+        ("GH_HOST", "attacker.example"),
+    ];
+    let dry = edition_env(&work, &["tag", "0.6.0"], &env);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    assert!(dry.stdout.contains(&format!("destination: {origin}")), "{}", dry.stdout);
+    let ok = apply_env(&work, &["tag", "0.6.0"], &env);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+    assert!(git(&work, &["ls-remote", "--tags", &origin]).contains("refs/tags/v0.6.0"));
+    assert!(!git(&work, &["ls-remote", "--tags", &mirror]).contains("v0.6.0"), "the push did not go to the mirror");
+}
+
+#[test]
+fn repository_hooks_do_not_run_during_edition_pushes() {
+    let (root, work, _mirror) = tag_ready("hooks-path");
+    let marker = root.join("hook-ran");
+    executable(&root, "evil-hooks/pre-push", &format!("#!/bin/sh\ntouch '{}'\n", marker.display()));
+    git(&work, &["config", "core.hooksPath", root.join("evil-hooks").to_str().expect("utf8")]);
+    let ok = apply(&work, &["tag", "0.6.0"]);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+    assert!(!marker.exists(), "a repository hook ran during Edition's push");
+    // The same hook does run for an ordinary push, so the test is meaningful.
+    git(&work, &["push", "-q", "origin", "main"]);
+    assert!(marker.exists());
+}
+
+#[test]
+fn the_receipt_file_must_not_be_a_link() {
+    let (_root, work) = project("link", BASE_CONFIG, "0.6.0-dev");
+    let r = staging_receipt(&work);
+    let state = work.join(".edition/receipts");
+    let moved = work.join(".edition/real");
+    std::fs::rename(&state, &moved).expect("move");
+    std::os::unix::fs::symlink(&moved, &state).expect("symlink");
+    let out = edition(&work, &["deploy", "staging-home", "main", "--apply", "--confirm", &r]);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.stderr.contains("not a link"), "{}", out.stderr);
 }

@@ -67,6 +67,8 @@ pub struct Step {
     pub isolated: bool,
     /// The program, resolved to an absolute path when the plan is made.
     pub program: PathBuf,
+    /// Where an outward step goes (a push URL, a repository, a channel target).
+    pub dest: Option<String>,
 }
 
 /// The `PATH` configured commands get when `edition.toml` does not set `[run] path`.
@@ -109,14 +111,26 @@ impl Step {
             expects: Vec::new(),
             isolated: false,
             program: PathBuf::new(),
+            dest: None,
         }
     }
 
-    /// The environment the command runs with (`None`: inherited, for Edition's own
-    /// git and gh steps).
-    pub fn run_env(&self, run_path: &str) -> Option<Vec<(String, String)>> {
+    pub fn to(mut self, dest: &str) -> Step {
+        self.dest = Some(dest.to_string());
+        self
+    }
+
+    /// The complete environment the command runs with. Edition's own git and gh steps
+    /// get the tool environment (see `git::tool_env`) plus their own variables; configured
+    /// commands get the base variables plus what they declare.
+    pub fn run_env(&self, run_path: &str, tool_env: &[(String, String)]) -> Vec<(String, String)> {
         if !self.isolated {
-            return None;
+            let mut env = tool_env.to_vec();
+            for (k, v) in &self.env {
+                env.retain(|(n, _)| n != k);
+                env.push((k.clone(), v.clone()));
+            }
+            return env;
         }
         let mut env = vec![("PATH".to_string(), run_path.to_string())];
         for k in BASE_VARS {
@@ -128,7 +142,7 @@ impl Step {
             env.retain(|(n, _)| n != k);
             env.push((k.clone(), v.clone()));
         }
-        Some(env)
+        env
     }
 
     pub fn note(what: &str) -> Step {
@@ -149,6 +163,9 @@ impl Step {
                 let names: Vec<&str> = self.env.iter().map(|(k, _)| k.as_str()).collect();
                 s.push_str(&format!("\n      env: {}", names.join(", ")));
             }
+        }
+        if let Some(d) = &self.dest {
+            s.push_str(&format!("\n      destination: {d}"));
         }
         for e in &self.expects {
             s.push_str(&format!(
@@ -175,6 +192,8 @@ pub struct Plan {
     pub remote: String,
     /// `PATH` for isolated commands.
     pub run_path: String,
+    /// The environment for Edition's own git and gh steps.
+    pub tool_env: Vec<(String, String)>,
 }
 
 impl Plan {
@@ -185,9 +204,8 @@ impl Plan {
     /// Resolves every step's program to an absolute path. Called once the steps are
     /// final; the resolved paths are part of the plan hash.
     pub fn resolve(&mut self) -> Result<(), String> {
-        let inherited = std::env::var("PATH").unwrap_or_default();
         for s in self.steps.iter_mut().filter(|s| !s.argv.is_empty()) {
-            let path = if s.isolated { self.run_path.clone() } else { inherited.clone() };
+            let path = self.run_path.clone();
             s.program = resolve_program(&s.argv[0], &s.cwd, &path).map_err(|e| format!("{}: {e}", s.what))?;
         }
         Ok(())
@@ -221,19 +239,12 @@ impl Plan {
             t.push_str(&format!("step {} {:?}\n", s.kind.label(), s.what));
             t.push_str(&format!("  cwd {:?}\n", s.cwd.display().to_string()));
             t.push_str(&format!("  program {:?}\n", s.program.display().to_string()));
-            match s.run_env(&self.run_path) {
-                Some(env) => {
-                    for (k, v) in env {
-                        t.push_str(&format!("  isolated-env {k:?}={v:?}\n"));
-                    }
-                }
-                None => t.push_str("  inherited-env\n"),
+            for (k, v) in s.run_env(&self.run_path, &self.tool_env) {
+                t.push_str(&format!("  env {k:?}={v:?}\n"));
             }
+            t.push_str(&format!("  dest {:?}\n", s.dest));
             for a in &s.argv {
                 t.push_str(&format!("  arg {a:?}\n"));
-            }
-            for (k, v) in &s.env {
-                t.push_str(&format!("  env {k:?}={v:?}\n"));
             }
             for e in &s.expects {
                 t.push_str(&format!("  expect {} {}\n", e.refname, e.oid.as_deref().unwrap_or("absent")));
@@ -292,6 +303,19 @@ pub struct Receipts {
 pub const RECEIPT_TTL_DEFAULT: u64 = 30;
 pub const RECEIPT_TTL_MAX: u64 = 60;
 
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(target_os = "macos")]
+const O_DIRECTORY: i32 = 0x0010_0000;
+#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
+const O_NOFOLLOW: i32 = 0o100_000;
+#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
+const O_DIRECTORY: i32 = 0o40_000;
+#[cfg(all(not(target_os = "macos"), not(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))))]
+const O_NOFOLLOW: i32 = 0o400_000;
+#[cfg(all(not(target_os = "macos"), not(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))))]
+const O_DIRECTORY: i32 = 0o200_000;
+
 fn private(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     meta.permissions().mode() & 0o077 == 0
@@ -305,35 +329,48 @@ impl Receipts {
     /// Opens the state directory (mode 0700) and returns the locked receipts file
     /// (mode 0600). Refuses either if group or others can access it.
     fn open_locked(&self) -> Result<std::fs::File, String> {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-        if !self.dir.exists() {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+        if std::fs::symlink_metadata(&self.dir).is_err() {
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&self.dir)
                 .map_err(|e| format!("cannot create {}: {e}", self.dir.display()))?;
             let _ = std::fs::write(self.dir.join(".gitignore"), "*\n");
         }
-        let meta = std::fs::symlink_metadata(&self.dir).map_err(|e| e.to_string())?;
-        if !meta.is_dir() || !private(&meta) {
+        // Open the directory itself without following a symlink and check it through the
+        // handle, then open the file without following a symlink and check that handle.
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_DIRECTORY)
+            .open(&self.dir)
+            .map_err(|e| format!("{} must be a private directory, not a link: {e}", self.dir.display()))?;
+        let dm = dir.metadata().map_err(|e| e.to_string())?;
+        if !dm.is_dir() || !private(&dm) {
             return Err(format!(
                 "{} must be a private directory (mode 0700); refusing to use receipts kept there",
                 self.dir.display()
             ));
         }
         let path = self.dir.join("receipts");
-        if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
-            return Err(format!("{} must be a regular file", path.display()));
-        }
         let f = std::fs::OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .mode(0o600)
+            .custom_flags(O_NOFOLLOW)
             .open(&path)
-            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+            .map_err(|e| format!("cannot open {} (it must be a regular file, not a link): {e}", path.display()))?;
         let fm = f.metadata().map_err(|e| e.to_string())?;
-        if !private(&fm) {
-            return Err(format!("{} must be private (mode 0600); refusing to use it", path.display()));
+        if !fm.is_file() || !private(&fm) || fm.uid() != dm.uid() {
+            return Err(format!(
+                "{} must be private (mode 0600) and owned like its directory; refusing to use it",
+                path.display()
+            ));
+        }
+        // The directory path must still name the directory that was checked.
+        let again = std::fs::symlink_metadata(&self.dir).map_err(|e| e.to_string())?;
+        if again.dev() != dm.dev() || again.ino() != dm.ino() {
+            return Err(format!("{} changed while it was being opened; refusing", self.dir.display()));
         }
         f.lock().map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
         Ok(f)
@@ -474,15 +511,8 @@ pub fn execute(
         println!("> [{}] {}", s.kind.label(), s.what);
         let mut c = Command::new(&s.program);
         c.args(&s.argv[1..]).current_dir(&s.cwd);
-        match s.run_env(&plan.run_path) {
-            Some(env) => {
-                c.env_clear();
-                c.envs(env);
-            }
-            None => {
-                c.envs(s.env.iter().cloned());
-            }
-        }
+        c.env_clear();
+        c.envs(s.run_env(&plan.run_path, &plan.tool_env));
         let code = match c.status() {
             Ok(st) => st.code(),
             Err(e) => {

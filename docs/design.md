@@ -127,6 +127,15 @@ after that leaves the receipt spent: run the dry run again.
 
 - The lifetime is 30 minutes, configurable as `[receipts] ttl_minutes` up to 60. There is
   no clock or lifetime override in the environment.
+- The directory is opened once without following links and checked through the handle
+  (a directory, mode 0700); the file is opened relative to that path with `O_NOFOLLOW` and
+  checked through its handle (a regular file, mode 0600, same owner as the directory);
+  then the directory path is checked to still name the same directory. Without `openat`
+  in the standard library a narrow window remains between the directory check and the
+  file open, which the final identity check detects in most cases.
+- File modes protect against other users only. Any process running as the same user can
+  read and write the state, as it can the repository itself; receipts guard against
+  mistakes, stale plans and replays, not against a hostile process with your identity.
 - There is no way to run an outward step without a receipt from a prior dry run of the
   same plan.
 
@@ -173,8 +182,31 @@ HEAD, so the ledger is committed on top of exactly what was checked.
   Nothing else is inherited, so a script that needs a credential must declare the
   variable (for example `env = { DEPLOY_TOKEN = "{var.deploy_token}" }`). The program is
   resolved to an absolute path when the plan is made, and that path is part of the plan
-  hash. Edition's own `git` and `gh` steps keep the caller's environment, which they need
-  for authentication; their resolved paths are hashed the same way.
+  hash.
+
+### git and gh
+
+Edition's own git and gh calls, read-only or outward, are bound the same way:
+
+- They run with a cleared environment: `PATH` (from `[run] path` or the default), `HOME`,
+  `LANG`, `TMPDIR`, `SSH_AUTH_SOCK`, the git author and committer identity variables, and
+  only those token variables listed in `[run] tool_env` (such as `GH_TOKEN`). `GIT_*`
+  variables, `GH_HOST`, `GH_REPO` and enterprise tokens can never be passed through, so
+  `GIT_DIR`, `GIT_CONFIG_*`, `GIT_SSH_COMMAND` and the like in the caller's environment
+  have no effect. `GIT_CONFIG_NOSYSTEM=1` is set.
+- Every git call forces `core.hooksPath=/dev/null`, `core.fsmonitor=false` and
+  `protocol.ext.allow=never`, and names its subcommand explicitly.
+- When a plan is made, the remote is resolved to its effective fetch and push URLs (after
+  `insteadOf`, `pushInsteadOf` and `pushurl`). Reads, re-checks and pushes use those URLs,
+  never the remote's name, and the URLs are part of the plan hash: a configuration change
+  that would redirect the remote, even to a mirror with identical refs, changes the plan
+  recomputed at apply time and the receipt is refused.
+- gh is called with `--repo <host>/<owner>/<name>` and `GH_HOST` derived from the remote's
+  configured URL; a plan whose URL does not name a forge repository is refused.
+- The plan shows the destination of every outward step.
+
+The trusted base is the user's global git configuration and what it names: credential
+helpers, ssh configuration and `includeIf` files. Edition does not and cannot vet those.
 
 ### Gates
 
@@ -321,7 +353,8 @@ offset. Edition never reads it back.
 | `[content] deny`, `allow_paths`, `action` | the content check's patterns (`<word>` matches one word), exempt path globs, `block` (default) or `report` |
 | `[concordance] catalog`, `release`, `bin` | the Concordance catalog; the release id template (`{version}`) |
 | `[vars] NAME` | values for `{var.NAME}`; an empty value must come from `EDITION_VAR_NAME` on the machine and is treated as secret |
-| `[run] path` | `PATH` for configured commands (absolute directories) |
+| `[run] path` | `PATH` for every command Edition runs, including git and gh (absolute directories) |
+| `[run] tool_env` | token variables git and gh may inherit, such as `GH_TOKEN` |
 | `[receipts] ttl_minutes` | receipt lifetime, 1 to 60 (default 30) |
 | `[verify] tags_since` | older tags are not checked against version files |
 

@@ -223,8 +223,13 @@ pub struct ConcordanceCfg {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunCfg {
-    /// `PATH` for channel, check and probe commands (default: a fixed system path).
+    /// `PATH` for every command Edition runs, including git and gh (default: a fixed
+    /// system path).
     pub path: Option<String>,
+    /// Extra variables git and gh may inherit, such as `GH_TOKEN`. Never `GIT_*`,
+    /// `GH_HOST`, `GH_REPO` or enterprise tokens.
+    #[serde(default)]
+    pub tool_env: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -531,6 +536,11 @@ impl Loaded {
         if let Some(t) = c.receipts.ttl_minutes {
             if t == 0 || t > crate::steps::RECEIPT_TTL_MAX {
                 errs.push(format!("receipts.ttl_minutes must be between 1 and {}", crate::steps::RECEIPT_TTL_MAX));
+            }
+        }
+        for v in &c.run.tool_env {
+            if crate::git::forbidden_tool_var(v) {
+                errs.push(format!("run.tool_env: {v} may not be passed to git or gh"));
             }
         }
         if let Some(p) = &c.run.path {

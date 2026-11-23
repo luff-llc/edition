@@ -13,6 +13,11 @@ pub struct RemoteView {
     /// Tags known to be on the remote (online only).
     pub remote_tags: Option<Vec<(String, String)>>,
     pub local_tags: Vec<(String, String)>,
+    /// Online: the remote's effective fetch URL (what was read), push URL (where pushes
+    /// go) and configured URL. Empty offline.
+    pub fetch_url: String,
+    pub push_url: String,
+    pub raw_url: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,13 +33,29 @@ impl RemoteView {
     /// Online, heads and tags are the remote's live values from `git ls-remote`;
     /// offline, heads come from remote-tracking refs and are unverified.
     pub fn build(git: &Git, remote: &str, online: bool) -> Result<RemoteView, String> {
-        let (branches, remote_tags) = if online {
-            let (heads, tags) = git.ls_remote(remote)?;
-            (heads, Some(tags))
+        if online {
+            let (fetch_url, push_url, raw_url) = git.remote_urls(remote)?;
+            let (heads, tags) = git.ls_remote(&fetch_url)?;
+            Ok(RemoteView {
+                remote: remote.to_string(),
+                branches: heads,
+                remote_tags: Some(tags),
+                local_tags: git.tags(),
+                fetch_url,
+                push_url,
+                raw_url,
+            })
         } else {
-            (git.remote_branches(remote), None)
-        };
-        Ok(RemoteView { remote: remote.to_string(), branches, remote_tags, local_tags: git.tags() })
+            Ok(RemoteView {
+                remote: remote.to_string(),
+                branches: git.remote_branches(remote),
+                remote_tags: None,
+                local_tags: git.tags(),
+                fetch_url: String::new(),
+                push_url: String::new(),
+                raw_url: String::new(),
+            })
+        }
     }
 
     /// Every commit the remote is known to have at a ref tip.
@@ -262,7 +283,7 @@ pub fn pins(l: &Loaded, git: &Git, rev: Option<&str>, online: bool) -> Vec<PinSt
             out.push(st);
             continue;
         };
-        let rg = Git::new(&path);
+        let rg = Git::with_env(&path, &l.run_path(), &l.cfg.run.tool_env);
         if !rg.is_repo() {
             st.problem = Some(format!("{} is not a git checkout (repo {})", path.display(), p.repo));
             out.push(st);

@@ -32,7 +32,7 @@ impl Report {
 
 pub fn run(l: &Loaded, online: bool) -> Report {
     let mut r = Report::default();
-    let git = Git::new(&l.root);
+    let git = Git::with_env(&l.root, &l.run_path(), &l.cfg.run.tool_env);
     if !git.is_repo() {
         r.errors.push(format!("{} is not a git repository", l.root.display()));
         return r;

@@ -1,5 +1,10 @@
-//! A thin wrapper around the `git` command. User configuration that changes output
-//! (colour, signatures, pagers) is switched off for every call.
+//! A thin wrapper around the `git` command.
+//!
+//! Every git (and gh) invocation runs with a cleared environment plus a small allowlist,
+//! so variables such as `GIT_DIR`, `GIT_CONFIG_*`, `GIT_SSH_COMMAND` or `GH_HOST` in the
+//! caller's environment cannot redirect or alter it. Repository hooks, fsmonitor and the
+//! `ext::` transport are switched off on the command line. The user's global git
+//! configuration (credential helpers, ssh settings) remains the trusted base.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -7,25 +12,126 @@ use std::process::Command;
 /// `(name, commit)` pairs.
 pub type Refs = Vec<(String, String)>;
 
+/// Inherited variables git and gh keep: what authentication and identity need.
+pub const TOOL_VARS: &[&str] = &[
+    "HOME",
+    "LANG",
+    "TMPDIR",
+    "SSH_AUTH_SOCK",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+];
+
+/// Configuration forced on every git call.
+pub const SAFE_CONFIG: &[&str] =
+    &["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.ext.allow=never"];
+
+/// Names that may never be passed through to git or gh, even when declared.
+pub fn forbidden_tool_var(name: &str) -> bool {
+    name.starts_with("GIT_")
+        || matches!(
+            name,
+            "GH_HOST" | "GH_REPO" | "GH_ENTERPRISE_TOKEN" | "GITHUB_ENTERPRISE_TOKEN" | "GH_CONFIG_DIR" | "PATH"
+        )
+}
+
+/// The environment git and gh run with: `PATH`, the allowlist, the declared token
+/// variables, and fixed settings. Nothing else is inherited.
+pub fn tool_env(path: &str, declared: &[String]) -> Vec<(String, String)> {
+    let mut env = vec![("PATH".to_string(), path.to_string())];
+    for k in TOOL_VARS.iter().map(|k| k.to_string()).chain(declared.iter().filter(|k| !forbidden_tool_var(k)).cloned())
+    {
+        if let Ok(v) = std::env::var(&k) {
+            env.push((k, v));
+        }
+    }
+    env.push(("GIT_CONFIG_NOSYSTEM".into(), "1".into()));
+    env.push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
+    env.push(("LC_ALL".into(), "C".into()));
+    env
+}
+
+/// The repository a gh command should target, from a remote URL:
+/// `(host, owner/name)` for `https://host/owner/name(.git)`, `git@host:owner/name(.git)`
+/// and `ssh://[user@]host[:port]/owner/name(.git)`.
+pub fn forge_repo(url: &str) -> Option<(String, String)> {
+    let (host, path) = if let Some(rest) = url.strip_prefix("https://") {
+        rest.split_once('/')?
+    } else if let Some(rest) = url.strip_prefix("ssh://") {
+        let (h, p) = rest.split_once('/')?;
+        (h.rsplit('@').next()?.split(':').next()?, p)
+    } else if let Some((user_host, p)) = url.split_once(':') {
+        if user_host.contains('/') || !user_host.contains('@') {
+            return None;
+        }
+        (user_host.rsplit('@').next()?, p)
+    } else {
+        return None;
+    };
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = path.split('/');
+    let (owner, name) = (parts.next()?, parts.next()?);
+    let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if parts.next().is_some() || !ok(owner) || !ok(name) || !ok(host) {
+        return None;
+    }
+    Some((host.to_string(), format!("{owner}/{name}")))
+}
+
 #[derive(Clone, Debug)]
 pub struct Git {
     pub dir: PathBuf,
+    /// The environment every call runs with.
+    pub env: Vec<(String, String)>,
 }
 
 impl Git {
     pub fn new(dir: &Path) -> Git {
-        Git { dir: dir.to_path_buf() }
+        Git { dir: dir.to_path_buf(), env: tool_env(crate::steps::DEFAULT_PATH, &[]) }
+    }
+
+    pub fn with_env(dir: &Path, path: &str, declared: &[String]) -> Git {
+        Git { dir: dir.to_path_buf(), env: tool_env(path, declared) }
     }
 
     fn command(&self, args: &[&str]) -> Command {
+        self.command_with(SAFE_CONFIG, args)
+    }
+
+    /// Where git runs hooks for this repository, as the user configured it (the one
+    /// query made without Edition's forced `core.hooksPath`).
+    pub fn hooks_dir(&self) -> Result<String, String> {
+        let out = self.command_with(&[], &["rev-parse", "--git-path", "hooks"]).output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    fn command_with(&self, forced: &[&str], args: &[&str]) -> Command {
         let mut c = Command::new("git");
-        c.arg("-C")
+        c.env_clear()
+            .envs(self.env.iter().cloned())
+            .arg("-C")
             .arg(&self.dir)
+            .args(forced)
             .args(["-c", "color.ui=false", "-c", "log.showSignature=false", "-c", "core.pager=cat"])
-            .args(args)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("LC_ALL", "C");
+            .args(args);
         c
+    }
+
+    /// `(fetch URL, push URL, configured URL)` of a remote, after `insteadOf`,
+    /// `pushInsteadOf` and `pushurl`.
+    pub fn remote_urls(&self, remote: &str) -> Result<(String, String, String), String> {
+        let fetch = self.run(&["remote", "get-url", "--", remote])?;
+        let push = self.run(&["remote", "get-url", "--push", "--", remote])?;
+        let raw = self.run(&["config", "--get", &format!("remote.{remote}.url")]).unwrap_or_else(|_| fetch.clone());
+        if [&fetch, &push, &raw].iter().any(|u| u.is_empty() || u.starts_with('-') || u.chars().any(char::is_control)) {
+            return Err(format!("remote {remote} has an unusable URL"));
+        }
+        Ok((fetch, push, raw))
     }
 
     pub fn run(&self, args: &[&str]) -> Result<String, String> {

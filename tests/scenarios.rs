@@ -179,7 +179,8 @@ fn promote_to_prod_requires_the_held_commit_to_be_tagged() {
 
 #[test]
 fn verify_finds_unmerged_lines_and_forward_offers_a_pull_request() {
-    let (_root, work) = project("forward", BASE_CONFIG, "0.6.0-dev");
+    let (root, work) = project("forward", BASE_CONFIG, "0.6.0-dev");
+    forge_alias(&root, &work);
     line_with_version(&work, "0.5", "0.5.2");
     git(&work, &["checkout", "-q", "release/0.5"]);
     write(&work, "fix.md", "fix");
@@ -193,7 +194,12 @@ fn verify_finds_unmerged_lines_and_forward_offers_a_pull_request() {
 
     let fwd = edition(&work, &["forward"]);
     assert_eq!(fwd.code, 0, "{}", fwd.all());
-    assert!(fwd.stdout.contains("gh pr create --base main --head release/0.5"), "{}", fwd.stdout);
+    assert!(
+        fwd.stdout.contains("gh pr create --repo github.com/example/lib --base main --head release/0.5"),
+        "{}",
+        fwd.stdout
+    );
+    assert!(fwd.stdout.contains("destination: https://github.com/example/lib"), "{}", fwd.stdout);
     fwd.receipt();
 
     git(&work, &["merge", "-q", "--no-ff", "-s", "ours", "origin/release/0.5", "-m", "Merge release/0.5 forward"]);
@@ -223,8 +229,12 @@ fn hotfix_start_then_finish_tags_and_opens_the_forward_merge_in_one_plan() {
     git(&work, &["push", "-q", "origin", "hotfix/0.5.3:release/0.5"]);
     git(&work, &["checkout", "-q", "main"]);
 
-    let path = fake_gh(&root);
-    let env = [("PATH", path.as_str())];
+    forge_alias(&root, &work);
+    let cfg = format!("{BASE_CONFIG}{}", fake_gh(&root));
+    write(&work, "edition.toml", &cfg);
+    commit_all(&work, "Use the fake gh");
+    git(&work, &["push", "-q", "origin", "main"]);
+    let env = [("GH_HOST", "attacker.example")];
     let dry = edition_env(&work, &["hotfix", "finish", "0.5.3"], &env);
     assert_eq!(dry.code, 0, "{}", dry.all());
     assert_eq!(dry.stdout.matches("Receipt: ").count(), 1, "one plan, one receipt");
@@ -232,7 +242,10 @@ fn hotfix_start_then_finish_tags_and_opens_the_forward_merge_in_one_plan() {
     assert_eq!(finish.code, 0, "{}", finish.all());
     assert!(git(&work, &["ls-remote", "--tags", "origin"]).contains("refs/tags/v0.5.3"));
     let calls = std::fs::read_to_string(root.join("bin/gh-calls.log")).expect("gh ran");
-    assert!(calls.contains("pr create --base main --head release/0.5"), "{calls}");
+    assert!(
+        calls.contains("GH_HOST=github.com pr create --repo github.com/example/lib --base main --head release/0.5"),
+        "{calls}"
+    );
     let ledger = std::fs::read_to_string(work.join("releases/ledger.toml")).expect("ledger");
     assert!(ledger.contains("action = \"push-tag\""));
     assert!(ledger.contains("action = \"open-pr\""));

@@ -50,8 +50,18 @@ impl Ctx {
 
     fn git_step(&self, kind: Kind, what: &str, args: &[&str]) -> Step {
         let mut argv = vec!["git".to_string()];
+        argv.extend(crate::git::SAFE_CONFIG.iter().map(|s| s.to_string()));
         argv.extend(args.iter().map(|s| s.to_string()));
         Step::plain(kind, what, argv, &self.l.root)
+    }
+
+    /// Binds a plan to the remote's resolved URLs: reads and re-checks go to the fetch
+    /// URL, pushes to the push URL, and all three URLs are part of the plan hash.
+    fn bind(&self, plan: &mut Plan, view: &RemoteView) {
+        plan.remote = view.fetch_url.clone();
+        plan.fact("fetch-url", &view.fetch_url);
+        plan.fact("push-url", &view.push_url);
+        plan.fact("configured-url", &view.raw_url);
     }
 
     /// Outward plans run from a clean checkout on a branch, so the ledger is committed
@@ -211,6 +221,7 @@ impl Ctx {
         let used = self.receipt_used();
         let mut plan = plan.clone();
         plan.run_path = self.l.run_path();
+        plan.tool_env = self.git.env.clone();
         if let Err(e) = plan.resolve() {
             return refuse(&[e]);
         }
@@ -519,6 +530,7 @@ pub fn cut(c: &Ctx, line: &str) -> Res {
         Err(e) => problems.push(e),
     }
     let mut plan = Plan::new(&format!("Cut the {line} line from {}", short(&from_commit)), &l.cfg.remote);
+    c.bind(&mut plan, &view);
     let (content, overrides) = c.content_gate(&view, std::slice::from_ref(&from_commit), &mut plan);
     problems.extend(content);
     if !problems.is_empty() {
@@ -542,10 +554,11 @@ pub fn cut(c: &Ctx, line: &str) -> Res {
                 "push",
                 "--atomic",
                 &format!("--force-with-lease=refs/heads/{branch}:"),
-                &l.cfg.remote,
+                &view.push_url,
                 &format!("{from_commit}:refs/heads/{branch}"),
             ],
         )
+        .to(&view.push_url)
         .expecting(&format!("refs/heads/{branch}"), None)
         .expecting(&format!("refs/heads/{}", l.cfg.main), Some(&main_tip)),
     ];
@@ -636,7 +649,7 @@ fn tag_parts(c: &Ctx, view: &RemoteView, version: &str, pre: bool, problems: &mu
     Some(TagParts { name, commit, line_branch: branch, line_tip })
 }
 
-fn push_tag_steps(c: &Ctx, t: &TagParts) -> Vec<Step> {
+fn push_tag_steps(c: &Ctx, t: &TagParts, push_url: &str) -> Vec<Step> {
     let msg = format!("{} {}", c.l.cfg.product, t.name);
     vec![
         c.git_step(
@@ -651,10 +664,11 @@ fn push_tag_steps(c: &Ctx, t: &TagParts) -> Vec<Step> {
                 "push",
                 "--atomic",
                 &format!("--force-with-lease=refs/tags/{}:", t.name),
-                &c.l.cfg.remote,
+                push_url,
                 &format!("refs/tags/{}", t.name),
             ],
         )
+        .to(push_url)
         .expecting(&format!("refs/tags/{}", t.name), None)
         .expecting(&format!("refs/heads/{}", t.line_branch), Some(&t.line_tip)),
     ]
@@ -667,6 +681,7 @@ fn tag_plan(c: &Ctx, version: &str, pre: bool) -> Res {
     let Some(t) = tag_parts(c, &view, version, pre, &mut problems) else { return refuse(&problems) };
     let title = format!("{} {} at {}", if pre { "Pre-release" } else { "Release" }, t.name, short(&t.commit));
     let mut plan = Plan::new(&title, &c.l.cfg.remote);
+    c.bind(&mut plan, &view);
     let (content, overrides) = c.content_gate(&view, std::slice::from_ref(&t.commit), &mut plan);
     problems.extend(content);
     if !problems.is_empty() {
@@ -675,7 +690,7 @@ fn tag_plan(c: &Ctx, version: &str, pre: bool) -> Res {
     plan.fact("action", "tag");
     plan.fact("tag", &t.name);
     plan.fact("commit", &t.commit);
-    plan.steps = push_tag_steps(c, &t);
+    plan.steps = push_tag_steps(c, &t, &view.push_url);
     let e = c.base_entry("push-tag", &t.name, &t.commit);
     c.run(&plan, vec![Record { index: 1, entry: e }], &overrides)
 }
@@ -738,6 +753,7 @@ pub fn hotfix_finish(c: &Ctx, version: &str) -> Res {
         return refuse(&[format!("{} has no {} branch", l.cfg.remote, l.cfg.main)]);
     };
     let mut plan = Plan::new(&format!("Finish hotfix {} at {}", t.name, short(&t.commit)), &l.cfg.remote);
+    c.bind(&mut plan, &view);
     let (content, overrides) = c.content_gate(&view, std::slice::from_ref(&t.commit), &mut plan);
     problems.extend(content);
     if !problems.is_empty() {
@@ -746,10 +762,12 @@ pub fn hotfix_finish(c: &Ctx, version: &str) -> Res {
     plan.fact("action", "hotfix-finish");
     plan.fact("tag", &t.name);
     plan.fact("commit", &t.commit);
-    plan.steps = push_tag_steps(c, &t);
+    plan.steps = push_tag_steps(c, &t, &view.push_url);
     let tag_index = plan.steps.len() - 1;
-    let pr = forward_step(c, &t.line_branch, &t.line_tip, &main_tip)
-        .expecting(&format!("refs/tags/{}", t.name), Some(&t.commit));
+    let pr = match forward_step(c, &view, &t.line_branch, &t.line_tip, &main_tip) {
+        Ok(step) => step.expecting(&format!("refs/tags/{}", t.name), Some(&t.commit)),
+        Err(e) => return refuse(&[e]),
+    };
     plan.steps.push(pr);
     let pr_index = plan.steps.len() - 1;
     let tag_entry = c.base_entry("push-tag", &t.name, &t.commit);
@@ -764,20 +782,30 @@ pub fn hotfix_finish(c: &Ctx, version: &str) -> Res {
 
 // ---------------------------------------------------------------- forward
 
-fn forward_step(c: &Ctx, branch: &str, tip: &str, main_tip: &str) -> Step {
+/// The pull request goes to the repository named by the remote's configured URL, on
+/// that host, explicitly (`--repo host/owner/name`, `GH_HOST`).
+fn forward_step(c: &Ctx, view: &RemoteView, branch: &str, tip: &str, main_tip: &str) -> Result<Step, String> {
     let l = &c.l;
+    let Some((host, repo)) = crate::git::forge_repo(&view.raw_url) else {
+        return Err(format!(
+            "cannot tell which repository gh should open the pull request in from {}'s URL ({})",
+            view.remote, view.raw_url
+        ));
+    };
     let title = format!("Merge {branch} forward into {}", l.cfg.main);
     let body = format!(
         "Brings the commits shipped on {branch} into {}, as of {tip}. Release lines merge forward only; {} is never merged into {branch}.\n\nOpened by edition.",
         l.cfg.main, l.cfg.main
     );
-    Step::plain(
+    let mut step = Step::plain(
         Kind::Outward,
         &format!("open a pull request merging {branch} into {}", l.cfg.main),
         vec![
             "gh".into(),
             "pr".into(),
             "create".into(),
+            "--repo".into(),
+            format!("{host}/{repo}"),
             "--base".into(),
             l.cfg.main.clone(),
             "--head".into(),
@@ -791,6 +819,9 @@ fn forward_step(c: &Ctx, branch: &str, tip: &str, main_tip: &str) -> Step {
     )
     .expecting(&format!("refs/heads/{branch}"), Some(tip))
     .expecting(&format!("refs/heads/{}", l.cfg.main), Some(main_tip))
+    .to(&format!("https://{host}/{repo}"));
+    step.env.push(("GH_HOST".into(), host.clone()));
+    Ok(step)
 }
 
 pub fn forward(c: &Ctx) -> Res {
@@ -802,6 +833,7 @@ pub fn forward(c: &Ctx) -> Res {
         return refuse(&[format!("{} has no {} branch", l.cfg.remote, l.cfg.main)]);
     };
     let mut plan = Plan::new("Forward merges", &l.cfg.remote);
+    c.bind(&mut plan, &view);
     plan.fact("action", "forward");
     let mut records = Vec::new();
     for (name, tip) in &view.branches {
@@ -825,7 +857,10 @@ pub fn forward(c: &Ctx) -> Res {
         for m in &missing {
             println!("    {m}");
         }
-        plan.steps.push(forward_step(c, name, tip, &main_tip));
+        match forward_step(c, &view, name, tip, &main_tip) {
+            Ok(step) => plan.steps.push(step),
+            Err(e) => return refuse(&[e]),
+        }
         let mut e = c.base_entry("open-pr", name, tip);
         e.note = Some(format!("forward merge of {name} into {}", l.cfg.main));
         records.push(Record { index: plan.steps.len() - 1, entry: e });
@@ -910,6 +945,7 @@ fn cmd_step(
         expects: Vec::new(),
         isolated: true,
         program: std::path::PathBuf::new(),
+        dest: None,
     })
 }
 /// A platform's build number at a commit, from its configured build file.
@@ -1055,6 +1091,9 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
     ];
     let title = format!("Deploy {r} ({}) to {channel} [{} tier, {}]", short(&commit), ch.tier.name(), ch.target);
     let mut plan = Plan::new(&title, &l.cfg.remote);
+    if !dev {
+        c.bind(&mut plan, &view);
+    }
     for (k, v) in [
         ("action", "deploy"),
         ("channel", channel),
@@ -1084,6 +1123,7 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
         let kind = if dev { Kind::Local } else { Kind::Outward };
         let mut run =
             cmd_step(c, kind, &format!("{} {} to {}", ch.kind, short(&commit), ch.target), &ch.run, &ch.env, &vals)?;
+        run.dest = Some(ch.target.clone());
         match ch.tier {
             Tier::Staging => run
                 .expects
@@ -1231,7 +1271,7 @@ pub fn ledger_cmd(c: &Ctx, channel: Option<&str>) -> Res {
 const HOOK: &str = "#!/bin/sh\n# Installed by `edition hooks install`: content, version and pin checks before a push.\nexec edition check-push \"$1\" \"$2\"\n";
 
 pub fn hooks_install(c: &Ctx) -> Res {
-    let dir = c.git.run(&["rev-parse", "--git-path", "hooks"])?;
+    let dir = c.git.hooks_dir()?;
     let dir = c.l.root.join(dir);
     let path = dir.join("pre-push");
     if let Ok(existing) = std::fs::read_to_string(&path) {

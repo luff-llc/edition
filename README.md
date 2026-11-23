@@ -84,7 +84,9 @@ state is unverified.
 
 Configured commands run with a cleared environment (`PATH`, `HOME`, `LANG`, `TMPDIR`
 and the variables a channel declares), so a deploy script that needs a credential must
-declare it, and must deploy the commit SHA it is given. The ledger's remote anchor is the
+declare it, and must deploy the commit SHA it is given. Edition's own git and gh calls
+also run with a cleared environment, with repository hooks off, and push to the remote
+URL resolved when the plan was made; the plan shows every destination. The ledger's remote anchor is the
 default branch: protect it against force pushes.
 
 Exit codes: `0` success or a printed dry run, `1` refused or a failed step, `2` usage,

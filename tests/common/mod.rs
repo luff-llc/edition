@@ -222,9 +222,22 @@ pub fn line_with_version(work: &Path, line: &str, version: &str) -> String {
     c
 }
 
-/// A directory with a fake `gh` that records its arguments, for PATH.
+/// A directory with a fake `gh` that records its arguments and `GH_HOST`, and the
+/// `[run] path` line that puts it first.
 pub fn fake_gh(root: &Path) -> String {
     let bin = root.join("bin");
-    executable(&bin, "gh", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/gh-calls.log\"\n");
-    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+    executable(
+        &bin,
+        "gh",
+        "#!/bin/sh\nprintf 'GH_HOST=%s %s\\n' \"$GH_HOST\" \"$*\" >> \"$(dirname \"$0\")/gh-calls.log\"\n",
+    );
+    format!("\n[run]\npath = \"{}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin\"\n", bin.display())
+}
+
+/// Gives origin a forge-style URL that git rewrites to the local bare repository, as a
+/// real checkout of a hosted repository would have.
+pub fn forge_alias(root: &Path, work: &Path) {
+    let origin = root.join("origin.git");
+    git(work, &["config", "remote.origin.url", "https://github.com/example/lib.git"]);
+    git(work, &["config", &format!("url.{}.insteadOf", origin.display()), "https://github.com/example/lib.git"]);
 }
