@@ -871,7 +871,55 @@ fn run_path_refuses_an_untrustworthy_home_or_directory() {
     write(&work, "edition.toml", &home_config(&format!("{}:/usr/bin:/bin", open.display())));
     let writable = edition(&work, &["status"]);
     assert_eq!(writable.code, 2, "{}", writable.all());
-    assert!(writable.stderr.contains("writable by others"), "{}", writable.stderr);
+    assert!(writable.stderr.contains("writable by its group or others"), "{}", writable.stderr);
     write(&work, "edition.toml", &home_config("bin:/usr/bin"));
     assert_eq!(edition(&work, &["status"]).code, 2);
+}
+
+#[test]
+fn run_path_refuses_group_writable_foreign_or_exposed_directories() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let (root, work) = project("run-path-trust", BASE_CONFIG, "0.6.0-dev");
+
+    let group = root.join("group-bin");
+    std::fs::create_dir(&group).expect("mkdir");
+    std::fs::set_permissions(&group, std::fs::Permissions::from_mode(0o775)).expect("chmod");
+    write(&work, "edition.toml", &home_config(&format!("{}:/usr/bin:/bin", group.display())));
+    let g = edition(&work, &["status"]);
+    assert_eq!(g.code, 2, "{}", g.all());
+    assert!(g.stderr.contains("run.path entry") && g.stderr.contains("writable by its group"), "{}", g.stderr);
+
+    // A non-sticky writable ancestor lets the entry be swapped.
+    let exposed = root.join("exposed");
+    let inner = exposed.join("bin");
+    std::fs::create_dir_all(&inner).expect("mkdir");
+    std::fs::set_permissions(&exposed, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+    write(&work, "edition.toml", &home_config(&format!("{}:/usr/bin:/bin", inner.display())));
+    let a = edition(&work, &["status"]);
+    assert_eq!(a.code, 2, "{}", a.all());
+    assert!(a.stderr.contains("run.path ancestor"), "{}", a.stderr);
+    std::fs::set_permissions(&exposed, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    assert_eq!(edition(&work, &["status"]).code, 0);
+
+    // An entry owned by another (non-root) user, if this system has one we can see.
+    let me = std::fs::metadata(&work).expect("meta").uid();
+    let foreign = ["/private/var/db", "/var/db", "/var/lib", "/usr/local"]
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            std::fs::metadata(p)
+                .is_ok_and(|m| m.is_dir() && m.uid() != 0 && m.uid() != me && m.permissions().mode() & 0o022 == 0)
+        });
+    match foreign {
+        Some(dir) => {
+            write(&work, "edition.toml", &home_config(&format!("{}:/usr/bin:/bin", dir.display())));
+            let f = edition(&work, &["status"]);
+            assert_eq!(f.code, 2, "{}", f.all());
+            assert!(f.stderr.contains("owned by another user"), "{}", f.stderr);
+        }
+        None => eprintln!("skipped: no directory owned by another non-root user is visible on this system"),
+    }
 }

@@ -143,6 +143,8 @@ app: [examples/library](examples/library/edition.toml) and
 - Ledger anchoring depends on a protected remote default branch.
 - Locking is POSIX advisory locking, which some network filesystems do not honour.
 - Signed-tag setups may need `GPG_TTY` or `GNUPGHOME` declared in `run.tool_env`.
+- Output printed by configured channel commands is passed through to the terminal as-is;
+  Edition does not redact it.
 
 ## Development
 

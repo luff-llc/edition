@@ -364,7 +364,7 @@ offset. Edition never reads it back.
 | `[content] deny`, `allow_paths`, `action` | the content check's patterns (`<word>` matches one word), exempt path globs, `block` (default) or `report` |
 | `[concordance] catalog`, `release`, `bin` | the Concordance catalog; the release id template (`{version}`) |
 | `[vars] NAME` | values for `{var.NAME}`; an empty value must come from `EDITION_VAR_NAME` on the machine and is treated as secret |
-| `[run] path` | `PATH` for every command Edition runs, including git and gh: absolute directories, or under `~/` (which needs an absolute, colon-free `HOME`); each is canonicalized, missing ones are dropped, and one writable by others refuses the configuration |
+| `[run] path` | `PATH` for every command Edition runs, including git and gh: absolute directories, or under `~/` (which needs an absolute, colon-free `HOME`); each is canonicalized and missing ones are dropped. An entry must be owned by root or the current user and not group- or other-writable; every ancestor up to `/` must be owned by root or the current user and may be group- or other-writable only if sticky. A configured entry that fails refuses the configuration; the built-in default silently skips such directories (Homebrew's `bin` is group-writable by design) |
 | `[run] tool_env` | variables git and gh may inherit, such as `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GPG_TTY`, `GNUPGHOME` |
 | `[receipts] ttl_minutes` | receipt lifetime, 1 to 60 (default 30) |
 | `[verify] tags_since` | older tags are not checked against version files |

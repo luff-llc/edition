@@ -179,7 +179,9 @@ fn promote_to_prod_requires_the_held_commit_to_be_tagged() {
 
 #[test]
 fn verify_finds_unmerged_lines_and_forward_offers_a_pull_request() {
-    let (root, work) = project("forward", BASE_CONFIG, "0.6.0-dev");
+    let bins = tmp("forward-bin");
+    let cfg = format!("{BASE_CONFIG}{}", fake_gh(&bins));
+    let (root, work) = project("forward", &cfg, "0.6.0-dev");
     forge_alias(&root, &work);
     line_with_version(&work, "0.5", "0.5.2");
     git(&work, &["checkout", "-q", "release/0.5"]);

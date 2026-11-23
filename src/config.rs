@@ -345,13 +345,51 @@ pub struct Loaded {
     pub run_path: String,
 }
 
+/// The effective user id, without libc: the owner of a file this process just created.
+fn current_uid() -> Result<u32, String> {
+    use std::os::unix::fs::MetadataExt;
+    static UID: std::sync::OnceLock<Result<u32, String>> = std::sync::OnceLock::new();
+    UID.get_or_init(|| {
+        let nonce = crate::util::random_hex(8)?;
+        let p = std::env::temp_dir().join(format!(".edition-uid-{nonce}"));
+        let f = std::fs::OpenOptions::new().write(true).create_new(true).open(&p).map_err(|e| e.to_string())?;
+        let uid = f.metadata().map(|m| m.uid()).map_err(|e| e.to_string());
+        let _ = std::fs::remove_file(&p);
+        uid
+    })
+    .clone()
+}
+
+/// The `run.path` trust rule. An entry must be owned by root or the current user and
+/// writable by neither its group nor others. Each ancestor up to `/` must be owned by
+/// root or the current user, and may be group- or other-writable only if it is sticky
+/// (as `/tmp` is), because a sticky directory does not let others rename or replace an
+/// entry they do not own.
+fn trusted_dir(path: &std::path::Path, meta: &std::fs::Metadata, entry: bool) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let uid = current_uid().map_err(|e| format!("cannot tell the current user: {e}"))?;
+    let what = if entry { "run.path entry" } else { "run.path ancestor" };
+    if meta.uid() != 0 && meta.uid() != uid {
+        return Err(format!("{what} {} is owned by another user; refusing to run commands from it", path.display()));
+    }
+    let mode = meta.permissions().mode();
+    let writable = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if writable && (entry || !sticky) {
+        return Err(format!(
+            "{what} {} is writable by its group or others; refusing to run commands from it",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Resolves `[run] path` (or the default) into the `PATH` every command runs with.
 /// A leading `~/` needs `HOME` to be absolute and free of `:`. Every entry must end up
 /// absolute, without `:`, canonical, and not writable by others; entries that do not
 /// exist are dropped. Planning runs git before any receipt exists, so this is checked
 /// before anything runs.
 pub fn checked_run_path(configured: Option<&str>) -> Result<String, String> {
-    use std::os::unix::fs::PermissionsExt;
     let p = configured.unwrap_or(crate::steps::DEFAULT_PATH);
     let mut out: Vec<String> = Vec::new();
     for d in p.split(':').filter(|d| !d.is_empty()) {
@@ -376,11 +414,22 @@ pub fn checked_run_path(configured: Option<&str>) -> Result<String, String> {
         if !meta.is_dir() {
             continue;
         }
-        if meta.permissions().mode() & 0o002 != 0 {
-            return Err(format!(
-                "run.path entry {} is writable by others; refusing to run commands from it",
-                canon.display()
-            ));
+        let check = || -> Result<(), String> {
+            trusted_dir(&canon, &meta, true)?;
+            let mut up = canon.parent();
+            while let Some(a) = up {
+                let am = std::fs::metadata(a).map_err(|e| format!("run.path ancestor {}: {e}", a.display()))?;
+                trusted_dir(a, &am, false)?;
+                up = a.parent();
+            }
+            Ok(())
+        };
+        match check() {
+            Ok(()) => {}
+            // The built-in default skips directories that fail the rule (Homebrew's bin
+            // is group-writable by design); a configured entry that fails is an error.
+            Err(_) if configured.is_none() => continue,
+            Err(e) => return Err(e),
         }
         let c = canon.display().to_string();
         if c.contains(':') {
