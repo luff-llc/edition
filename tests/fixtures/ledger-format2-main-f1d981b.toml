@@ -1,0 +1,78 @@
+# Edition ledger: what went where. Append-only; written by `edition`, never by hand.
+# A correction is a new entry; see Edition's docs/design.md.
+format = 2
+
+[[entry]]
+id = "2026-11-23T22:49:31Z/staging-home/9067222d1a/68fa2f54"
+at = "2026-11-23T22:49:31Z"
+by = "fixture-agent"
+action = "deploy"
+product = "lib"
+channel = "staging-home"
+tier = "staging"
+target = "https://staging.example.com"
+ref = "main"
+commit = "9067222d1aad6db975d9e270f4addbbd4f916d9a"
+tree = "9243970bda218f8cd1410778c50f61bcb358d3a2"
+version = "0.6.0-dev"
+result = "ok"
+prev = "0000000000000000000000000000000000000000000000000000000000000000"
+receipt = "68fa2f54c7d7f2275908bb6066c19ae4"
+command = [
+  "home 9067222d1a to https://staging.example.com: true",
+]
+steps = [
+  "check unit: exit 0",
+  "home 9067222d1a to https://staging.example.com: exit 0",
+  "probe: exit 0",
+]
+
+[[entry]]
+id = "2026-11-23T22:49:32Z/staging-home/a32699a5d1/0baecf9d"
+at = "2026-11-23T22:49:32Z"
+by = "fixture-agent"
+action = "deploy"
+product = "lib"
+channel = "staging-home"
+tier = "staging"
+target = "https://staging.example.com"
+ref = "main"
+commit = "a32699a5d103e26a8f0b139219b869ba84fe5be7"
+tree = "dbd744b69675ce21b3f047cf78f980c442f55bcc"
+version = "0.6.0-dev"
+result = "ok"
+prev = "cf8f6a766558ab8d55681a2f887a525ef4f358d4c95aa148a90c35415ece65bf"
+receipt = "0baecf9d8040ade336566445fcede2e6"
+note = "second deploy"
+command = [
+  "home a32699a5d1 to https://staging.example.com: true",
+]
+steps = [
+  "check unit: exit 0",
+  "home a32699a5d1 to https://staging.example.com: exit 0",
+  "probe: exit 0",
+]
+
+[[entry]]
+id = "2026-11-23T22:49:34Z/production-home/ca1b750366/b4be4d23"
+at = "2026-11-23T22:49:34Z"
+by = "fixture-agent"
+action = "deploy"
+product = "lib"
+channel = "production-home"
+tier = "prod"
+target = "https://home.example.com"
+ref = "v0.6.0"
+commit = "ca1b750366205af417b71e24b3553a5ecbe504fe"
+tree = "73cb2ac83b24c5beae0a2c257cf4559c52d2c4d9"
+version = "0.6.0"
+result = "ok"
+prev = "ff37f0fdba3da991fb83799073d1a5c69196003127f4b4953f0f75561f8b9753"
+receipt = "b4be4d23180d5513616d86debcaf6641"
+approved_by = "owner"
+command = [
+  "home ca1b750366 to https://home.example.com: true",
+]
+steps = [
+  "home ca1b750366 to https://home.example.com: exit 0",
+]

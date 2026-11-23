@@ -183,6 +183,8 @@ pub struct CheckTreeCfg {
     pub max_file_bytes: Option<u64>,
     /// All files together, in bytes (default 2 GiB).
     pub max_total_bytes: Option<u64>,
+    /// The tree's listing (paths and their metadata), in bytes (default 32 MiB).
+    pub max_listing_bytes: Option<u64>,
 }
 
 impl CheckTreeCfg {
@@ -192,6 +194,7 @@ impl CheckTreeCfg {
             max_entries: self.max_entries.unwrap_or(d.max_entries),
             max_file_bytes: self.max_file_bytes.unwrap_or(d.max_file_bytes),
             max_total_bytes: self.max_total_bytes.unwrap_or(d.max_total_bytes),
+            max_listing_bytes: self.max_listing_bytes.unwrap_or(d.max_listing_bytes),
         }
     }
 }
@@ -874,6 +877,7 @@ impl Loaded {
             ("max_entries", c.check_tree.max_entries),
             ("max_file_bytes", c.check_tree.max_file_bytes),
             ("max_total_bytes", c.check_tree.max_total_bytes),
+            ("max_listing_bytes", c.check_tree.max_listing_bytes),
         ] {
             if v == Some(0) {
                 errs.push(format!("check_tree.{k} must be at least 1"));

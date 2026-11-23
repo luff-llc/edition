@@ -401,22 +401,7 @@ mod tests {
     fn sha256_vectors() {
         assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        // Fed in uneven pieces, the stream hash matches the one-shot one.
-        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 % 251) as u8).collect();
-        for sha256 in [false, true] {
-            let mut h = StreamHash::new(sha256);
-            let mut rest = &data[..];
-            for n in [1usize, 63, 64, 65, 3, 200].iter().cycle() {
-                if rest.is_empty() {
-                    break;
-                }
-                let (a, b) = rest.split_at((*n).min(rest.len()));
-                h.update(a);
-                rest = b;
-            }
-            let one = if sha256 { sha256_hex(&data) } else { sha1_hex(&data) };
-            assert_eq!(h.finish(), one);
-        }
+
         let long = vec![b'a'; 1000];
         assert_eq!(sha256_hex(&long), "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3");
         let r = random_hex(16).expect("random");
@@ -455,5 +440,121 @@ mod tests {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    /// Known answers from tools independent of this code: `shasum -a 1`, `shasum -a 256`
+    /// and `openssl dgst -sha256` (which agree), over `n` bytes of `a`. The 1 000 000-byte
+    /// vectors are also the published FIPS 180 ones.
+    const A_VECTORS: &[(usize, &str, &str)] = &[
+        (
+            0,
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            55,
+            "c1c8bbdc22796e28c0e15163d20899b65621d65a",
+            "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+        ),
+        (
+            56,
+            "c2db330f6083854c99d4b5bfb6e8f29f201be699",
+            "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+        ),
+        (
+            63,
+            "03f09f5b158a7a8cdad920bddc29b81c18a551f5",
+            "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34",
+        ),
+        (
+            64,
+            "0098ba824b5c16427bd7a1122a5a442a25ec644d",
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+        ),
+        (
+            65,
+            "11655326c708d70319be2610e8a57d9a5b959d3b",
+            "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0",
+        ),
+        (
+            119,
+            "ee971065aaa017e0632a8ca6c77bb3bf8b1dfc56",
+            "31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb",
+        ),
+        (
+            120,
+            "f34c1488385346a55709ba056ddd08280dd4c6d6",
+            "2f3d335432c70b580af0e8e1b3674a7c020d683aa5f73aaaedfdc55af904c21c",
+        ),
+        (
+            1_000_000,
+            "34aa973cd4c4daa4f61eeb2bdbad27316534016f",
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+        ),
+    ];
+
+    #[test]
+    fn sha_known_answers_at_the_padding_boundaries() {
+        for (n, sha1, sha256) in A_VECTORS {
+            let data = vec![b'a'; *n];
+            assert_eq!(sha1_hex(&data), *sha1, "sha1 of {n} bytes");
+            assert_eq!(sha256_hex(&data), *sha256, "sha256 of {n} bytes");
+        }
+    }
+
+    #[test]
+    fn sha_known_answers_for_a_multi_megabyte_input() {
+        // (i * 7 + 3) mod 256 for 3 MiB + 17 bytes; digests from shasum.
+        let data: Vec<u8> = (0..(3 * 1024 * 1024 + 17)).map(|i: usize| ((i * 7 + 3) % 256) as u8).collect();
+        assert_eq!(sha1_hex(&data), "61889c7cfef045a8caf53e696db34a5054f2f168");
+        assert_eq!(sha256_hex(&data), "af0420698203db612d2363019e5daab6c288a059aad9a9ee0270be2cd0f5bd4d");
+        for sha256 in [false, true] {
+            let mut h = StreamHash::new(sha256);
+            for c in data.chunks(65_537) {
+                h.update(c);
+            }
+            let want = if sha256 {
+                "af0420698203db612d2363019e5daab6c288a059aad9a9ee0270be2cd0f5bd4d"
+            } else {
+                "61889c7cfef045a8caf53e696db34a5054f2f168"
+            };
+            assert_eq!(h.finish(), want);
+        }
+    }
+
+    #[test]
+    fn sha_updates_split_at_every_offset_around_the_block_boundaries() {
+        // (i * 31 + 5) mod 256 for 200 bytes; digests from shasum.
+        let data: Vec<u8> = (0..200usize).map(|i| ((i * 31 + 5) % 256) as u8).collect();
+        let want = [
+            (false, "4f346e1d048d0b60e1bff62d7a8a608bbf9a26fe"),
+            (true, "650ff77e1121cdbf6069827a5da6a7a1d80ab96bdeb01b64da8a5b22a3be900a"),
+        ];
+        for (sha256, digest) in want {
+            for i in 0..=data.len() {
+                let mut h = StreamHash::new(sha256);
+                h.update(&data[..i]);
+                h.update(&data[i..]);
+                assert_eq!(h.finish(), digest, "split at {i}");
+            }
+            // Three pieces with both cuts near the first two block boundaries.
+            for i in 50..=70 {
+                for j in i..=135.min(data.len()) {
+                    if j < 115 && j != i {
+                        continue;
+                    }
+                    let mut h = StreamHash::new(sha256);
+                    h.update(&data[..i]);
+                    h.update(&data[i..j]);
+                    h.update(&data[j..]);
+                    assert_eq!(h.finish(), digest, "split at {i} and {j}");
+                }
+            }
+            let mut h = StreamHash::new(sha256);
+            for b in &data {
+                h.update(std::slice::from_ref(b));
+            }
+            assert_eq!(h.finish(), digest, "byte by byte");
+        }
     }
 }

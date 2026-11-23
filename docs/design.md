@@ -336,8 +336,10 @@ are three kinds of gate:
     HFS+ ignores), a link that is absolute or contains `..`, or two paths that are the same
     on this file system (by case or Unicode normalisation) refuse the run. A submodule's
     place is an empty directory. `[check_tree] max_entries` (default 100 000),
-    `max_file_bytes` (256 MiB) and `max_total_bytes` (2 GiB) refuse a larger tree when the
-    plan is made.
+    `max_file_bytes` (256 MiB), `max_total_bytes` (2 GiB) and `max_listing_bytes` (32 MiB,
+    the paths and their metadata; no path may exceed 4096 bytes) refuse a larger tree when
+    the plan is made. The listing is read record by record and stopped at the first excess,
+    so a hostile tree cannot exhaust memory before a limit applies.
   - **Where.** Outside every repository, in `$XDG_CACHE_HOME/edition/checks` (else
     `~/.cache/edition/checks`), whose ancestors must belong to you or root and not be
     writable by others unless sticky, and whose `edition` and `checks` directories are
@@ -353,10 +355,15 @@ are three kinds of gate:
     and is left alone. Only then is an ownership marker naming the directory written in
     it, and locked while the check runs. A run that was killed leaves its directory; the
     next run removes it only if its marker names it and is not locked. A directory with no
-    valid marker is never removed.
+    valid marker is never removed. These are advisory locks, which are unreliable on NFS
+    and some other network file systems: keep the cache directory on a local file system.
 
-  A check that needs installed dependencies (`node_modules`, a build cache) must set them
-  up itself.
+  Every check starts in a fresh directory, every time. A check that needs installed
+  dependencies (`node_modules`, a build cache) must set them up itself, and a build tool
+  that keys its cache on the source path (cargo's `target/`, SwiftPM's `.build`, Gradle's
+  project cache) rebuilds the project's own code on every run. Pointing it at a cache
+  outside the tree (`CARGO_TARGET_DIR`, `GRADLE_USER_HOME`, an npm cache) in the check's
+  `env` still saves the dependencies.
 - **The parity gate** (`kind = "parity"`): Edition asks Concordance
   (`concordance track --format json`) for the release that matches the version and
   refuses while any item the release carries is not ready on the platforms the release
@@ -559,7 +566,7 @@ offset. Edition never reads it back.
 | `[run] trust_group_writable` | exact canonical paths of group-writable directories to allow in `path` (for example `/opt/homebrew/bin`); each one in use is printed with the plan and part of its hash |
 | `[run] tool_env` | variables git and gh may inherit, such as `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GPG_TTY`, `GNUPGHOME` |
 | `[receipts] ttl_minutes` | receipt lifetime, 1 to 60 (default 30) |
-| `[check_tree] max_entries`, `max_file_bytes`, `max_total_bytes` | limits on the tree checks run on (defaults 100 000 entries, 256 MiB, 2 GiB) |
+| `[check_tree] max_entries`, `max_file_bytes`, `max_total_bytes`, `max_listing_bytes` | limits on the tree checks run on (defaults 100 000 entries, 256 MiB, 2 GiB, 32 MiB of listing) |
 | `[verify] tags_since` | older tags are not checked against version files |
 
 Placeholders in `run`, `probe`, `env`, `probe_env` and check commands, each a whole argument or value:

@@ -389,6 +389,7 @@ fn trees_over_the_limits_are_refused_before_anything_is_written() {
         ("max_file_bytes = 40", "check_tree.max_file_bytes"),
         ("max_total_bytes = 200", "check_tree.max_total_bytes"),
         ("max_entries = 3", "check_tree.max_entries"),
+        ("max_listing_bytes = 300", "check_tree.max_listing_bytes"),
     ]
     .iter()
     .enumerate()
@@ -613,4 +614,47 @@ fn a_check_program_must_be_in_the_deployed_tree() {
     let out = edition_env(&p.work, &["deploy", "npm-newer", "v0.6.0"], &TOKEN);
     assert_ne!(out.code, 0, "{}", out.all());
     assert!(out.all().contains("is not an executable file in the tree of"), "{}", out.all());
+}
+
+#[test]
+fn a_path_longer_than_the_limit_stops_the_listing() {
+    let p = plain("tree-long-path");
+    let blob = p.blob("x");
+    let name = "n".repeat(edition::checktree::MAX_PATH_BYTES + 1);
+    p.retag_with(&[format!("100644 blob {blob}\t{name}")]);
+    let out = edition_env(&p.work, &["deploy", "npm", "v0.6.0"], &TOKEN);
+    assert_eq!(out.code, 1, "{}", out.all());
+    assert!(out.stderr.contains("a path over 4096 bytes"), "{}", out.stderr);
+}
+
+#[test]
+fn many_entries_stop_the_listing_as_they_arrive() {
+    let p = registry("tree-many", "", "[check_tree]\nmax_entries = 50\n", &|_| {});
+    let blob = p.blob("x");
+    let extra: Vec<String> = (0..500).map(|i| format!("100644 blob {blob}\tf{i:04}")).collect();
+    p.retag_with(&extra);
+    let out = edition_env(&p.work, &["deploy", "npm", "v0.6.0"], &TOKEN);
+    assert_eq!(out.code, 1, "{}", out.all());
+    assert!(out.stderr.contains("more than 50 entries"), "{}", out.stderr);
+}
+
+/// A ledger written by Edition on `main` (f1d981b) before this change: the streaming
+/// hash must verify its chain, so the chain format did not change.
+#[test]
+fn a_ledger_written_before_streaming_hashes_still_verifies() {
+    let text = include_str!("fixtures/ledger-format2-main-f1d981b.toml");
+    assert_eq!(edition::ledger::format_of(text), Ok(Some(2)));
+    let entries = edition::ledger::parse_ledger(text).expect("parses");
+    assert_eq!(entries.len(), 3);
+    let dir = tmp("ledger-fixture");
+    let git = edition::git::Git::new(&dir);
+    assert_eq!(edition::ledger::check_chain(&git, &entries), Ok(()));
+    // Every link but the first is the SHA-256 of the entry before it.
+    for w in entries.windows(2) {
+        assert_eq!(edition::ledger::entry_hash(&git, &w[0]).expect("hash"), w[1].prev);
+    }
+    // A changed entry breaks the chain, so the check is not vacuous.
+    let mut broken = entries.clone();
+    broken[0].by = "someone-else".into();
+    assert!(edition::ledger::check_chain(&git, &broken).is_err());
 }

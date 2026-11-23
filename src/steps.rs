@@ -321,14 +321,15 @@ impl Plan {
         if let Some(ct) = &self.check_tree {
             let l = &ct.limits;
             t.push_str(&format!(
-                "check-tree {} {} {:?} base {:?} limits {} {} {}\n",
+                "check-tree {} {} {:?} base {:?} limits {} {} {} {}\n",
                 ct.commit,
                 ct.tree,
                 crate::checktree::METHOD,
                 ct.base.display().to_string(),
                 l.max_entries,
                 l.max_file_bytes,
-                l.max_total_bytes
+                l.max_total_bytes,
+                l.max_listing_bytes
             ));
         }
         for f in &self.facts {

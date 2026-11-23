@@ -48,13 +48,26 @@ pub struct Limits {
     pub max_entries: u64,
     pub max_file_bytes: u64,
     pub max_total_bytes: u64,
+    /// The listing itself: paths and their metadata, in bytes.
+    pub max_listing_bytes: u64,
 }
 
 impl Default for Limits {
     fn default() -> Limits {
-        Limits { max_entries: 100_000, max_file_bytes: 256 << 20, max_total_bytes: 2 << 30 }
+        Limits {
+            max_entries: 100_000,
+            max_file_bytes: 256 << 20,
+            max_total_bytes: 2 << 30,
+            max_listing_bytes: 32 << 20,
+        }
     }
 }
+
+/// The longest path a tree entry may have, in bytes.
+pub const MAX_PATH_BYTES: usize = 4096;
+
+/// Room for an entry's mode, type, object id and size before its path.
+const RECORD_META_BYTES: usize = 160;
 
 /// One entry of the tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,39 +124,59 @@ fn check_link(path: &str, target: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Every entry of `tree`, checked against the path rules and the limits.
+/// Every entry of `tree`, checked against the path rules and the limits. The listing is
+/// read record by record: the entry count, the path length and the listing's size are
+/// enforced as records arrive, and the listing is stopped on the first excess.
 pub fn list(git: &Git, tree: &str, limits: &Limits) -> Result<Tree, String> {
-    let out = git.run_bytes(&["ls-tree", "-r", "-z", "-l", "--full-tree", tree])?;
     let mut entries = BTreeMap::new();
     let mut total: u64 = 0;
-    for rec in out.split(|b| *b == 0).filter(|r| !r.is_empty()) {
-        let rec = String::from_utf8(rec.to_vec()).map_err(|_| "the tree has a path that is not UTF-8".to_string())?;
-        let (meta, path) = rec.split_once('\t').ok_or("unexpected ls-tree output")?;
-        let f: Vec<&str> = meta.split_whitespace().collect();
-        let [mode, _kind, oid, size] = f.as_slice() else { return Err("unexpected ls-tree output".into()) };
-        check_path(path)?;
-        if !["100644", "100755", "120000", "160000"].contains(mode) {
-            return Err(format!("the tree has {path:?} with an unknown mode {mode}"));
+    let listing = |e: String| {
+        if e.contains("wrote more than") {
+            format!("the tree's listing is over {} bytes (check_tree.max_listing_bytes)", limits.max_listing_bytes)
+        } else if e.contains("wrote a record over") {
+            format!("the tree has a path over {MAX_PATH_BYTES} bytes")
+        } else {
+            e
         }
-        let size: u64 = if *mode == "160000" { 0 } else { size.parse().map_err(|_| "unexpected ls-tree size")? };
-        if size > limits.max_file_bytes {
-            return Err(format!(
-                "{path} is {size} bytes, over the check tree limit of {} (check_tree.max_file_bytes)",
-                limits.max_file_bytes
-            ));
-        }
-        total = total.saturating_add(size);
-        entries.insert(path.to_string(), TreeEntry { mode: mode.to_string(), oid: oid.to_string(), size });
-        if entries.len() as u64 > limits.max_entries {
-            return Err(format!("the tree has more than {} entries (check_tree.max_entries)", limits.max_entries));
-        }
-    }
-    if total > limits.max_total_bytes {
-        return Err(format!(
-            "the tree holds {total} bytes, over the check tree limit of {} (check_tree.max_total_bytes)",
-            limits.max_total_bytes
-        ));
-    }
+    };
+    git.stream_nul(
+        &["ls-tree", "-r", "-z", "-l", "--full-tree", tree],
+        MAX_PATH_BYTES + RECORD_META_BYTES,
+        limits.max_listing_bytes,
+        &mut |rec| {
+            if entries.len() as u64 >= limits.max_entries {
+                return Err(format!("the tree has more than {} entries (check_tree.max_entries)", limits.max_entries));
+            }
+            let rec = std::str::from_utf8(rec).map_err(|_| "the tree has a path that is not UTF-8".to_string())?;
+            let (meta, path) = rec.split_once('\t').ok_or("unexpected ls-tree output")?;
+            if path.len() > MAX_PATH_BYTES {
+                return Err(format!("the tree has a path over {MAX_PATH_BYTES} bytes"));
+            }
+            let f: Vec<&str> = meta.split_whitespace().collect();
+            let [mode, _kind, oid, size] = f.as_slice() else { return Err("unexpected ls-tree output".into()) };
+            check_path(path)?;
+            if !["100644", "100755", "120000", "160000"].contains(mode) {
+                return Err(format!("the tree has {path:?} with an unknown mode {mode}"));
+            }
+            let size: u64 = if *mode == "160000" { 0 } else { size.parse().map_err(|_| "unexpected ls-tree size")? };
+            if size > limits.max_file_bytes {
+                return Err(format!(
+                    "{path} is {size} bytes, over the check tree limit of {} (check_tree.max_file_bytes)",
+                    limits.max_file_bytes
+                ));
+            }
+            total = total.saturating_add(size);
+            if total > limits.max_total_bytes {
+                return Err(format!(
+                    "the tree holds more than {} bytes (check_tree.max_total_bytes)",
+                    limits.max_total_bytes
+                ));
+            }
+            entries.insert(path.to_string(), TreeEntry { mode: mode.to_string(), oid: oid.to_string(), size });
+            Ok(())
+        },
+    )
+    .map_err(listing)?;
     Ok(Tree { entries })
 }
 

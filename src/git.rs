@@ -175,19 +175,68 @@ impl Git {
         }
     }
 
-    /// Raw stdout of a read-only command that must never fetch a missing object.
-    pub fn run_bytes(&self, args: &[&str]) -> Result<Vec<u8>, String> {
-        let out =
-            self.command(args).env("GIT_NO_LAZY_FETCH", "1").output().map_err(|e| format!("cannot run git: {e}"))?;
-        if out.status.success() {
-            Ok(out.stdout)
-        } else {
-            Err(crate::util::redact(&format!(
-                "git {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )))
+    /// Runs a read-only command and hands each NUL-terminated record of its output to
+    /// `each` as it arrives, never holding more than one record. A record longer than
+    /// `max_record` bytes, more than `max_total` bytes in all, or an error from `each`
+    /// kills the command and fails. Never fetches a missing object.
+    pub fn stream_nul(
+        &self,
+        args: &[&str],
+        max_record: usize,
+        max_total: u64,
+        each: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        let mut child = self
+            .command(args)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("cannot run git: {e}"))?;
+        let mut out = std::io::BufReader::with_capacity(64 * 1024, child.stdout.take().ok_or("no stdout for git")?);
+        let mut record: Vec<u8> = Vec::new();
+        let mut total: u64 = 0;
+        let result = (|| -> Result<(), String> {
+            loop {
+                let buf = out.fill_buf().map_err(|e| e.to_string())?;
+                if buf.is_empty() {
+                    if !record.is_empty() {
+                        each(&record)?;
+                    }
+                    return Ok(());
+                }
+                let (take, done) = match buf.iter().position(|b| *b == 0) {
+                    Some(i) => (i, true),
+                    None => (buf.len(), false),
+                };
+                total += (take + usize::from(done)) as u64;
+                if total > max_total {
+                    return Err(format!("git {} wrote more than {max_total} bytes", args.first().unwrap_or(&"")));
+                }
+                if record.len() + take > max_record {
+                    return Err(format!("git {} wrote a record over {max_record} bytes", args.first().unwrap_or(&"")));
+                }
+                record.extend_from_slice(&buf[..take]);
+                out.consume(take + usize::from(done));
+                if done {
+                    each(&record)?;
+                    record.clear();
+                }
+            }
+        })();
+        if result.is_err() {
+            let _ = child.kill();
         }
+        drop(out);
+        let status = child.wait().map_err(|e| e.to_string())?;
+        result?;
+        if !status.success() {
+            return Err(format!("git {} failed", args.join(" ")));
+        }
+        Ok(())
     }
 
     /// Streams the raw bytes of each blob, in order, through `each(oid, size, reader)`, with
