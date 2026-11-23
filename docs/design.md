@@ -173,7 +173,13 @@ remote tip is enough.
   Edition removes only regular files it created there.
 - `ledger`, `version_files` paths and pin files must be relative paths inside the
   repository (no `..`, not absolute): `bump` writes version files and `ledger migrate`
-  reads the legacy ledger.
+  reads the legacy ledger. Every component of such a path is checked with `lstat` from
+  the repository root and a symbolic link anywhere refuses it; the file is opened with
+  `O_NOFOLLOW`; `bump` writes a new file beside the old one (same mode), checks the path
+  again, and renames it into place, so no write passes through a link. The content scan
+  reads a tracked link as its target text and never follows it.
+- Ledger validation accepts only mode 100644 for `ledger.toml` and rejects any other diff
+  metadata (mode changes, renames, copies, deletions, binary changes).
 - `ledger_branch`, refs and `--at` pass the ref grammar; the ledger branch cannot be
   `main` or a release line.
 - `EDITION_EVENTS` is the caller's chosen output path; Edition only appends to it and
@@ -403,7 +409,9 @@ in `[content] allow_paths` or it is allowed by id for one run.
   A finding refuses the plan unless it is allowed by id with `--allow-finding`; allowed
   findings are printed with the plan, part of its hash, and recorded in the entry. The
   final entry is scanned again before the push, and a finding that was not allowed when
-  the plan was made blocks it; the outcome stays pending.
+  the plan was made blocks it; the outcome stays pending. At that point an id given on
+  the command line counts for nothing: only the allowances bound in the receipt do. The
+  entry's own `overrides` list (which quotes the allowed patterns) is not scanned.
 
 ## How it fits with other tools
 

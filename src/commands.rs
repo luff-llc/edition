@@ -246,10 +246,13 @@ impl Ctx {
         // The ledger branch goes to the same remote: a public one gets the same scan.
         // Only findings allowed when the plan was made (and so bound in its receipt) may
         // pass; anything new blocks and the outcome stays pending.
-        let (_, blocked) = self.ledger_findings(plan, std::slice::from_ref(e))?;
-        let blocked: Vec<String> = blocked
+        // Every finding in the final entry must have been allowed in the plan the receipt
+        // was issued for; an id given on this command line counts for nothing here.
+        let blocked: Vec<String> = self
+            .ledger_finding_list(std::slice::from_ref(e))
             .into_iter()
-            .filter(|b| !plan.allowed_findings.iter().any(|id| b.starts_with(id.as_str())))
+            .filter(|f| !plan.allowed_findings.contains(&f.id))
+            .map(|f| format!("{} {} [{}] {} (not allowed when the plan was made)", f.id, f.place, f.pattern, f.excerpt))
             .collect();
         if !blocked.is_empty() {
             return Err(format!("the ledger entry matches the content deny-list: {}", blocked.join("; ")));
@@ -276,22 +279,32 @@ impl Ctx {
     /// `--allow-finding` as `(id, description)` and the blocking ones as messages. The
     /// finding's place names the action and channel, not the entry id, so it is the
     /// same when planned and when applied.
-    fn ledger_findings(&self, plan: &Plan, entries: &[Entry]) -> Result<Findings, String> {
-        let _ = plan;
+    /// Every content finding in ledger entries bound for a public remote, with no
+    /// allowance applied.
+    fn ledger_finding_list(&self, entries: &[Entry]) -> Vec<crate::content::Finding> {
         if !self.l.is_public(&self.l.cfg.remote) {
-            return Ok((Vec::new(), Vec::new()));
+            return Vec::new();
         }
         let scanner = crate::content::Scanner::new(&self.l);
         let mut found = Vec::new();
         for e in entries {
             let place = format!("ledger entry ({} {})", e.action, e.channel.as_deref().unwrap_or(&e.ref_));
-            for line in ledger::render(&ledger::redacted(e)).lines() {
+            // `overrides` is Edition's own record of the findings allowed; it quotes the
+            // patterns, so it is not scanned itself.
+            let mut scanned = ledger::redacted(e);
+            scanned.overrides.clear();
+            for line in ledger::render(&scanned).lines() {
                 scanner.scan_line(&place, line, &mut found);
             }
         }
+        crate::content::identify(&self.git, found)
+    }
+
+    fn ledger_findings(&self, plan: &Plan, entries: &[Entry]) -> Result<Findings, String> {
+        let _ = plan;
         let mut allowed = Vec::new();
         let mut blocked = Vec::new();
-        for f in crate::content::identify(&self.git, found) {
+        for f in self.ledger_finding_list(entries) {
             if self.allow_findings.contains(&f.id) {
                 allowed.push((f.id.clone(), format!("{} {} [{}]", f.id, f.place, f.pattern)));
             } else {
@@ -664,7 +677,7 @@ pub fn bump(c: &Ctx, version: &str) -> Res {
     let mut changes: Vec<(std::path::PathBuf, String, usize)> = Vec::new();
     for vf in &l.cfg.version_files {
         let path = l.root.join(&vf.path);
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let text = crate::safefs::read(&l.root, &vf.path)?;
         let pat = FilePattern::parse(&vf.pattern, &["version"])?;
         let base = changes.iter().rev().find(|(p, _, _)| *p == path).map(|(_, t, _)| t.clone()).unwrap_or(text);
         let (out, n) = pat.replace_all(&base, vf.after.as_deref(), &v.to_string());
@@ -684,7 +697,8 @@ pub fn bump(c: &Ctx, version: &str) -> Res {
         return Ok(0);
     }
     for (p, out, _) in &changes {
-        std::fs::write(p, out).map_err(|e| format!("{}: {e}", p.display()))?;
+        let rel = p.strip_prefix(&l.root).map(|r| r.display().to_string()).unwrap_or_default();
+        crate::safefs::replace(&l.root, &rel, out)?;
     }
     crate::say!("written; review with git diff, then commit (lock files may need regenerating by their tool)");
     Ok(0)
@@ -1536,7 +1550,8 @@ pub fn hooks_install(c: &Ctx) -> Res {
 pub fn ledger_migrate(c: &Ctx) -> Res {
     let l = &c.l;
     let file = l.root.join(&l.cfg.ledger);
-    let text = std::fs::read_to_string(&file)
+    let _ = &file;
+    let text = crate::safefs::read(&l.root, &l.cfg.ledger)
         .map_err(|e| format!("there is no in-tree ledger to migrate at {} ({e})", l.cfg.ledger))?;
     let entries = ledger::parse(&text).map_err(|e| format!("{}: {e}", l.cfg.ledger))?;
     if let Err((_, m)) = ledger::check_chain(&c.git, &entries) {

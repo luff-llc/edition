@@ -143,7 +143,7 @@ pub fn version_values(l: &Loaded, git: &Git, rev: Option<&str>) -> Vec<(String, 
     for vf in &l.cfg.version_files {
         let text = match rev {
             Some(r) => git.show(r, &vf.path).ok_or_else(|| format!("missing at {r}")),
-            None => std::fs::read_to_string(l.root.join(&vf.path)).map_err(|e| e.to_string()),
+            None => crate::safefs::read(&l.root, &vf.path),
         };
         let res = text.and_then(|t| {
             let p = FilePattern::parse(&vf.pattern, &["version"])?;
@@ -256,7 +256,7 @@ pub fn pins(l: &Loaded, git: &Git, rev: Option<&str>, online: bool) -> Vec<PinSt
         };
         let text = match rev {
             Some(r) => git.show(r, &p.file),
-            None => std::fs::read_to_string(l.root.join(&p.file)).ok(),
+            None => crate::safefs::read(&l.root, &p.file).ok(),
         };
         let Some(text) = text else {
             st.problem = Some(format!("{} is missing", p.file));

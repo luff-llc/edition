@@ -1515,3 +1515,99 @@ fn validation_cost_for_5000_entries() {
     store.validate_new(None, &tip).expect("valid");
     eprintln!("validated 5000 ledger commits in {:?}", start.elapsed());
 }
+
+#[test]
+fn an_apply_only_finding_needs_an_allowance_bound_in_the_receipt() {
+    let cfg = format!(
+        "{}\n[remotes.origin]\npublic = true\n\n[content]\ndeny = [\"exit 3\"]\n",
+        BASE_CONFIG.replace(
+            "run = [\"scripts/record.sh\", \"staging-deploys.txt\", \"{commit}\"]",
+            "run = [\"scripts/fail3.sh\", \"{commit}\"]",
+        )
+    );
+    let (_root, work) = project("apply-only", &cfg, "0.6.0-dev");
+    executable(&work, "scripts/fail3.sh", "#!/bin/sh\nexit 3\n");
+    commit_all(&work, "A deploy that exits 3");
+    git(&work, &["push", "-q", "origin", "main"]);
+
+    // The finding exists only in the final entry ("...: exit 3"), so the plan cannot see it.
+    let first = apply(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(first.code, 2, "{}", first.all());
+    assert!(first.stderr.contains("not allowed when the plan was made"), "{}", first.stderr);
+    let id: String =
+        first.stderr.split("matches the content deny-list: ").nth(1).expect("finding").chars().take(10).collect();
+    // Publishing that pending outcome needs the allowance in reconcile's own plan.
+    let ok = apply(&work, &["ledger", "reconcile", "--abandon", "--allow-finding", &id]);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+
+    // The id on the command line, absent from the receipt, does not authorize it.
+    let dry = edition(&work, &["deploy", "staging-home", "main", "--allow-finding", &id]);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    assert!(!dry.stdout.contains("allowing content findings"), "{}", dry.stdout);
+    let again = edition(
+        &work,
+        &["deploy", "staging-home", "main", "--allow-finding", &id, "--apply", "--confirm", &dry.receipt()],
+    );
+    assert_eq!(again.code, 2, "{}", again.all());
+    assert!(again.stderr.contains("not allowed when the plan was made"), "{}", again.stderr);
+    assert!(edition(&work, &["status"]).stdout.contains("UNRECONCILED"));
+}
+
+#[test]
+fn configured_files_are_never_read_or_written_through_a_link() {
+    let (root, work) = project("symlinks", BASE_CONFIG, "0.6.0-dev");
+    let outside = root.join("outside");
+    std::fs::create_dir(&outside).expect("mkdir");
+    std::fs::write(outside.join("Cargo.toml"), "[package]\nname = \"x\"\nversion = \"9.9.9\"\n").expect("write");
+
+    // A symlinked version file.
+    std::fs::remove_file(work.join("Cargo.toml")).expect("rm");
+    std::os::unix::fs::symlink(outside.join("Cargo.toml"), work.join("Cargo.toml")).expect("link");
+    let f = edition(&work, &["bump", "0.7.0", "--apply"]);
+    assert_eq!(f.code, 2, "{}", f.all());
+    assert!(f.stderr.contains("is a symbolic link"), "{}", f.stderr);
+    std::fs::remove_file(work.join("Cargo.toml")).expect("rm");
+    set_version(&work, "0.6.0-dev");
+
+    // A symlinked parent directory.
+    std::fs::remove_dir_all(work.join("pkg")).expect("rm");
+    std::fs::create_dir(outside.join("pkg")).expect("mkdir");
+    std::fs::write(outside.join("pkg/package.json"), "{\n  \"version\": \"9.9.9\"\n}\n").expect("write");
+    std::os::unix::fs::symlink(outside.join("pkg"), work.join("pkg")).expect("link");
+    let d = edition(&work, &["bump", "0.7.0", "--apply"]);
+    assert_eq!(d.code, 2, "{}", d.all());
+    assert!(d.stderr.contains("is a symbolic link"), "{}", d.stderr);
+    std::fs::remove_file(work.join("pkg")).expect("rm");
+    set_version(&work, "0.6.0-dev");
+
+    // A link introduced between the dry run and the apply.
+    assert_eq!(edition(&work, &["bump", "0.7.0"]).code, 0);
+    std::fs::remove_file(work.join("Cargo.toml")).expect("rm");
+    std::os::unix::fs::symlink(outside.join("Cargo.toml"), work.join("Cargo.toml")).expect("link");
+    assert_eq!(edition(&work, &["bump", "0.7.0", "--apply"]).code, 2);
+    assert!(
+        std::fs::read_to_string(outside.join("Cargo.toml")).expect("read").contains("9.9.9"),
+        "the outside file is untouched"
+    );
+    assert!(std::fs::read_to_string(outside.join("pkg/package.json")).expect("read").contains("9.9.9"));
+}
+
+#[test]
+fn a_ledger_commit_that_changes_the_file_mode_is_refused() {
+    let (root, work) = two_entry_ledger("mode");
+    let text = ledger_text(&work);
+    let other = other_clone(&root, "o1");
+    git(&other, &["fetch", "-q", "origin", "edition/ledger:refs/remotes/origin/edition/ledger"]);
+    let parent = git(&other, &["rev-parse", "origin/edition/ledger"]);
+    let entries = edition::ledger::parse(&text).expect("parse");
+    let g = edition::git::Git::new(&other);
+    let prev = edition::ledger::entry_hash(&g, entries.last().expect("last")).expect("hash");
+    let new = format!("{}\n{}", text.trim_end(), edition::ledger::render(&entry("valid-but-executable", &prev)));
+    let blob = plumb(&other, &["hash-object", "-w", "--stdin"], &new);
+    let tree = plumb(&other, &["mktree"], &format!("100755 blob {blob}\tledger.toml\n"));
+    let c = plumb(&other, &["commit-tree", &tree, "-p", &parent, "-m", "exec"], "");
+    git(&other, &["push", "-q", "origin", &format!("{c}:refs/heads/edition/ledger")]);
+    let d = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(d.code, 1, "{}", d.all());
+    assert!(d.stderr.contains(&format!("invalid commit {}", &c[..10])), "{}", d.stderr);
+}

@@ -225,6 +225,13 @@ impl Scanner {
             if self.allowed(path) {
                 continue;
             }
+            // A tracked link is scanned as git stores it (its target text), never followed.
+            if std::fs::symlink_metadata(l.root.join(path)).is_ok_and(|m| m.file_type().is_symlink()) {
+                if let Ok(target) = std::fs::read_link(l.root.join(path)) {
+                    self.scan_line(&format!("{path} (link)"), &target.display().to_string(), &mut found);
+                }
+                continue;
+            }
             let bytes = match std::fs::read(l.root.join(path)) {
                 Ok(b) => b,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,

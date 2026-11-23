@@ -14,6 +14,7 @@ pub mod ledger;
 pub mod ledger_store;
 pub mod pending;
 pub mod policy;
+pub mod safefs;
 pub mod steps;
 pub mod util;
 pub mod verify;

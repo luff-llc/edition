@@ -174,13 +174,26 @@ impl<'a> Store<'a> {
                     if rest != format!("a/{FILE} b/{FILE}") {
                         return Err(bad(&c, &format!("it changes something other than {FILE}")));
                     }
-                } else if line.starts_with("deleted file") || line.starts_with("Binary files") {
-                    return Err(bad(&c, &format!("{FILE} is deleted or unreadable")));
-                } else if line.starts_with("--- ")
-                    || line.starts_with("+++ ")
-                    || line.starts_with("index ")
-                    || line.starts_with("new file")
+                } else if let Some(idx) = line.strip_prefix("index ") {
+                    // `index a..b 100644`, or `index a..b` when the mode is unchanged.
+                    if idx.split(' ').nth(1).is_some_and(|m| m != "100644") {
+                        return Err(bad(&c, &format!("{FILE} must have mode 100644")));
+                    }
+                } else if let Some(m) = line.strip_prefix("new file mode ") {
+                    if m != "100644" || lines != 0 {
+                        return Err(bad(&c, &format!("{FILE} must be created once, with mode 100644")));
+                    }
+                } else if line.starts_with("--- ") || line.starts_with("+++ ") {
+                } else if line.starts_with("old mode")
+                    || line.starts_with("new mode")
+                    || line.starts_with("deleted file")
+                    || line.starts_with("Binary files")
+                    || line.starts_with("similarity")
+                    || line.starts_with("rename ")
+                    || line.starts_with("copy ")
+                    || line.starts_with("dissimilarity")
                 {
+                    return Err(bad(&c, &format!("unexpected change to {FILE}: {line}")));
                 } else if let Some(h) = line.strip_prefix("@@ -") {
                     // `@@ -N,0 +N+1,M @@`: an insertion after the last line only.
                     let old = h.split(' ').next().unwrap_or("");
@@ -192,6 +205,8 @@ impl<'a> Store<'a> {
                     added.push(a);
                 } else if line.starts_with('-') || line.starts_with('\\') {
                     return Err(bad(&c, "it removes or rewrites existing lines"));
+                } else if !line.is_empty() {
+                    return Err(bad(&c, &format!("unexpected diff metadata: {line}")));
                 }
             }
             if files != 1 || added.is_empty() {
