@@ -257,10 +257,23 @@ Edition's own git and gh calls, read-only or outward, are bound the same way:
   `credential.helper = osxkeychain`), the global file chosen by `HOME`, the repository's
   own file and every file they include. Before any git operation that can contact a
   remote or run a helper (`status --online`, `verify --online`, and every outward plan),
-  Edition lists that chain with a purely local `git config --list --show-origin` and
-  refuses outright if any file in it is writable by its group or others or owned by a
-  user other than root or you; it does not judge which settings in such a file are
-  harmless. Offline, `verify` reports the same problem as a warning.
+  Edition enumerates that chain explicitly and refuses outright if any file in it is
+  writable by its group or others or owned by a user other than root or you; it does not
+  judge which settings in such a file are harmless. The chain is: the system, global and
+  XDG files as `git var GIT_CONFIG_SYSTEM` and `GIT_CONFIG_GLOBAL` report them for the
+  environment Edition gives git (reported whether or not the files exist; this needs
+  git 2.42 or later, and Edition refuses when git cannot answer); the repository's
+  `config`, and `config.worktree` when `extensions.worktreeConfig` is set; every file
+  `git config --list --show-origin` names (which also catches files such as Apple git's
+  built-in configuration); and, recursively, every `include.path` and `includeIf.*.path`
+  target, parsed from the files themselves (`~/` from `HOME`, relative paths from the
+  including file), so a file that contributes nothing yet is still checked. Every
+  `includeIf` target is audited whatever its condition, so a later change of branch or
+  directory stays inside the boundary. A target that does not exist yet is bound as
+  missing, and refused if the nearest existing directory above it lets others create it.
+  Cyclic includes, chains deeper than git's limit of 10 and unresolvable targets
+  (`%(prefix)/...`) fail closed. Offline, `verify` reports the same problems as
+  warnings.
 - **Binding.** Every outward plan, including ones made only of notes such as
   `ledger reconcile`, binds the identity of each file in the chain (path, owner, mode,
   size, modification time and SHA-256 of its contents) and the settings that change how

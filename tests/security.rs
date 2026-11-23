@@ -1822,3 +1822,82 @@ fn a_signing_program_change_invalidates_a_tag_plan() {
     let again = edition(&work, &["tag", "0.6.0"]);
     assert!(again.stdout.contains("gpg.program (local)"), "{}", again.stdout);
 }
+
+#[test]
+fn an_empty_group_writable_include_is_refused_before_any_remote_contact() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, work) = project("empty-include", BASE_CONFIG, "0.6.0-dev");
+    let marker = root.join("ssh-ran");
+    executable(&root, "ssh-marker", &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()));
+    git(&work, &["config", "core.sshCommand", root.join("ssh-marker").to_str().expect("utf8")]);
+    git(&work, &["config", "remote.origin.url", "ssh://git.example.invalid/lib.git"]);
+    std::fs::write(work.join("inc.cfg"), "# nothing yet\n").expect("write");
+    std::fs::set_permissions(work.join("inc.cfg"), std::fs::Permissions::from_mode(0o664)).expect("chmod");
+    git(&work, &["config", "include.path", "../inc.cfg"]);
+    let out = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_ne!(out.code, 0, "{}", out.all());
+    assert!(out.stderr.contains("inc.cfg") && out.stderr.contains("writable by its group or others"), "{}", out.stderr);
+    assert!(!marker.exists(), "git contacted the remote");
+}
+
+#[test]
+fn an_empty_system_config_and_the_worktree_config_are_in_the_chain() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, work) = project("chain-files", BASE_CONFIG, "0.6.0-dev");
+    let sys = system_config(&root, "", 0o644);
+    let mut g = edition::git::Git::new(&work);
+    g.env.push(("GIT_CONFIG_SYSTEM".into(), sys.clone()));
+    let chain = edition::gitcfg::audit(&g).expect("audit");
+    let canon = std::fs::canonicalize(&sys).expect("canon").display().to_string();
+    assert!(chain.files.iter().any(|f| f.path == canon && f.scope == "system"), "{:?}", chain.files);
+
+    git(&work, &["config", "extensions.worktreeConfig", "true"]);
+    git(&work, &["config", "--worktree", "color.ui", "false"]);
+    let chain = edition::gitcfg::audit(&g).expect("audit");
+    assert!(chain.files.iter().any(|f| f.path.ends_with("config.worktree")), "{:?}", chain.files);
+    std::fs::set_permissions(work.join(".git/config.worktree"), std::fs::Permissions::from_mode(0o664)).expect("chmod");
+    let refused = edition::gitcfg::audit(&g);
+    assert!(refused.is_err_and(|e| e.contains("config.worktree")));
+}
+
+#[test]
+fn a_missing_include_in_a_directory_others_can_write_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, work) = project("missing-include", BASE_CONFIG, "0.6.0-dev");
+    let open = root.join("open");
+    std::fs::create_dir(&open).expect("mkdir");
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+    git(&work, &["config", "include.path", open.join("later.cfg").to_str().expect("utf8")]);
+    let out = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_ne!(out.code, 0, "{}", out.all());
+    assert!(out.stderr.contains("does not exist") && out.stderr.contains("lets others create it"), "{}", out.stderr);
+    // A missing include in a private directory is bound as missing, and appearing later
+    // invalidates the receipt.
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let dry = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    std::fs::write(open.join("later.cfg"), "[color]\n\tui = false\n").expect("write");
+    let out2 = edition(&work, &["deploy", "staging-home", "main", "--apply", "--confirm", &dry.receipt()]);
+    assert_eq!(out2.code, 2, "{}", out2.all());
+}
+
+#[test]
+fn cyclic_includes_fail_closed() {
+    let (_root, work) = project("cyclic", BASE_CONFIG, "0.6.0-dev");
+    std::fs::write(work.join("a.cfg"), "[include]\n\tpath = b.cfg\n").expect("a");
+    std::fs::write(work.join("b.cfg"), "[include]\n\tpath = a.cfg\n").expect("b");
+    git(&work, &["config", "include.path", "../a.cfg"]);
+    let g = edition::git::Git::new(&work);
+    assert!(edition::gitcfg::audit(&g).is_err(), "a cycle fails closed");
+    let out = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_ne!(out.code, 0, "{}", out.all());
+
+    // A chain deeper than git's limit fails closed too.
+    let (_r2, w2) = project("deep", BASE_CONFIG, "0.6.0-dev");
+    for i in 0..12 {
+        std::fs::write(w2.join(format!("d{i}.cfg")), format!("[include]\n\tpath = d{}.cfg\n", i + 1)).expect("write");
+    }
+    std::fs::write(w2.join("d12.cfg"), "").expect("write");
+    git(&w2, &["config", "include.path", "../d0.cfg"]);
+    assert!(edition::gitcfg::audit(&edition::git::Git::new(&w2)).is_err(), "over-deep includes fail closed");
+}
