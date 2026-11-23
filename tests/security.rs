@@ -1717,3 +1717,63 @@ fn a_format1_ledger_from_a_sha256_repository_migrates() {
     let Some((_root, work)) = sha256_project("sha256-migrate") else { return };
     migrates_format1(&work);
 }
+
+fn system_config(root: &Path, text: &str, mode: u32) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let p = root.join("system-gitconfig");
+    std::fs::write(&p, text).expect("write");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    p.display().to_string()
+}
+
+#[test]
+fn system_git_configuration_is_honoured_and_bound() {
+    let (root, work, _mirror) = tag_ready("system-config");
+    let origin = root.join("origin.git").display().to_string();
+    // The remote is only reachable through a rewrite that lives in the system config,
+    // next to a credential helper, as on a stock macOS or Homebrew git.
+    git(&work, &["config", "remote.origin.url", "https://git.example.invalid/lib.git"]);
+    let sys = system_config(
+        &root,
+        &format!("[url \"{origin}\"]\n\tinsteadOf = https://git.example.invalid/lib.git\n[credential]\n\thelper = osxkeychain\n"),
+        0o644,
+    );
+    let env = [("GIT_CONFIG_SYSTEM", sys.as_str())];
+    let dry = edition_env(&work, &["tag", "0.6.0"], &env);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    assert!(dry.stdout.contains(&format!("destination: {origin}")), "{}", dry.stdout);
+    // The credential helper is bound in the receipt: changing it invalidates the plan.
+    let r = dry.receipt();
+    system_config(
+        &root,
+        &format!(
+            "[url \"{origin}\"]\n\tinsteadOf = https://git.example.invalid/lib.git\n[credential]\n\thelper = store\n"
+        ),
+        0o644,
+    );
+    let changed = edition_env(&work, &["tag", "0.6.0", "--apply", "--confirm", &r], &env);
+    assert_eq!(changed.code, 2, "{}", changed.all());
+    assert!(changed.stderr.contains("does not match this plan"), "{}", changed.stderr);
+    let ok = apply_env(&work, &["tag", "0.6.0"], &env);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+    assert!(
+        git(&work, &["ls-remote", "--tags", &origin]).contains("refs/tags/v0.6.0"),
+        "Edition's push used the system config"
+    );
+}
+
+#[test]
+fn git_configuration_from_an_untrustworthy_file_warns_or_refuses() {
+    let (root, work) = project("untrusted-config", BASE_CONFIG, "0.6.0-dev");
+    // Harmless settings in a group-writable file: a warning, and the plan goes on.
+    let sys = system_config(&root, "[color]\n\tui = false\n", 0o664);
+    let env = [("GIT_CONFIG_SYSTEM", sys.as_str())];
+    let warn = edition_env(&work, &["deploy", "staging-home", "main"], &env);
+    assert_eq!(warn.code, 0, "{}", warn.all());
+    assert!(warn.stdout.contains("which is writable by its group or others"), "{}", warn.stdout);
+    // A setting that runs a program, from that file: refused.
+    system_config(&root, "[core]\n\tsshCommand = /tmp/evil\n", 0o666);
+    let refused = edition_env(&work, &["deploy", "staging-home", "main"], &env);
+    assert_eq!(refused.code, 1, "{}", refused.all());
+    assert!(refused.stderr.contains("git setting core.sshcommand comes from"), "{}", refused.stderr);
+}

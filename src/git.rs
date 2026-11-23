@@ -22,11 +22,37 @@ pub const TOOL_VARS: &[&str] = &[
     "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME",
     "GIT_COMMITTER_EMAIL",
+    // Which system and global configuration git reads: the same trust base as `HOME`.
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_GLOBAL",
 ];
 
 /// Configuration forced on every git call.
 pub const SAFE_CONFIG: &[&str] =
     &["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.ext.allow=never"];
+
+/// Configuration keys that can redirect a push or run a program while git talks to a
+/// remote. They are bound in the plan, and refused when they come from a file that is
+/// not trustworthy.
+pub fn sensitive_config_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k == "core.sshcommand"
+        || k == "core.gitproxy"
+        || k == "core.askpass"
+        || k == "http.proxy"
+        || k == "credential.helper"
+        || (k.starts_with("http.") && k.ends_with(".proxy"))
+        || (k.starts_with("credential.") && k.ends_with(".helper"))
+        || (k.starts_with("url.") && (k.ends_with(".insteadof") || k.ends_with(".pushinsteadof")))
+        || (k.starts_with("remote.")
+            && (k.ends_with(".url")
+                || k.ends_with(".pushurl")
+                || k.ends_with(".receivepack")
+                || k.ends_with(".uploadpack")))
+}
+
+/// One setting as git reports it: `(scope, origin file if any, key, value)`.
+pub type ConfigSetting = (String, Option<String>, String, String);
 
 /// Names that may never be passed through to git or gh, even when declared.
 pub fn forbidden_tool_var(name: &str) -> bool {
@@ -43,7 +69,6 @@ pub fn tool_env(path: &str, declared: &[String]) -> Vec<(String, String)> {
             env.push((k, v));
         }
     }
-    env.push(("GIT_CONFIG_NOSYSTEM".into(), "1".into()));
     env.push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
     env.push(("LC_ALL".into(), "C".into()));
     env
@@ -117,6 +142,30 @@ impl Git {
             .args(["-c", "color.ui=false", "-c", "log.showSignature=false", "-c", "core.pager=cat"])
             .args(args);
         c
+    }
+
+    /// Every effective setting with its scope and origin
+    /// (`git config --list --show-scope --show-origin -z`).
+    pub fn config_settings(&self) -> Result<Vec<ConfigSetting>, String> {
+        let out = self.run(&["config", "--list", "--show-scope", "--show-origin", "-z"])?;
+        let mut v = Vec::new();
+        let fields: Vec<&str> = out.split('\0').collect();
+        let mut i = 0;
+        while i + 2 < fields.len() {
+            let (scope, origin, kv) = (fields[i], fields[i + 1], fields[i + 2]);
+            i += 3;
+            if scope.is_empty() {
+                break;
+            }
+            let (k, val) = kv.split_once('\n').unwrap_or((kv, ""));
+            v.push((
+                scope.to_string(),
+                origin.strip_prefix("file:").map(str::to_string),
+                k.to_string(),
+                val.to_string(),
+            ));
+        }
+        Ok(v)
     }
 
     /// `(fetch URL, push URL, configured URL)` of a remote, after `insteadOf`,
