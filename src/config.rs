@@ -544,8 +544,8 @@ impl Loaded {
             }
         }
         if let Some(p) = &c.run.path {
-            if p.split(':').any(|d| !d.starts_with('/')) {
-                errs.push("run.path must list absolute directories".into());
+            if p.split(':').any(|d| !d.starts_with('/') && !d.starts_with("~/")) {
+                errs.push("run.path must list absolute directories (or ones under ~/)".into());
             }
         }
         if !matches!(c.content.action.as_str(), "report" | "block") {
@@ -617,8 +617,17 @@ impl Loaded {
         self.cfg.receipts.ttl_minutes.unwrap_or(crate::steps::RECEIPT_TTL_DEFAULT)
     }
 
+    /// `PATH` for every command, with a leading `~/` expanded per directory.
     pub fn run_path(&self) -> String {
-        self.cfg.run.path.clone().unwrap_or_else(|| crate::steps::DEFAULT_PATH.to_string())
+        let p = self.cfg.run.path.clone().unwrap_or_else(|| crate::steps::DEFAULT_PATH.to_string());
+        let home = std::env::var("HOME").unwrap_or_default();
+        p.split(':')
+            .map(|d| match d.strip_prefix("~/") {
+                Some(rest) if !home.is_empty() => format!("{home}/{rest}"),
+                _ => d.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(":")
     }
 
     pub fn is_public(&self, remote: &str) -> bool {

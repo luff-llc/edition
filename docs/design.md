@@ -360,7 +360,7 @@ offset. Edition never reads it back.
 | `[content] deny`, `allow_paths`, `action` | the content check's patterns (`<word>` matches one word), exempt path globs, `block` (default) or `report` |
 | `[concordance] catalog`, `release`, `bin` | the Concordance catalog; the release id template (`{version}`) |
 | `[vars] NAME` | values for `{var.NAME}`; an empty value must come from `EDITION_VAR_NAME` on the machine and is treated as secret |
-| `[run] path` | `PATH` for every command Edition runs, including git and gh (absolute directories) |
+| `[run] path` | `PATH` for every command Edition runs, including git and gh (absolute directories, or under `~/`) |
 | `[run] tool_env` | variables git and gh may inherit, such as `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GPG_TTY`, `GNUPGHOME` |
 | `[receipts] ttl_minutes` | receipt lifetime, 1 to 60 (default 30) |
 | `[verify] tags_since` | older tags are not checked against version files |
