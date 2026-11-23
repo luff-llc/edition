@@ -66,66 +66,30 @@ fn identity(path: &str) -> Result<(std::fs::Metadata, String), String> {
 /// Git's limit on nested includes; deeper chains fail closed.
 const MAX_DEPTH: usize = 10;
 
-/// `include.path` and `includeIf.*.path` values in a config file, parsed by Edition
-/// itself so that a file contributing nothing is still followed.
-pub fn include_targets(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut in_include = false;
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.starts_with('[') {
-            let header = line.trim_start_matches('[').split(']').next().unwrap_or("");
-            let name = header.split(|c: char| c.is_whitespace() || c == '"').next().unwrap_or("").to_ascii_lowercase();
-            // `[include]`, `[includeIf "..."]`, and the `[include.x]`-style forms.
-            in_include = name == "include"
-                || name == "includeif"
-                || name.starts_with("include.")
-                || name.starts_with("includeif.");
-            // A key on the same line as the header: `[include] path = x`.
-            let rest = line.split_once(']').map(|(_, r)| r.trim()).unwrap_or("");
-            if in_include && !rest.is_empty() {
-                if let Some(v) = path_value(rest) {
-                    out.push(v);
-                }
-            }
-            continue;
-        }
-        if in_include {
-            if let Some(v) = path_value(line) {
-                out.push(v);
+/// `include.path` and `includeIf.*.path` values in a config file, whatever their
+/// condition, as git itself parses the file (`git config --file F --no-includes --list
+/// -z`), so continuation lines, quoting, escapes, comments and CRLF are read exactly as
+/// git reads them. A file git cannot parse fails closed.
+pub fn include_targets(git: &Git, file: &Path) -> Result<Vec<String>, String> {
+    let shown = file.display().to_string();
+    let out = git
+        .run(&["config", "--file", &shown, "--no-includes", "--list", "-z"])
+        .map_err(|e| format!("git cannot parse {shown} as configuration ({e}); refusing"))?;
+    let mut targets = Vec::new();
+    for rec in out.split('\0').filter(|r| !r.is_empty()) {
+        let (key, value) = match rec.split_once('\n') {
+            Some((k, v)) => (k, Some(v)),
+            None => (rec, None),
+        };
+        let k = key.to_ascii_lowercase();
+        if k == "include.path" || (k.starts_with("includeif.") && k.ends_with(".path")) {
+            match value {
+                Some(v) if !v.is_empty() => targets.push(v.to_string()),
+                _ => return Err(format!("{shown}: {key} has no value; refusing")),
             }
         }
     }
-    out
-}
-
-/// The value of a `path = value` line, with git's quoting and comments.
-fn path_value(line: &str) -> Option<String> {
-    let (k, v) = line.split_once('=')?;
-    if !k.trim().eq_ignore_ascii_case("path") {
-        return None;
-    }
-    let mut out = String::new();
-    let mut quoted = false;
-    let mut chars = v.trim().chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => quoted = !quoted,
-            '\\' => {
-                if let Some(n) = chars.next() {
-                    out.push(match n {
-                        'n' => '\n',
-                        't' => '\t',
-                        other => other,
-                    });
-                }
-            }
-            '#' | ';' if !quoted => break,
-            c => out.push(c),
-        }
-    }
-    let out = out.trim().to_string();
-    (!out.is_empty()).then_some(out)
+    Ok(targets)
 }
 
 /// Resolves an include target the way git does: `~/` from `HOME`, a relative path from
@@ -209,7 +173,13 @@ pub fn audit(git: &Git) -> Result<Chain, String> {
                 path.display()
             ));
         }
-        let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // A file that does not exist yet is named through its canonical directory.
+        let key = path.canonicalize().unwrap_or_else(|_| {
+            match (path.parent().and_then(|d| d.canonicalize().ok()), path.file_name()) {
+                (Some(d), Some(n)) => d.join(n),
+                _ => path.clone(),
+            }
+        });
         if seen.contains(&key) {
             continue;
         }
@@ -235,8 +205,7 @@ pub fn audit(git: &Git) -> Result<Chain, String> {
                 "git configuration {shown} ({scope}) is writable by its group or others; refusing to let git contact a remote"
             ));
         }
-        let text = std::fs::read_to_string(&key).map_err(|e| format!("git configuration {shown}: {e}; refusing"))?;
-        for t in include_targets(&text) {
+        for t in include_targets(git, &key)? {
             let target = resolve_include(&t, &key, &home)?;
             queue.push((target, format!("{scope} include"), depth + 1));
         }
@@ -285,11 +254,5 @@ mod tests {
         for k in ["user.name", "color.ui", "core.editor", "remote.origin.fetch"] {
             assert!(!sensitive_key(k), "{k}");
         }
-    }
-
-    #[test]
-    fn includes_are_parsed() {
-        let text = "[include]\n\tpath = a.cfg ; comment\n[includeIf \"gitdir:~/w/\"]\n  PATH = \"~/b c.cfg\"\n[user]\n\tpath = not-an-include\n[include] path = d.cfg\n";
-        assert_eq!(super::include_targets(text), vec!["a.cfg", "~/b c.cfg", "d.cfg"]);
     }
 }

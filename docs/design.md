@@ -266,8 +266,11 @@ Edition's own git and gh calls, read-only or outward, are bound the same way:
   `config`, and `config.worktree` when `extensions.worktreeConfig` is set; every file
   `git config --list --show-origin` names (which also catches files such as Apple git's
   built-in configuration); and, recursively, every `include.path` and `includeIf.*.path`
-  target, parsed from the files themselves (`~/` from `HOME`, relative paths from the
-  including file), so a file that contributes nothing yet is still checked. Every
+  target in each of those files, read with git's own parser
+  (`git config --file F --no-includes --list -z`, so continuation lines, quoting,
+  escapes, comments and CRLF mean exactly what they mean to git; a file git cannot parse
+  fails closed) and resolved as git resolves them (`~/` from `HOME`, relative paths from
+  the including file), so a file that contributes nothing yet is still checked. Every
   `includeIf` target is audited whatever its condition, so a later change of branch or
   directory stays inside the boundary. A target that does not exist yet is bound as
   missing, and refused if the nearest existing directory above it lets others create it.

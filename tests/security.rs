@@ -1901,3 +1901,67 @@ fn cyclic_includes_fail_closed() {
     git(&w2, &["config", "include.path", "../d0.cfg"]);
     assert!(edition::gitcfg::audit(&edition::git::Git::new(&w2)).is_err(), "over-deep includes fail closed");
 }
+
+fn append_local_config(work: &Path, text: &str) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().append(true).open(work.join(".git/config")).expect("open");
+    f.write_all(text.as_bytes()).expect("write");
+}
+
+/// A project with a directory others can write (`work/open`), so that an include target
+/// resolved there is refused and the refusal names the path Edition resolved.
+fn open_dir_project(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, work) = project(name, BASE_CONFIG, "0.6.0-dev");
+    std::fs::create_dir(work.join("open")).expect("mkdir");
+    std::fs::set_permissions(work.join("open"), std::fs::Permissions::from_mode(0o777)).expect("chmod");
+    (root, work)
+}
+
+fn audit_error(work: &Path) -> String {
+    edition::gitcfg::audit(&edition::git::Git::new(work)).expect_err("refused")
+}
+
+#[test]
+fn inactive_includes_are_read_with_gits_own_grammar() {
+    // Backslash-newline continuation in an inactive includeIf.
+    let (_r, w) = open_dir_project("inc-continued");
+    append_local_config(&w, "[includeIf \"onbranch:other\"]\n\tpath = ../open/la\\\nter.cfg\n");
+    let e = audit_error(&w);
+    assert!(e.contains("open/later.cfg") && e.contains("lets others create it"), "{e}");
+
+    // A quoted path with escapes and an inline comment, under a quoted subsection.
+    let (_r, w) = open_dir_project("inc-quoted");
+    append_local_config(
+        &w,
+        "[includeIf \"onbranch:feature/x\"]\n\tpath = \"../open/we\\\"ird\\tname.cfg\" ; a comment\n",
+    );
+    let e = audit_error(&w);
+    assert!(e.contains("open/we\"ird\tname.cfg"), "{e}");
+
+    // CRLF line endings.
+    let (_r, w) = open_dir_project("inc-crlf");
+    append_local_config(&w, "[includeIf \"gitdir:/nowhere/\"]\r\n\tpath = ../open/crlf.cfg\r\n");
+    let e = audit_error(&w);
+    assert!(e.contains("work/open/crlf.cfg (local include) does not exist"), "{e}");
+
+    // A malformed line fails closed.
+    let (_r, w) = project("inc-malformed", BASE_CONFIG, "0.6.0-dev");
+    append_local_config(&w, "[includeIf \"onbranch:x\"\n\tpath = y.cfg\n");
+    assert!(edition::gitcfg::audit(&edition::git::Git::new(&w)).is_err());
+    let out = edition(&w, &["deploy", "staging-home", "main"]);
+    assert_ne!(out.code, 0, "{}", out.all());
+}
+
+#[test]
+fn active_includes_agree_with_git() {
+    let (_r, w) = project("inc-active", BASE_CONFIG, "0.6.0-dev");
+    std::fs::write(w.join("active.cfg"), "[color]\n\tui = false\n").expect("write");
+    append_local_config(&w, "[include]\n\tpath = \"../act\\\nive.cfg\" # continued and quoted\n");
+    let chain = edition::gitcfg::audit(&edition::git::Git::new(&w)).expect("audit");
+    // The file git itself reports reading for color.ui:
+    let listed = git(&w, &["config", "--show-origin", "--get", "color.ui"]);
+    let origin = listed.split('\t').next().and_then(|o| o.strip_prefix("file:")).expect("origin");
+    let git_path = std::fs::canonicalize(w.join(origin)).expect("canon").display().to_string();
+    assert!(chain.files.iter().any(|f| f.path == git_path), "Edition {:?} vs git {git_path}", chain.files);
+}
