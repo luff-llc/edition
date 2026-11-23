@@ -172,6 +172,48 @@ pub struct Channel {
     pub note: Option<String>,
 }
 
+/// Limits on the tree a deploy's checks run on (`[check_tree]`). A tree over any of them
+/// refuses the plan before anything is written.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckTreeCfg {
+    /// Files, links and submodules in the tree (default 100 000).
+    pub max_entries: Option<u64>,
+    /// The largest single file, in bytes (default 256 MiB).
+    pub max_file_bytes: Option<u64>,
+    /// All files together, in bytes (default 2 GiB).
+    pub max_total_bytes: Option<u64>,
+}
+
+impl CheckTreeCfg {
+    pub fn limits(&self) -> crate::checktree::Limits {
+        let d = crate::checktree::Limits::default();
+        crate::checktree::Limits {
+            max_entries: self.max_entries.unwrap_or(d.max_entries),
+            max_file_bytes: self.max_file_bytes.unwrap_or(d.max_file_bytes),
+            max_total_bytes: self.max_total_bytes.unwrap_or(d.max_total_bytes),
+        }
+    }
+}
+
+/// Variables that change where git finds a repository. A check may not declare them: it
+/// runs in a tree with no repository, and git must not find another one.
+pub const GIT_DISCOVERY_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_NAMESPACE",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+];
+
 /// A probe's declared environment: its own table, or `"channel"` for the channel's `env`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
@@ -403,6 +445,8 @@ pub struct Config {
     pub run: RunCfg,
     #[serde(default)]
     pub receipts: ReceiptCfg,
+    #[serde(default)]
+    pub check_tree: CheckTreeCfg,
 }
 
 fn d_final() -> String {
@@ -820,6 +864,20 @@ impl Loaded {
         };
         for (name, ck) in &c.checks {
             check_cmd(&format!("check {name}"), &ck.run, &ck.env, &mut errs);
+            for k in ck.env.keys() {
+                if GIT_DISCOVERY_VARS.contains(&k.as_str()) || k.starts_with("GIT_CONFIG_") {
+                    errs.push(format!("check {name}: env may not set {k} (checks run where git finds no repository)"));
+                }
+            }
+        }
+        for (k, v) in [
+            ("max_entries", c.check_tree.max_entries),
+            ("max_file_bytes", c.check_tree.max_file_bytes),
+            ("max_total_bytes", c.check_tree.max_total_bytes),
+        ] {
+            if v == Some(0) {
+                errs.push(format!("check_tree.{k} must be at least 1"));
+            }
         }
         for (name, ch) in &c.channels {
             if !name.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')

@@ -9,8 +9,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Receives each blob from `Git::cat_blobs`: `(object id, raw bytes)`.
-pub type BlobSink<'a> = dyn FnMut(&str, &[u8]) -> Result<(), String> + 'a;
+/// Receives each blob from `Git::cat_blobs`: `(object id, size, a reader of exactly its
+/// raw bytes)`, so a blob is never held whole.
+pub type BlobSink<'a> = dyn FnMut(&str, u64, &mut dyn std::io::Read) -> Result<(), String> + 'a;
 
 /// `(name, commit)` pairs.
 pub type Refs = Vec<(String, String)>;
@@ -189,7 +190,7 @@ impl Git {
         }
     }
 
-    /// Streams the raw bytes of each blob, in order, through `each(oid, bytes)`, with
+    /// Streams the raw bytes of each blob, in order, through `each(oid, size, reader)`, with
     /// `git cat-file --batch`: no filters or conversions, and never a lazy fetch.
     pub fn cat_blobs(&self, oids: &[String], each: &mut BlobSink<'_>) -> Result<(), String> {
         use std::io::{BufRead, Read, Write};
@@ -224,15 +225,17 @@ impl Git {
                 result = Err(format!("object {want} is not a blob here ({})", header.trim_end()));
                 break;
             };
-            let size: usize = size.parse().map_err(|_| "unexpected git cat-file output".to_string())?;
-            let mut data = vec![0u8; size];
-            out.read_exact(&mut data).map_err(|e| e.to_string())?;
-            let mut nl = [0u8; 1];
-            out.read_exact(&mut nl).map_err(|e| e.to_string())?;
-            if let Err(e) = each(oid, &data) {
+            let size: u64 = size.parse().map_err(|_| "unexpected git cat-file output".to_string())?;
+            let mut body = (&mut out).take(size);
+            let r = each(oid, size, &mut body);
+            // Whatever the sink did not read is skipped, never buffered.
+            std::io::copy(&mut body, &mut std::io::sink()).map_err(|e| e.to_string())?;
+            if let Err(e) = r {
                 result = Err(e);
                 break;
             }
+            let mut nl = [0u8; 1];
+            out.read_exact(&mut nl).map_err(|e| e.to_string())?;
         }
         drop(out);
         let _ = writer.join();

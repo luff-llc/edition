@@ -69,16 +69,23 @@ pub struct Step {
     pub program: PathBuf,
     /// Where an outward step goes (a push URL, a repository, a channel target).
     pub dest: Option<String>,
-    /// Runs in the plan's check tree (see `checktree`), not in `cwd`: the directory is
-    /// written once the receipt is spent, and a relative program is taken from it.
+    /// Runs in a fresh copy of the plan's check tree (see `checktree`), not in `cwd`: the
+    /// copy is written for this step once the receipt is spent, a relative program is
+    /// taken from it, and git cannot find a repository from it.
     pub in_tree: bool,
 }
 
-/// The tree a plan's checks run on: bound in the plan hash with how it is written.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The tree a plan's checks run on: bound in the plan hash with where and how it is
+/// written and the limits it was checked against.
+#[derive(Clone, Debug, Default)]
 pub struct CheckTree {
     pub commit: String,
     pub tree: String,
+    /// The per-user directory the copies go in (`checktree::base_dir`).
+    pub base: PathBuf,
+    pub limits: crate::checktree::Limits,
+    /// The entries, as listed and checked when the plan was made.
+    pub listed: crate::checktree::Tree,
 }
 
 /// The `PATH` configured commands get when `edition.toml` does not set `[run] path`.
@@ -170,11 +177,8 @@ impl Step {
         let mut s = format!("  [{}] {}", self.kind.label(), self.what);
         if !self.argv.is_empty() {
             let line = self.shown.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
-            let dir = if self.in_tree {
-                format!("{}/<receipt>", crate::checktree::DIR)
-            } else {
-                shell_quote(&self.cwd.display().to_string())
-            };
+            let dir =
+                if self.in_tree { "<check tree>".to_string() } else { shell_quote(&self.cwd.display().to_string()) };
             s.push_str(&format!("\n      $ (cd {dir} && {line})"));
             if !self.env.is_empty() {
                 let names: Vec<&str> = self.env.iter().map(|(k, _)| k.as_str()).collect();
@@ -315,7 +319,17 @@ impl Plan {
             t.push_str(&format!("record {branch:?} {url:?}\n"));
         }
         if let Some(ct) = &self.check_tree {
-            t.push_str(&format!("check-tree {} {} {:?}\n", ct.commit, ct.tree, crate::checktree::METHOD));
+            let l = &ct.limits;
+            t.push_str(&format!(
+                "check-tree {} {} {:?} base {:?} limits {} {} {}\n",
+                ct.commit,
+                ct.tree,
+                crate::checktree::METHOD,
+                ct.base.display().to_string(),
+                l.max_entries,
+                l.max_file_bytes,
+                l.max_total_bytes
+            ));
         }
         for f in &self.facts {
             t.push_str(&format!("fact {f:?}\n"));
@@ -323,7 +337,7 @@ impl Plan {
         for s in self.steps.iter().filter(|s| s.kind != Kind::Note) {
             t.push_str(&format!("step {} {:?}\n", s.kind.label(), s.what));
             if s.in_tree {
-                t.push_str("  cwd check-tree\n");
+                t.push_str("  cwd check-tree\n  env GIT_CEILING_DIRECTORIES=<the check tree's parent>\n");
             } else {
                 t.push_str(&format!("  cwd {:?}\n", s.cwd.display().to_string()));
             }
@@ -639,56 +653,59 @@ pub fn execute(
     }
     let mut outcomes = Vec::new();
     let mut stopped = None;
-    // The check tree is written only now, under --apply and after the receipt is spent.
-    let mut tree: Option<crate::checktree::Materialised> = None;
+    // Check trees are written only now, under --apply and after the receipt is spent:
+    // a fresh one for every check, removed when it ends.
+    let tree_name = match (&plan.check_tree, &receipt) {
+        (None, _) => String::new(),
+        (Some(_), Some(r)) => r.clone(),
+        (Some(_), None) => crate::util::random_hex(16)?,
+    };
     if let Some(ct) = &plan.check_tree {
-        let name = match &receipt {
-            Some(r) => r.clone(),
-            None => crate::util::random_hex(16)?,
-        };
-        let _ = crate::checktree::sweep(root);
-        crate::say!(
-            "> [local] write the tree of {} to {}/{name}",
-            crate::util::short(&ct.commit),
-            crate::checktree::DIR
-        );
-        match git.tree(&ct.commit).filter(|t| *t == ct.tree) {
-            None => stopped = Some(format!("{} no longer has the tree the plan was made with", ct.commit)),
-            Some(_) => match crate::checktree::materialise(git, root, &ct.tree, &name) {
-                Ok(m) => tree = Some(m),
-                Err(e) => stopped = Some(format!("the check tree was not written: {e}")),
-            },
-        }
-        if let Some(why) = &stopped {
+        if git.tree(&ct.commit).as_deref() != Some(ct.tree.as_str()) {
+            let why = format!("{} no longer has the tree the plan was made with", ct.commit);
             crate::warn!("edition: {why}; nothing was run");
-            return Ok(Ran::Ran { outcomes, receipt, stopped });
+            return Ok(Ran::Ran { outcomes, receipt, stopped: Some(why) });
         }
     }
-    let mut first_in_tree = true;
     for (i, s) in plan.steps.iter().enumerate() {
         if s.kind == Kind::Note || s.argv.is_empty() {
             continue;
         }
+        let mut current: Option<crate::checktree::Materialised> = None;
+        let mut extra_env: Vec<(String, String)> = Vec::new();
         let (cwd, program) = if s.in_tree {
-            let Some(m) = &tree else {
+            let Some(ct) = &plan.check_tree else {
                 stopped = Some(format!("{}: the plan has no check tree", s.what));
                 break;
             };
-            // Exactly the bound tree before the first check; before later ones, every
-            // bound file unchanged (an earlier check may have added output).
-            if let Err(e) = m.verify(first_in_tree) {
-                let why = format!(
-                    "{}: the check tree no longer matches {} ({e}); nothing further was run",
-                    s.what,
-                    plan.check_tree.as_ref().map(|c| c.tree.as_str()).unwrap_or("")
-                );
+            let name = crate::checktree::name(&tree_name, i);
+            crate::say!(
+                "> [local] write the tree of {} to {}",
+                crate::util::short(&ct.commit),
+                ct.base.join(&name).join("tree").display()
+            );
+            let m = match crate::checktree::materialise(git, &ct.base, &ct.listed, &name, &ct.limits) {
+                Ok(m) => m,
+                Err(e) => {
+                    let why = format!("{}: the check tree was not written: {e}; nothing further was run", s.what);
+                    crate::warn!("edition: {why}");
+                    stopped = Some(why);
+                    break;
+                }
+            };
+            // Exactly the bound tree, immediately before the check.
+            if let Err(e) = m.verify() {
+                let why =
+                    format!("{}: the check tree does not match {} ({e}); nothing further was run", s.what, ct.tree);
                 crate::warn!("edition: {why}");
                 stopped = Some(why);
                 break;
             }
-            first_in_tree = false;
             let program = if s.program.is_relative() { m.dir.join(&s.program) } else { s.program.clone() };
-            (m.dir.clone(), program)
+            let dir = m.dir.clone();
+            extra_env.push(("GIT_CEILING_DIRECTORIES".into(), m.home.display().to_string()));
+            current = Some(m);
+            (dir, program)
         } else {
             (s.cwd.clone(), s.program.clone())
         };
@@ -703,7 +720,15 @@ pub fn execute(
         let mut c = Command::new(&program);
         c.args(&s.argv[1..]).current_dir(&cwd);
         c.env_clear();
-        c.envs(s.run_env(&plan.run_path, &plan.tool_env));
+        let mut env = s.run_env(&plan.run_path, &plan.tool_env);
+        if s.in_tree {
+            // git must find no repository from a check: none above the tree, none named.
+            env.retain(|(k, _)| {
+                !crate::config::GIT_DISCOVERY_VARS.contains(&k.as_str()) && !k.starts_with("GIT_CONFIG_")
+            });
+            env.extend(extra_env.iter().cloned());
+        }
+        c.envs(env);
         // Edition's own git and gh output can name the remote URL: capture it and print it
         // redacted. Configured commands write straight to the terminal.
         let code = if s.isolated {
@@ -728,6 +753,8 @@ pub fn execute(
             }
         };
         let o = Outcome { index: i, kind: s.kind, what: s.what.clone(), code };
+        // The check's tree goes as soon as the check ends.
+        drop(current.take());
         let ok = o.ok();
         outcomes.push(o);
         // The pending record follows every step, so a crash leaves what is known.
@@ -739,6 +766,5 @@ pub fn execute(
             break;
         }
     }
-    drop(tree);
     Ok(Ran::Ran { outcomes, receipt, stopped })
 }

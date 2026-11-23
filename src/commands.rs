@@ -1391,13 +1391,20 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
         let Some(tree) = c.git.tree(&commit) else {
             return refuse(&[format!("cannot read the tree of {}", short(&commit))]);
         };
-        let entries = match crate::checktree::list(&c.git, &tree) {
+        let limits = l.cfg.check_tree.limits();
+        let entries = match crate::checktree::list(&c.git, &tree, &limits) {
             Ok(e) => e,
             Err(e) => return refuse(&[format!("channel {channel}: the checks cannot run on {}: {e}", short(&commit))]),
         };
+        let base = match crate::checktree::base_dir() {
+            Ok(b) => b,
+            Err(e) => return refuse(&[e]),
+        };
         plan.fact("checks-tree", &tree);
         plan.fact("checks-method", crate::checktree::METHOD);
-        plan.check_tree = Some(steps::CheckTree { commit: commit.clone(), tree });
+        plan.fact("checks-dir", &base.display().to_string());
+        plan.check_tree =
+            Some(steps::CheckTree { commit: commit.clone(), tree, base, limits, listed: entries.clone() });
         Some(entries)
     } else {
         None
@@ -1406,10 +1413,10 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
         let mut steps = Vec::new();
         if let Some(ct) = &plan.check_tree {
             steps.push(Step::note(&format!(
-                "the checks run on the tree of {} ({}), written by Edition into {}/<receipt> after the receipt is spent; not on this checkout, and without its untracked or ignored files, git metadata, submodules or filters",
+                "each check runs in a fresh copy of the tree of {} ({}), written by Edition into {}/<receipt>-<n>/tree after the receipt is spent and removed when the check ends; not on this checkout, and without its untracked or ignored files, git metadata (git finds no repository there), submodules or filters",
                 short(&commit),
                 short(&ct.tree),
-                crate::checktree::DIR
+                ct.base.display()
             )));
         }
         for name in &ch.checks {

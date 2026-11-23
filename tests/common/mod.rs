@@ -89,6 +89,10 @@ pub fn edition_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Out {
         .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
         .env("GIT_COMMITTER_NAME", "Test")
         .env("GIT_COMMITTER_EMAIL", "test@example.invalid");
+    // Check trees go beside the test's repositories, never in the real cache.
+    if let Some(root) = dir.parent() {
+        c.env("XDG_CACHE_HOME", root.join("cache"));
+    }
     for (k, v) in env {
         c.env(k, v);
     }
