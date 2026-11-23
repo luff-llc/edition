@@ -187,14 +187,15 @@ pub struct ContentCfg {
     /// Path globs that are never scanned (for example the file defining the patterns).
     #[serde(default)]
     pub allow_paths: Vec<String>,
-    /// `report` (print, exit 0) or `block` (the pre-push check exits 1).
-    #[serde(default = "d_report")]
+    /// `block` (the default: findings stop a push and fail `verify`) or `report`.
+    /// Edition's own outward plans to a public remote always block.
+    #[serde(default = "d_block")]
     pub action: String,
 }
 
 impl Default for ContentCfg {
     fn default() -> Self {
-        ContentCfg { deny: d_deny(), allow_paths: Vec::new(), action: d_report() }
+        ContentCfg { deny: d_deny(), allow_paths: Vec::new(), action: d_block() }
     }
 }
 
@@ -292,8 +293,8 @@ fn d_ledger() -> String {
 fn d_command() -> String {
     "command".into()
 }
-fn d_report() -> String {
-    "report".into()
+fn d_block() -> String {
+    "block".into()
 }
 fn d_release_id() -> String {
     "{version}".into()
@@ -314,6 +315,21 @@ pub struct Loaded {
     pub hotfix_branch: Template,
     /// Lines of the file that carry the to-do marker.
     pub todos: Vec<String>,
+    /// The configuration file's bytes, for the plan digest.
+    pub raw: String,
+}
+
+/// Channel kinds that are review or testing tracks, where a release candidate may go.
+pub const REVIEW_KINDS: &[&str] = &["testflight", "play-testing", "store-review", "beta"];
+
+/// Placeholders a command may use, each as a whole argument or environment value.
+pub const PLACEHOLDERS: &[&str] = &["commit", "ref", "tag", "version", "build", "channel", "target"];
+
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"];
+
+/// The placeholder an argument names, if it is exactly `{name}`.
+pub fn whole_placeholder(a: &str) -> Option<&str> {
+    a.strip_prefix('{')?.strip_suffix('}').filter(|n| !n.contains('{') && !n.contains('}'))
 }
 
 impl Loaded {
@@ -335,8 +351,17 @@ impl Loaded {
         let pre_tag = Template::parse(&cfg.tags.prerelease)?;
         let line_branch = Template::parse(&cfg.lines.branch)?;
         let hotfix_branch = Template::parse(&cfg.lines.hotfix_branch)?;
-        let loaded =
-            Loaded { cfg, root, path: path.to_path_buf(), final_tag, pre_tag, line_branch, hotfix_branch, todos };
+        let loaded = Loaded {
+            cfg,
+            root,
+            path: path.to_path_buf(),
+            final_tag,
+            pre_tag,
+            line_branch,
+            hotfix_branch,
+            todos,
+            raw: text.clone(),
+        };
         loaded.validate()?;
         Ok(loaded)
     }
@@ -410,7 +435,47 @@ impl Loaded {
                 errs.push(format!("pin {} names repo `{}`, which is not in [repos]", p.name, p.repo));
             }
         }
+        let check_cmd = |what: &str, argv: &[String], env: &BTreeMap<String, String>, errs: &mut Vec<String>| {
+            if let Some(p) = argv.first() {
+                let base = p.rsplit('/').next().unwrap_or(p);
+                if SHELLS.contains(&base) && argv.iter().any(|a| a == "-c") {
+                    errs.push(format!(
+                        "{what}: commands run directly, never through `{base} -c`; put a pipeline in a script file"
+                    ));
+                }
+            }
+            for a in argv.iter().chain(env.values()) {
+                if !a.contains('{') && !a.contains('}') {
+                    continue;
+                }
+                match whole_placeholder(a) {
+                    Some(n) if PLACEHOLDERS.contains(&n) => {}
+                    Some(n) if n.strip_prefix("var.").is_some_and(|v| c.vars.contains_key(v)) => {}
+                    Some(n) => errs.push(format!("{what}: unknown placeholder {{{n}}}")),
+                    None => errs.push(format!(
+                        "{what}: `{a}`: a placeholder must be a whole argument or environment value, never part of one"
+                    )),
+                }
+            }
+        };
+        for (name, ck) in &c.checks {
+            check_cmd(&format!("check {name}"), &ck.run, &ck.env, &mut errs);
+        }
         for (name, ch) in &c.channels {
+            if !name.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+                || name.starts_with('-')
+            {
+                errs.push(format!("channel `{name}`: names use lowercase letters, digits and hyphens"));
+            }
+            check_cmd(&format!("channel {name} run"), &ch.run, &ch.env, &mut errs);
+            check_cmd(&format!("channel {name} probe"), &ch.probe, &BTreeMap::new(), &mut errs);
+            if ch.allow_prerelease && !REVIEW_KINDS.contains(&ch.kind.as_str()) {
+                errs.push(format!(
+                    "channel {name}: allow_prerelease is only for review or testing kinds ({}), not `{}`",
+                    REVIEW_KINDS.join(", "),
+                    ch.kind
+                ));
+            }
             if ch.run.is_empty() {
                 errs.push(format!("channel {name}: run must name the command that performs it"));
             }
@@ -458,16 +523,24 @@ impl Loaded {
         }
     }
 
-    /// Expands `{var.NAME}` (overridable with `EDITION_VAR_NAME`) and a leading `~/`.
-    /// A variable declared as `""` must come from the environment.
+    /// A variable's value and whether it came from the environment (and so is treated
+    /// as secret: printed by name, never recorded). `None` when it has no value.
+    pub fn var(&self, name: &str) -> Option<(String, bool)> {
+        let v = self.cfg.vars.get(name)?;
+        let env_key = format!("EDITION_VAR_{}", name.to_ascii_uppercase().replace('-', "_"));
+        match std::env::var(&env_key).ok().filter(|e| !e.is_empty()) {
+            Some(e) => Some((e, true)),
+            None if v.is_empty() => None,
+            None => Some((v.clone(), false)),
+        }
+    }
+
+    /// Expands a leading `~/` in a configured path, and a whole `{var.NAME}`.
     pub fn expand(&self, s: &str) -> String {
         let mut out = s.to_string();
-        for (k, v) in &self.cfg.vars {
-            let env_key = format!("EDITION_VAR_{}", k.to_ascii_uppercase().replace('-', "_"));
-            let val = std::env::var(&env_key).ok().filter(|e| !e.is_empty()).unwrap_or_else(|| v.clone());
-            // An empty value with no override stays unexpanded, so `deploy` can refuse it.
-            if !val.is_empty() {
-                out = out.replace(&format!("{{var.{k}}}"), &val);
+        if let Some(n) = whole_placeholder(s).and_then(|n| n.strip_prefix("var.")) {
+            if let Some((v, _)) = self.var(n) {
+                out = v;
             }
         }
         if let Some(rest) = out.strip_prefix("~/") {

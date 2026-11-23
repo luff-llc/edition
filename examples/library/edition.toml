@@ -1,0 +1,81 @@
+# Example: "Inkwell", a fictional sync library that also ships a home server.
+# Every command is an argv array run directly; a placeholder is always a whole argument.
+
+product = "inkwell"
+remote = "origin"
+main = "main"
+ledger = "releases/ledger.toml"
+
+[tags]
+final = "v{version}"
+prerelease = "v{version}-rc.{n}"
+prerelease_files = "base"     # version files say 1.4.0 at v1.4.0-rc.N
+
+[lines]
+branch = "release/{line}"
+dev_suffix = "dev"            # main builds as X.Y.0-dev
+hotfix_branch = "hotfix/{version}"
+
+[verify]
+tags_since = "1.0.0"
+
+[[version_files]]
+path = "Cargo.toml"
+after = "[workspace.package]"
+pattern = 'version = "{version}"'
+
+[[version_files]]
+path = "Cargo.lock"
+after = 'name = "inkwell-core"'
+pattern = 'version = "{version}"'
+
+[[version_files]]
+path = "js/package.json"
+after = '"name": "@inkwell/core",'
+pattern = '"version": "{version}"'
+
+[[version_files]]
+path = "android/build.gradle.kts"
+pattern = 'version = "{version}"'
+
+[platforms.home]
+
+# The repository is public: pushes are scanned for internal notes first.
+[remotes.origin]
+public = true
+
+[vars]
+# The home server's deploy script on this machine. Set EDITION_VAR_DEPLOY_SCRIPT;
+# it is printed by name and never recorded.
+deploy_script = ""
+
+[checks.test]
+run = ["cargo", "test", "--workspace", "--locked"]
+
+[channels.dev-home]
+tier = "dev"
+kind = "home"
+target = "http://localhost:8080"
+platform = "home"
+run = ["scripts/package.sh", "--only", "home", "--allow-dirty"]
+
+[channels.staging-home]
+tier = "staging"
+kind = "home"
+target = "https://staging.example.com"
+platform = "home"
+checks = ["test"]
+run = ["{var.deploy_script}", "release", "{commit}"]
+env = { HOME_SITE = "staging" }
+probe = ["curl", "-fsS", "https://staging.example.com/healthz"]
+
+[channels.production-home]
+tier = "prod"
+kind = "home"
+target = "https://home.example.com"
+platform = "home"
+approval = "owner"
+checks = ["test"]
+run = ["{var.deploy_script}", "release", "{commit}"]
+env = { HOME_SITE = "production" }
+probe = ["curl", "-fsS", "https://home.example.com/healthz"]

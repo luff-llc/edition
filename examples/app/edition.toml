@@ -1,0 +1,111 @@
+# Example: "Quill", a fictional app for iOS and Android that embeds the Inkwell
+# library and plans its releases in a Concordance catalog. Edition orchestrates the
+# repository's own build and upload scripts; they keep their own signing and approvals.
+
+product = "quill"
+remote = "origin"
+main = "main"
+ledger = "releases/ledger.toml"
+
+# One version for both platforms. Both files must agree, and must match every tag.
+[[version_files]]
+path = "ios/version.txt"
+pattern = "{version}"
+
+[[version_files]]
+path = "android/app/build.gradle.kts"
+pattern = 'versionName = "{version}"'
+
+# Build numbers are per platform: iOS takes `--build`; Android reads Gradle.
+[platforms.ios]
+
+[platforms.android]
+build_file = "android/app/build.gradle.kts"
+build_pattern = "versionCode = {build}"
+
+[concordance]
+catalog = "spec/quill"
+release = "{version}"
+
+# Production builds must pin the commit of a final Inkwell tag on Inkwell's remote.
+[repos.inkwell]
+path = "../inkwell"
+final_tag = "v{version}"
+
+[[pins]]
+name = "inkwell-sdk"
+file = "tools/inkwell.lock"
+pattern = "commit={commit}"
+repo = "inkwell"
+
+[vars]
+# Path to the Android App Bundle built from the deployed commit (per machine).
+android_bundle = ""
+
+[checks.gate]
+run = ["scripts/release-gate.sh"]
+
+[checks.parity]
+kind = "parity"
+note = "Every item the release carries is ready on iOS and Android, per Concordance."
+
+# staging: the tip of main, on every platform.
+[channels.testflight-internal]
+tier = "staging"
+kind = "testflight"
+target = "TestFlight internal testers"
+platform = "ios"
+checks = ["gate"]
+run = ["scripts/upload-ios.sh", "{commit}", "{build}", "internal"]
+
+[channels.play-internal]
+tier = "staging"
+kind = "play-testing"
+target = "Google Play internal testing"
+platform = "android"
+checks = ["gate"]
+run = ["scripts/upload-android.sh", "{var.android_bundle}", "internal"]
+
+# prod: final tags; the review tracks also accept release candidates.
+[channels.testflight-external]
+tier = "prod"
+kind = "testflight"
+target = "TestFlight external testers"
+platform = "ios"
+allow_prerelease = true
+approval = "owner"
+checks = ["parity"]
+run = ["scripts/upload-ios.sh", "{commit}", "{build}", "external"]
+
+[channels.play-closed]
+tier = "prod"
+kind = "play-testing"
+target = "Google Play closed testing"
+platform = "android"
+allow_prerelease = true
+approval = "owner"
+checks = ["parity"]
+run = ["scripts/upload-android.sh", "{var.android_bundle}", "beta"]
+
+# Store releases are submitted by a person in each store's console; these channels
+# record that submission against the exact tag and build, after external testing
+# held the same commit.
+[channels.app-store]
+tier = "prod"
+kind = "app-store"
+target = "App Store"
+platform = "ios"
+approval = "owner"
+checks = ["parity"]
+requires = ["testflight-external"]
+run = ["true"]
+
+[channels.play-production]
+tier = "prod"
+kind = "play-production"
+target = "Google Play production"
+platform = "android"
+approval = "owner"
+checks = ["parity"]
+requires = ["play-closed"]
+run = ["true"]

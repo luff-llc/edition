@@ -19,11 +19,13 @@ same release. Each is easy to avoid once it is checked, and easy to miss when it
 - **Orchestrate, do not reimplement.** Signing, uploading, deploying and secrets stay with
   the scripts that already do them well. A channel names the command that performs it;
   Edition decides whether it may run, runs it at the checked commit, and records it.
-- **Dry run first, always.** Every mutating command prints the exact commands it would
-  run. `--apply` runs the local ones. Anything that leaves the machine (a push, a deploy,
-  an upload, a pull request) also needs `--confirm <token>` for that run, and the token
-  is printed by the dry run. A missing confirmation is caught before any step runs, so a
-  plan never stops half done for that reason.
+- **Dry run first, always.** Every mutating command prints its plan. `--apply` runs
+  local steps. A plan that leaves the machine (a push, a deploy, an upload, a pull
+  request) runs only with `--confirm <receipt>`, where the receipt was issued by a dry
+  run of exactly that plan (see Receipts). Nothing runs when the receipt does not match.
+- **Live state, checked twice.** Outward plans are built from the remote's live heads and
+  tags (`git ls-remote`), never from possibly stale remote-tracking refs, and each outward
+  step re-reads the remote immediately before it runs.
 - **Policy is built in.** The three tiers are part of the tool, not of each channel's
   configuration. A channel declares its tier; it cannot loosen it.
 - **Readiness, not dates.** A release moves forward by passing gates whose evidence is
@@ -57,6 +59,11 @@ same release. Each is easy to avoid once it is checked, and easy to miss when it
 - Lines merge forward into `main`. `main` is never merged into a line, and fixes are not
   cherry-picked backwards. `verify` lists every commit on a release line that `main`
   does not contain; `forward` offers one pull request per line.
+- A hotfix starts on `hotfix/X.Y.Z` from the line (`hotfix start`, local only), lands on
+  the line by review, and is finished by `hotfix finish X.Y.Z`: one plan with one receipt
+  that tags the line, publishes the tag and opens the forward-merge pull request. The
+  pull request step expects the tag it just published, so the plan never leaves a public
+  tag without its forward merge unless a step fails, which the ledger then records.
 - **Version files** are any number of files and patterns (`version = "{version}"`,
   optionally scoped to the first match after a given line). They must agree with each
   other at every commit Edition looks at, and with the tag at every release tag.
@@ -80,21 +87,76 @@ a target, the platform it ships, the checks it needs, and the command that perfo
 | --- | --- | --- | --- |
 | `dev` | any ref; runs on this machine | never | never recorded |
 | `staging` | exactly the tip of `main` on the remote | never | recorded |
-| `prod` | a final tag on its release line, present on the remote; every pin on a final tag | if the channel says `owner` or `touch` | recorded |
+| `prod` | a release tag named explicitly, on its release line and present on the remote; every pin on a final tag | if the channel says `owner` or `touch` | recorded |
 
 - **Staging tracks `main`.** Every merge to `main` is deployable to every staging
   channel without further approval, and nothing else is: not an older `main` commit, not
-  a branch. This applies alike to a staging server, TestFlight internal testing and Play
+  a branch. "The tip" is the remote's live head, read when the plan is made and again
+  just before the deploy command runs. This applies alike to a staging server, TestFlight internal testing and Play
   internal testing.
-- **Production takes releases.** A prod channel takes a final tag that is on the remote
-  and on its release line, and refuses it while any pinned dependency is not itself on a
-  final tag (see Pins).
+- **Production takes releases.** A prod channel takes a tag named explicitly
+  (`refs/tags/v1.4.0`, or `v1.4.0` when no branch has that name); a branch or a bare
+  commit is refused even when a release tag points at it. The tag must be on the remote,
+  pointing at the commit Edition resolved, and on its release line, and every pinned
+  dependency must itself be on a final tag (see Pins).
 - **Release candidates** are prod-tier refs only for channels that set
-  `allow_prerelease`: store review builds such as TestFlight external testing or Play
-  closed testing. A production server never sets it.
+  `allow_prerelease`, which configuration accepts only on review or testing kinds
+  (`testflight`, `play-testing`, `store-review`, `beta`). A production server cannot set it.
 - **Approvals.** `approval = "owner"` requires `--approved-by <name>`, which is recorded.
   `approval = "touch"` also notes that the command itself asks for a hardware key. Only
   prod channels may ask for an approval; staging never does.
+
+### Receipts
+
+A dry run of a plan with outward steps prints a receipt: the first 16 hex digits of
+Git's hash of the plan's canonical text. That text contains the configuration file's
+digest, every fact the plan was checked against (resolved commits, tags, version, build,
+approver, pins, allowed content findings), and for every step its kind, arguments,
+environment (values included, so a changed secret changes the receipt, though it is
+never printed), working directory and remote expectations. Timestamps and notes are not
+part of it.
+
+`--apply --confirm <receipt>` recomputes the plan from scratch and runs it only if:
+
+- the recomputed plan hashes to the same receipt (any change of ref, configuration or
+  remote state since the dry run produces a different one);
+- the receipt was issued here, by a dry run, less than `EDITION_RECEIPT_TTL` seconds ago
+  (default 1800);
+- it has not been used: used receipts are recorded in `.edition/receipts` (local state,
+  never committed) and in the ledger entry, and either one refuses a replay.
+
+There is no way to run an outward step without a receipt from a prior dry run of the same
+plan.
+
+### Remote state
+
+Plans with outward steps read the remote with `git ls-remote` and use those heads and
+tags. If the remote cannot be read, the plan is refused; if a live head is not in the
+local clone, Edition asks for a fetch rather than reasoning about a commit it cannot see.
+Each outward step also carries expectations, printed with the plan, such as "remote
+`refs/heads/main` is `a1b2c3`" or "`refs/tags/v1.4.0` is absent", and immediately before
+the step runs the remote is read again. If any expectation fails, the step and everything
+after it is skipped and the ledger records the run as `failed` with the reason.
+
+Outward plans also refuse a dirty working tree (other than the ledger) and a detached
+HEAD, so the ledger is committed on top of exactly what was checked.
+
+### Commands, placeholders and secrets
+
+- Channel and check commands are argument lists executed directly, never through a
+  shell; `sh -c` (and the other common shells with `-c`) is rejected when the
+  configuration loads. A pipeline belongs in a script file.
+- A placeholder (`{commit}`, `{ref}`, `{tag}`, `{version}`, `{build}`, `{channel}`,
+  `{target}`, `{var.NAME}`) must be a whole argument or environment value. Text such as
+  `--sha={commit}` is rejected.
+- Inputs are checked against strict grammars before use: refs and `--at` (letters,
+  digits, `.`, `_`, `/`, `-`; no leading `-`, no `..`), build labels (letters, digits,
+  dots), versions (`MAJOR.MINOR.PATCH[-pre]`), channel names (lowercase, digits,
+  hyphens), actor names (one printable line). Machine values may not start with `-`.
+- A `[vars]` value set to `""` must come from `EDITION_VAR_NAME` on the machine. Such
+  values are treated as secret: plans print `<var.NAME>`, environment variables are
+  printed by name only, and the ledger records each step's configured template
+  (`{var.NAME}`), never expanded values.
 
 ### Gates
 
@@ -138,11 +200,21 @@ detectable.
 `releases/ledger.toml` (configurable) is an append-only list of `[[entry]]` tables, one
 per outward action: `deploy`, `push-branch`, `push-tag`, `open-pr`. Each entry records
 the time, the actor, the channel and tier, the ref and commit, the tree hash, the
-version, platform and build, the result, the approval, the command that ran, the check
-results, and every pin with its tag.
+version, platform and build, the result, the receipt, the approval, the step's configured
+command (never expanded values), every step that ran with its exit code, gate evidence,
+every pin with its tag, and any content findings explicitly allowed.
 
-- Entries are never edited; a correction is a new entry. `verify` fails when the
-  committed ledger is not a prefix of the working copy.
+- **Results.** `ok`: the step and everything after it succeeded. `partial`: the outward
+  step succeeded and a later step (a probe, a Concordance record) failed, or a later
+  outward step was stopped. `failed`: the outward step failed, a check before it failed,
+  or a remote expectation stopped it.
+- **Hash chain.** Each entry's `prev` is Git's hash of the previous entry's canonical
+  text (the first entry's is all zeros). Appends take a lock (`ledger.toml.lock`), check
+  the existing chain, and refuse to extend a broken one.
+- **History.** `verify` checks the chain, and that along the first-parent history of
+  `main` (then HEAD, then the working copy) every committed version of the ledger is a
+  prefix of the next. An edit, removal or reordering is reported with the first commit
+  that introduced it.
 - Dev-tier deploys are never recorded.
 - `verify` checks every successful entry: its commit is reachable from the remote; a
   staging entry's commit is on `main`; a prod entry's ref is a release tag at that commit.
@@ -152,14 +224,26 @@ The ledger is committed with the repository's other changes, through its normal 
 
 ### Content check
 
-Remotes may be marked `public = true`. Before anything is pushed to one,
-`edition check-push <remote>` (installed as a pre-push hook by `edition hooks install`)
-scans the commits being pushed, their messages and the lines they add, for a deny-list:
-by default notes addressed to a named person, unanswered to-do markers, home-directory
-paths and private-key headers. `verify` scans the tracked tree and unpushed commits the
-same way. The default is to report; `content.action = "block"` makes the hook refuse the
-push. The same hook also reports disagreeing version files and pins that are not on a
-release tag.
+Remotes may be marked `public = true`. What would be published to one is scanned for a
+deny-list: by default notes addressed to a named person, unanswered to-do markers,
+home-directory paths and private-key headers. The scan covers every commit reachable
+from what is pushed and from nothing the remote already has: commit messages and every
+added line, with renames shown as a deletion plus an addition (so a file moved out of an
+exempt path is scanned in full) and merges as combined diffs (a line counts as added by a
+merge only when it is new against every parent). Binary files are skipped.
+
+- **Edition's own plans.** Every plan that pushes to a public remote runs the scan when
+  the plan is made, and findings refuse the plan. A finding can be let through only by
+  naming its id with `--allow-finding <id>`; the id becomes part of the receipt and is
+  recorded in the ledger. (Edition's pushes publish commits the remote already has, plus
+  the annotated tags Edition writes, so in practice this scan is a backstop.)
+- **Every other push.** `edition check-push <remote>`, installed as a pre-push hook by
+  `edition hooks install`, runs the same scan on the refs git is about to push and refuses
+  the push on a finding (`content.action = "block"`, the default; `"report"` only
+  prints). It also reports, without blocking, disagreeing version files and pins that are
+  not on a release tag.
+- **`verify`** scans the tracked tree and commits not yet on each public remote, and
+  fails on a finding when the action is `block`.
 
 ## How it fits with other tools
 
@@ -187,6 +271,7 @@ JSON object per line for each event:
 | `channel-updated` | a deploy was recorded (ok or failed) | `id`, `channel`, `ref`, `commit`, `result`, `by` |
 | `ref-published` | a pushed branch or tag, or an opened pull request, was recorded | `id`, `ref`, `commit`, `result`, `by` |
 | `gate-failed` | a gate refused a deploy | `gate`, `channel`, `reason` |
+| `refused` | any plan was refused | `reason` |
 | `parity-gap` | the parity gate found an item that is not ready | `release`, `item` |
 
 Every event carries `at` (UTC). Consumers treat the file as append-only and keep their own
@@ -206,13 +291,15 @@ offset. Edition never reads it back.
 | `[repos.R] path`, `remote`, `final_tag` | another repository that pins point into |
 | `[[pins]] name`, `file`, `pattern`, `repo` | a pinned dependency |
 | `[remotes.R] public` | marks a remote for the content check |
-| `[content] deny`, `allow_paths`, `action` | the content check's patterns (`<word>` matches one word), exempt paths, `report` or `block` |
+| `[content] deny`, `allow_paths`, `action` | the content check's patterns (`<word>` matches one word), exempt path globs, `block` (default) or `report` |
 | `[concordance] catalog`, `release`, `bin` | the Concordance catalog; the release id template (`{version}`) |
-| `[vars] NAME` | values for `{var.NAME}`; an empty value must come from `EDITION_VAR_NAME` on the machine |
+| `[vars] NAME` | values for `{var.NAME}`; an empty value must come from `EDITION_VAR_NAME` on the machine and is treated as secret |
 | `[verify] tags_since` | older tags are not checked against version files |
 
-Placeholders in `run`, `probe` and check commands: `{commit}`, `{ref}`, `{tag}`,
-`{version}`, `{build}`, `{channel}`, `{target}`, `{var.NAME}`.
+Placeholders in `run`, `probe`, `env` and check commands, each a whole argument or value:
+`{commit}`, `{ref}`, `{tag}`, `{version}`, `{build}`, `{channel}`, `{target}`,
+`{var.NAME}`. Environment variables: `EDITION_ACTOR`, `EDITION_EVENTS`,
+`EDITION_RECEIPT_TTL`, `EDITION_VAR_<NAME>`.
 
 ## Roadmap
 

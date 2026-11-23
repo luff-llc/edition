@@ -140,6 +140,49 @@ impl Git {
         self.run(&["config", "user.name"]).ok().filter(|s| !s.is_empty())
     }
 
+    /// Git's object hash of `text` (as a blob). Used for receipts and the ledger chain.
+    pub fn hash(&self, text: &str) -> Result<String, String> {
+        use std::io::Write;
+        let mut child = self
+            .command(&["hash-object", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot run git: {e}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or("no stdin for git hash-object")?
+            .write_all(text.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!("git hash-object failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// True when HEAD is not on a branch.
+    pub fn is_detached(&self) -> bool {
+        !self.ok(&["symbolic-ref", "-q", "HEAD"])
+    }
+
+    /// Tracked paths with uncommitted changes (staged or not).
+    pub fn dirty_paths(&self) -> Vec<String> {
+        self.run(&["status", "--porcelain=v1", "--untracked-files=no", "-z"])
+            .unwrap_or_default()
+            .split('\0')
+            .filter(|l| l.len() > 3)
+            .map(|l| l[3..].to_string())
+            .collect()
+    }
+
+    /// True when `refs/<kind>/<name>` exists locally.
+    pub fn has_ref(&self, full: &str) -> bool {
+        self.ok(&["show-ref", "--verify", "--quiet", full])
+    }
+
     pub fn is_tracked(&self, path: &str) -> bool {
         self.ok(&["ls-files", "--error-unmatch", "--", path])
     }

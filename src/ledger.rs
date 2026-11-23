@@ -2,9 +2,12 @@
 //!
 //! Each outward action (a deploy to a staging or prod channel, a pushed branch or tag,
 //! an opened forward-merge pull request) appends one `[[entry]]`. Entries are never
-//! edited; a correction is a new entry. `verify` checks that the committed ledger is a
-//! prefix of the working copy.
+//! edited; a correction is a new entry. Each entry carries `prev`, the hash of the
+//! previous entry's canonical text, so an edit, removal or reordering breaks the chain.
+//! `verify` checks the chain and that every committed version of the ledger on the main
+//! branch's first-parent history is a prefix of the next.
 
+use crate::git::Git;
 use serde::Deserialize;
 use std::io::Write;
 use std::path::Path;
@@ -28,8 +31,14 @@ pub struct Entry {
     pub version: Option<String>,
     pub platform: Option<String>,
     pub build: Option<String>,
-    /// `ok` or `failed`.
+    /// `ok`: every step succeeded. `partial`: the outward step succeeded and a later
+    /// step failed. `failed`: the outward step failed or never ran.
     pub result: String,
+    /// The hash of the previous entry's canonical text (`GENESIS` for the first).
+    #[serde(default)]
+    pub prev: String,
+    /// The receipt this run was confirmed with.
+    pub receipt: Option<String>,
     pub approved_by: Option<String>,
     #[serde(default)]
     pub command: Vec<String>,
@@ -38,6 +47,12 @@ pub struct Entry {
     /// `name=commit (tag)` for every pin the shipped commit carried.
     #[serde(default)]
     pub pins: Vec<String>,
+    /// Each step that ran, with its exit code.
+    #[serde(default)]
+    pub steps: Vec<String>,
+    /// Content-check findings an operator explicitly allowed for this run.
+    #[serde(default)]
+    pub overrides: Vec<String>,
     pub note: Option<String>,
 }
 
@@ -47,6 +62,8 @@ struct File {
     #[serde(default)]
     entry: Vec<Entry>,
 }
+
+pub const GENESIS: &str = "0000000000000000000000000000000000000000";
 
 pub const HEADER: &str = "# Edition ledger: what went where. Append-only; written by `edition`, never by hand.\n# A correction is a new entry. See https://github.com/luff-llc/edition docs/design.md.\n";
 
@@ -109,13 +126,23 @@ pub fn render(e: &Entry) -> String {
         }
     }
     kv("result", &e.result);
+    kv("prev", &e.prev);
+    if let Some(v) = &e.receipt {
+        kv("receipt", v);
+    }
     if let Some(v) = &e.approved_by {
         kv("approved_by", v);
     }
     if let Some(v) = &e.note {
         kv("note", v);
     }
-    for (k, v) in [("command", &e.command), ("evidence", &e.evidence), ("pins", &e.pins)] {
+    for (k, v) in [
+        ("command", &e.command),
+        ("evidence", &e.evidence),
+        ("pins", &e.pins),
+        ("steps", &e.steps),
+        ("overrides", &e.overrides),
+    ] {
         if !v.is_empty() {
             s.push_str(&format!("{k} = {}\n", list(v)));
         }
@@ -123,8 +150,26 @@ pub fn render(e: &Entry) -> String {
     s
 }
 
-/// Appends one entry, creating the file (with its header) if needed. Refuses a symlink.
-pub fn append(path: &Path, e: &Entry) -> Result<(), String> {
+/// The chain hash of an entry: Git's blob hash of its canonical rendering.
+pub fn entry_hash(git: &Git, e: &Entry) -> Result<String, String> {
+    git.hash(&render(e))
+}
+
+/// Checks the chain. Returns the first broken link as `(index, message)`.
+pub fn check_chain(git: &Git, entries: &[Entry]) -> Result<(), (usize, String)> {
+    let mut prev = GENESIS.to_string();
+    for (i, e) in entries.iter().enumerate() {
+        if e.prev != prev {
+            return Err((i, format!("entry {} ({}) does not follow the entry before it", i + 1, e.id)));
+        }
+        prev = entry_hash(git, e).map_err(|m| (i, m))?;
+    }
+    Ok(())
+}
+
+/// Appends one entry under a lock, setting its `prev` to the hash of the last entry.
+/// Creates the file (with its header) if needed. Refuses a symlink or an invalid ledger.
+pub fn append(git: &Git, path: &Path, e: &Entry) -> Result<Entry, String> {
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() {
             return Err(format!("refusing to write the ledger through a symlink: {}", path.display()));
@@ -133,22 +178,39 @@ pub fn append(path: &Path, e: &Entry) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
+    let lock_path = path.with_extension("toml.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| format!("cannot open {}: {err}", lock_path.display()))?;
+    lock.lock().map_err(|err| format!("cannot lock {}: {err}", lock_path.display()))?;
     let existing = std::fs::read_to_string(path).unwrap_or_default();
-    parse(&existing).map_err(|err| format!("refusing to append to an invalid ledger {}: {err}", path.display()))?;
+    let entries =
+        parse(&existing).map_err(|err| format!("refusing to append to an invalid ledger {}: {err}", path.display()))?;
+    check_chain(git, &entries).map_err(|(_, m)| format!("refusing to append to a broken ledger chain: {m}"))?;
+    let mut e = e.clone();
+    e.prev = match entries.last() {
+        Some(last) => entry_hash(git, last)?,
+        None => GENESIS.to_string(),
+    };
     let mut chunk = String::new();
     if existing.is_empty() {
         chunk.push_str(HEADER);
     } else if !existing.ends_with('\n') {
         chunk.push('\n');
     }
-    chunk.push_str(&render(e));
+    chunk.push_str(&render(&e));
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|err| format!("cannot open {}: {err}", path.display()))?;
     f.write_all(chunk.as_bytes()).map_err(|err| format!("cannot write {}: {err}", path.display()))?;
-    Ok(())
+    f.sync_all().map_err(|err| err.to_string())?;
+    drop(lock);
+    Ok(e)
 }
 
 /// The latest successful deploy to each channel.
@@ -186,10 +248,14 @@ mod tests {
             platform: Some("home".into()),
             build: None,
             result: "ok".into(),
+            prev: GENESIS.into(),
+            receipt: Some("0123456789abcdef".into()),
             approved_by: None,
             command: vec!["colophon-home.sh".into(), "release".into(), "abc".into()],
             evidence: vec!["check rust: exit 0".into(), "line\nbreak\\".into()],
             pins: vec![],
+            steps: vec!["deploy: exit 0".into()],
+            overrides: vec![],
             note: Some("first".into()),
         };
         let text = format!("{HEADER}{}", render(&e));

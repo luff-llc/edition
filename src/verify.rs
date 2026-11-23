@@ -226,14 +226,41 @@ fn ledger_checks(l: &Loaded, git: &Git, view: &RemoteView, r: &mut Report) {
             return;
         }
     };
-    if git.is_tracked(&rel) {
-        let committed = git.show("HEAD", &rel).unwrap_or_default();
-        let current = std::fs::read_to_string(&path).unwrap_or_default();
-        if current.starts_with(committed.trim_end()) {
-            r.ok.push(format!("{rel} is append-only against HEAD"));
-        } else {
-            r.errors.push(format!("{rel} was edited: the committed ledger is not a prefix of the working copy"));
+    match ledger::check_chain(git, &entries) {
+        Ok(()) if !entries.is_empty() => r.ok.push(format!("{rel}: hash chain intact ({} entries)", entries.len())),
+        Ok(()) => {}
+        Err((_, m)) => r.errors.push(format!("{rel}: hash chain broken: {m}")),
+    }
+    // Along the first-parent history of main (and then HEAD and the working copy), each
+    // committed version of the ledger must be a prefix of the next.
+    let main_ref = view.branch(&l.cfg.main).map(str::to_string).filter(|c| git.resolve(c).is_some());
+    let mut versions: Vec<(String, String)> = Vec::new();
+    for rev in main_ref.iter().map(String::as_str).chain(std::iter::once("HEAD")) {
+        let commits =
+            git.run(&["log", "--first-parent", "--reverse", "--format=%H", rev, "--", &rel]).unwrap_or_default();
+        for c in commits.lines() {
+            if versions.iter().any(|(h, _)| h == c) {
+                continue;
+            }
+            let text = git.show(c, &rel).unwrap_or_default();
+            versions.push((c.to_string(), text));
         }
+    }
+    versions.push(("the working copy".into(), std::fs::read_to_string(&path).unwrap_or_default()));
+    let mut history_ok = true;
+    for w in versions.windows(2) {
+        let (prev, next) = (&w[0], &w[1]);
+        if !next.1.starts_with(prev.1.trim_end()) {
+            history_ok = false;
+            let at = if next.0.len() == 40 { short(&next.0).to_string() } else { next.0.clone() };
+            r.errors.push(format!(
+                "{rel} was rewritten at {at}: the version before it is not a prefix (an entry was edited, removed or reordered)"
+            ));
+            break;
+        }
+    }
+    if history_ok && versions.len() > 1 {
+        r.ok.push(format!("{rel} is append-only across {} committed version(s)", versions.len() - 1));
     }
     let mut ids: Vec<&str> = Vec::new();
     for e in &entries {

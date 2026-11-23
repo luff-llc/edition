@@ -25,19 +25,23 @@ pub enum Reach {
 }
 
 impl RemoteView {
+    /// Online, heads and tags are the remote's live values from `git ls-remote`;
+    /// offline, heads come from remote-tracking refs and are unverified.
     pub fn build(git: &Git, remote: &str, online: bool) -> Result<RemoteView, String> {
-        let remote_tags = if online {
-            let (_, tags) = git.ls_remote(remote)?;
-            Some(tags)
+        let (branches, remote_tags) = if online {
+            let (heads, tags) = git.ls_remote(remote)?;
+            (heads, Some(tags))
         } else {
-            None
+            (git.remote_branches(remote), None)
         };
-        Ok(RemoteView {
-            remote: remote.to_string(),
-            branches: git.remote_branches(remote),
-            remote_tags,
-            local_tags: git.tags(),
-        })
+        Ok(RemoteView { remote: remote.to_string(), branches, remote_tags, local_tags: git.tags() })
+    }
+
+    /// Every commit the remote is known to have at a ref tip.
+    pub fn tips(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.branches.iter().map(|(_, c)| c.clone()).collect();
+        v.extend(self.remote_tags.iter().flatten().map(|(_, c)| c.clone()));
+        v
     }
 
     pub fn branch(&self, name: &str) -> Option<&str> {
@@ -362,16 +366,27 @@ pub fn check_tier(
                 }
             }
             let at = tags_at(l, &tags, commit);
-            let named = classify_tag(&l.final_tag, &l.pre_tag, input)
-                .filter(|_| at.finals.iter().any(|(n, _)| n == input) || at.pres.iter().any(|(n, _, _)| n == input));
-            let chosen: Option<(String, Version, bool)> = match named {
-                Some((ver, None)) => Some((input.to_string(), ver, false)),
-                Some((ver, Some(_))) => Some((input.to_string(), ver, true)),
-                None => at
-                    .finals
-                    .first()
-                    .map(|(n, ver)| (n.clone(), ver.clone(), false))
-                    .or_else(|| at.pres.first().map(|(n, ver, _)| (n.clone(), ver.clone(), true))),
+            // Production names its tag explicitly: `refs/tags/X`, or a name that is a tag
+            // and not also a branch. A branch or a bare commit is refused even when a
+            // release tag points at it.
+            let name = input.strip_prefix("refs/tags/").unwrap_or(input);
+            let explicit = input.starts_with("refs/tags/")
+                || (git.has_ref(&format!("refs/tags/{input}"))
+                    && !git.has_ref(&format!("refs/heads/{input}"))
+                    && !git.has_ref(&format!("refs/remotes/{}/{input}", view.remote))
+                    && !view.branches.iter().any(|(b, _)| b == input));
+            let named = classify_tag(&l.final_tag, &l.pre_tag, name)
+                .filter(|_| at.finals.iter().any(|(n, _)| n == name) || at.pres.iter().any(|(n, _, _)| n == name));
+            let chosen: Option<(String, Version, bool)> = match (explicit, named) {
+                (true, Some((ver, None))) => Some((name.to_string(), ver, false)),
+                (true, Some((ver, Some(_)))) => Some((name.to_string(), ver, true)),
+                (false, _) => {
+                    v.violations.push(format!(
+                        "prod takes a release tag by name (refs/tags/<tag>, or a tag name that is not also a branch); `{input}` is not one"
+                    ));
+                    return v;
+                }
+                (true, None) => None,
             };
             match chosen {
                 None => v.violations.push(format!(

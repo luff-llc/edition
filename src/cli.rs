@@ -28,19 +28,21 @@ OPTIONS
   -C, --config <path>   edition.toml (default: found in this directory or a parent)
   --root <dir>          the repository the config describes (default: the config's directory)
   --apply               run local steps (default: dry run that prints every command)
-  --confirm <token>     also run outward steps; the dry run prints the token
-  --online              read remotes with git ls-remote and gh (read-only)
+  --confirm <receipt>   run outward steps: the receipt the dry run of this exact plan printed
+  --online              read the remote live for status, plan and verify (outward plans always do)
   --by <who>            recorded actor (default $EDITION_ACTOR, then git user.name)
   --build <label>       build label for app channels
   --approved-by <who>   approval for prod channels that need one
   --at <ref>            commit to cut or tag (default: the branch tip)
   --note <text>         note recorded in the ledger
   --channel <name>      ledger filter
+  --allow-finding <id>  let one named content-check finding through (recorded)
 
 ENVIRONMENT
   EDITION_ACTOR         recorded actor
   EDITION_EVENTS        append JSON-lines events here (`-` for standard error)
-  EDITION_VAR_<NAME>    machine-specific values for {var.name} in edition.toml
+  EDITION_VAR_<NAME>    machine-specific values for {var.name}; printed by name, never recorded
+  EDITION_RECEIPT_TTL   receipt lifetime in seconds (default 1800)
 
 Tiers: dev (any ref, local, unrecorded), staging (tip of main only), prod (final release
 tag on a release line, on the remote, every pin on a release tag).";
@@ -58,6 +60,7 @@ struct Opts {
     at: Option<String>,
     note: Option<String>,
     channel: Option<String>,
+    allow_findings: Vec<String>,
     pos: Vec<String>,
 }
 
@@ -78,6 +81,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--at" => o.at = Some(val(a)?),
             "--note" => o.note = Some(val(a)?),
             "--channel" => o.channel = Some(val(a)?),
+            "--allow-finding" => o.allow_findings.push(val(a)?),
             s if s.starts_with('-') && s != "-" => return Err(format!("unknown option {s}")),
             s => o.pos.push(s.to_string()),
         }
@@ -134,6 +138,7 @@ fn dispatch(o: Opts) -> Result<i32, String> {
         approved_by: o.approved_by.clone(),
         at: o.at.clone(),
         note: o.note.clone(),
+        allow_findings: o.allow_findings.clone(),
     };
     let p = &o.pos;
     let cmd = need(p, 0, "command")?;

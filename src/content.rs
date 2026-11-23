@@ -91,6 +91,22 @@ pub struct Finding {
     pub place: String,
     pub pattern: String,
     pub excerpt: String,
+    /// A short stable id, for `--allow-finding`.
+    pub id: String,
+}
+
+/// Gives each finding its id and drops exact repeats.
+pub fn identify(git: &Git, found: Vec<Finding>) -> Vec<Finding> {
+    let mut out: Vec<Finding> = Vec::new();
+    for mut f in found {
+        if out.iter().any(|o| o.place == f.place && o.pattern == f.pattern && o.excerpt == f.excerpt) {
+            continue;
+        }
+        let h = git.hash(&format!("{}\0{}\0{}", f.place, f.pattern, f.excerpt)).unwrap_or_default();
+        f.id = h.chars().take(10).collect();
+        out.push(f);
+    }
+    out
 }
 
 pub struct Scanner {
@@ -114,15 +130,31 @@ impl Scanner {
         for p in &self.patterns {
             if p.is_match(line) {
                 let excerpt: String = line.trim().chars().take(100).collect();
-                out.push(Finding { place: place.to_string(), pattern: p.source().to_string(), excerpt });
+                out.push(Finding {
+                    place: place.to_string(),
+                    pattern: p.source().to_string(),
+                    excerpt,
+                    id: String::new(),
+                });
             }
         }
     }
 
-    /// Commits in `range` (git log arguments): their messages and the lines they add.
+    /// Commits in `range` (git log arguments): their messages and every line they add.
+    /// Renames are shown as a deletion and an addition, so a file moved out of an allowed
+    /// path is scanned in full. Merges are shown as combined diffs, and a line counts as
+    /// added by the merge only when it is new against every parent (merge-only changes).
     pub fn scan_commits(&self, git: &Git, range: &[String]) -> Vec<Finding> {
-        let mut args =
-            vec!["log", "--no-show-signature", "--no-merges", "-p", "--no-ext-diff", "--format=%x1e%h%x1f%B%x1f"];
+        let mut args = vec![
+            "log",
+            "--no-show-signature",
+            "-p",
+            "--cc",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-color",
+            "--format=%x1e%H%x1f%B%x1f",
+        ];
         args.extend(range.iter().map(String::as_str));
         args.push("--");
         let out = git.run(&args).unwrap_or_default();
@@ -130,22 +162,36 @@ impl Scanner {
         for rec in out.split('\u{1e}') {
             let mut f = rec.splitn(3, '\u{1f}');
             let (Some(hash), Some(body), diff) = (f.next(), f.next(), f.next()) else { continue };
-            let hash = hash.trim();
+            let hash = crate::util::short(hash.trim()).to_string();
             for line in body.lines() {
                 self.scan_line(&format!("commit {hash} message"), line, &mut found);
             }
             let mut path = String::new();
+            let mut parents = 1usize;
             for line in diff.unwrap_or("").lines() {
                 if let Some(p) = line.strip_prefix("+++ ") {
                     path = p.strip_prefix("b/").unwrap_or(p).to_string();
-                } else if let Some(added) = line.strip_prefix('+') {
-                    if !self.allowed(&path) {
-                        self.scan_line(&format!("commit {hash} {path}"), added, &mut found);
-                    }
+                } else if line.starts_with("@@") {
+                    parents = line.chars().take_while(|c| *c == '@').count().saturating_sub(1).max(1);
+                } else if line.len() >= parents
+                    && line.is_char_boundary(parents)
+                    && line[..parents].chars().all(|c| c == '+')
+                    && !self.allowed(&path)
+                {
+                    self.scan_line(&format!("commit {hash} {path}"), &line[parents..], &mut found);
                 }
             }
         }
-        found
+        identify(git, found)
+    }
+
+    /// Exactly what a push would publish: every commit reachable from `tips` and from
+    /// none of the commits the remote already has.
+    pub fn scan_publish(&self, git: &Git, tips: &[String], remote_has: &[String]) -> Vec<Finding> {
+        let mut range: Vec<String> = tips.to_vec();
+        range.push("--not".into());
+        range.extend(remote_has.iter().filter(|c| git.resolve(c).is_some()).cloned());
+        self.scan_commits(git, &range)
     }
 
     /// Every tracked text file in the working tree.
@@ -164,7 +210,7 @@ impl Scanner {
                 self.scan_line(&format!("{path}:{}", n + 1), line, &mut found);
             }
         }
-        found
+        identify(git, found)
     }
 }
 
@@ -217,12 +263,10 @@ pub fn verify(l: &Loaded, git: &Git, r: &mut Report) {
 pub fn check_push(l: &Loaded, git: &Git, remote: &str) -> Result<i32, String> {
     if !l.is_public(remote) {
         println!("edition: {remote} is not marked public; content not checked");
-        let mut code = 0;
         if let Err(e) = crate::policy::agreed_version(l, git, Some("HEAD")) {
-            eprintln!("edition: versions: {e}");
-            code = if l.cfg.content.action == "block" { 1 } else { 0 };
+            eprintln!("edition: versions (reported, not blocking): {e}");
         }
-        return Ok(code);
+        return Ok(0);
     }
     let zero = |s: &str| s.chars().all(|c| c == '0');
     let mut ranges: Vec<Vec<String>> = Vec::new();
@@ -264,14 +308,14 @@ pub fn check_push(l: &Loaded, git: &Git, remote: &str) -> Result<i32, String> {
         return Ok(0);
     }
     for o in &other {
-        eprintln!("edition: {o}");
+        eprintln!("edition: {o} (reported, not blocking)");
     }
     if found.is_empty() {
-        return Ok(if l.cfg.content.action == "block" { 1 } else { 0 });
+        return Ok(0);
     }
     eprintln!("edition: {} line(s) about to go to public remote {remote} match the deny-list:", found.len());
     for f in &found {
-        eprintln!("  {} [{}] {}", f.place, f.pattern, f.excerpt);
+        eprintln!("  {} {} [{}] {}", f.id, f.place, f.pattern, f.excerpt);
     }
     if l.cfg.content.action == "block" {
         eprintln!("edition: push blocked (content.action = \"block\"); edit the commits or the deny-list");
