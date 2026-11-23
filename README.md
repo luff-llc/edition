@@ -148,8 +148,9 @@ Edition pushes and reads with git and gh as you have set them up:
 - gh uses its stored login, or a token variable you declare in `[run] tool_env` (such as
   `GH_TOKEN` or `GH_ENTERPRISE_TOKEN`).
 
-Edition warns when a git configuration file is writable by others, and refuses a
-redirecting or program-running setting that comes from one.
+Before git contacts a remote, Edition refuses if any git configuration file it would read
+is writable by group or others or owned by another user, and every plan binds those files
+so an edit between dry run and apply invalidates the receipt.
 
 ## Residual risks
 

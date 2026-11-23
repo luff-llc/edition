@@ -77,48 +77,22 @@ impl Ctx {
         self.bind_unchecked(plan, view)
     }
 
-    /// Checks the configuration git will use while it talks to the remote. System and
-    /// global configuration are part of the trust base (they hold credential helpers),
-    /// but a file that is writable by its group or others, or owned by another user, is
-    /// named with a warning, and a setting from such a file that can redirect a push or
-    /// run a program refuses the plan. Every such setting is bound in the plan.
-    fn check_git_config(&self, plan: &mut Plan) -> Result<(), String> {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let uid = crate::config::current_uid()?;
-        let untrusted = |file: &str| -> Option<&'static str> {
-            let m = std::fs::metadata(file).ok()?;
-            if m.uid() != 0 && m.uid() != uid {
-                Some("is owned by another user")
-            } else if m.permissions().mode() & 0o022 != 0 {
-                Some("is writable by its group or others")
-            } else {
-                None
-            }
-        };
-        let mut warned: Vec<String> = Vec::new();
-        for (scope, origin, key, value) in self.git.config_settings()? {
-            let reason = origin.as_deref().and_then(untrusted);
-            if let (Some(file), Some(why)) = (&origin, reason) {
-                if !warned.contains(file) {
-                    crate::say!("warning: git reads {file} ({scope} configuration), which {why}");
-                    warned.push(file.clone());
-                }
-            }
-            if scope == "command" || !crate::git::sensitive_config_key(&key) {
-                continue;
-            }
-            plan.fact("git-config", &format!("{scope} {key}={value}"));
-            if let (Some(file), Some(why)) = (&origin, reason) {
-                return Err(format!(
-                    "git setting {key} comes from {file}, which {why}; refusing to talk to the remote with it"
-                ));
-            }
+    /// Binds the audited git configuration chain in the plan: every file's identity
+    /// and every setting that changes how git reaches a remote or signs.
+    fn bind_config(&self, plan: &mut Plan, view: &RemoteView) -> Result<(), String> {
+        let chain = view.config.clone().ok_or("the git configuration was not audited")?;
+        for f in &chain.files {
+            plan.fact("git-config-file", &format!("{} {} {}", f.scope, f.path, f.identity));
         }
+        for (scope, key, value) in &chain.sensitive {
+            plan.fact("git-config", &format!("{scope} {key}={value}"));
+        }
+        plan.git_config = chain;
         Ok(())
     }
 
     fn bind_unchecked(&self, plan: &mut Plan, view: &RemoteView) -> Result<(), String> {
-        self.check_git_config(plan)?;
+        self.bind_config(plan, view)?;
         plan.remote = view.fetch_url.clone();
         plan.fact("fetch-url", &view.fetch_url);
         plan.fact("push-url", &view.push_url);
@@ -1649,6 +1623,9 @@ pub fn ledger_migrate(c: &Ctx) -> Res {
     plan.remote = view.fetch_url.clone();
     plan.fact("fetch-url", &view.fetch_url);
     plan.fact("push-url", &view.push_url);
+    if let Err(e) = c.bind_config(&mut plan, &view) {
+        return refuse(&[e]);
+    }
     plan.fact("ledger-sha256", &crate::util::sha256_hex(text.as_bytes()));
     plan.steps = vec![
         Step::note(&format!(

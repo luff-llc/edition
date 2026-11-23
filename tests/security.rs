@@ -1727,53 +1727,98 @@ fn system_config(root: &Path, text: &str, mode: u32) -> String {
 }
 
 #[test]
-fn system_git_configuration_is_honoured_and_bound() {
+fn editions_git_reads_the_system_configuration() {
+    // Edition no longer sets GIT_CONFIG_NOSYSTEM, so a credential helper or rewrite in
+    // the system file reaches its git. The library's Git is the same command builder the
+    // binary uses; the test points it at a system file the way git itself allows.
     let (root, work, _mirror) = tag_ready("system-config");
     let origin = root.join("origin.git").display().to_string();
-    // The remote is only reachable through a rewrite that lives in the system config,
-    // next to a credential helper, as on a stock macOS or Homebrew git.
-    git(&work, &["config", "remote.origin.url", "https://git.example.invalid/lib.git"]);
     let sys = system_config(
         &root,
         &format!("[url \"{origin}\"]\n\tinsteadOf = https://git.example.invalid/lib.git\n[credential]\n\thelper = osxkeychain\n"),
         0o644,
     );
-    let env = [("GIT_CONFIG_SYSTEM", sys.as_str())];
-    let dry = edition_env(&work, &["tag", "0.6.0"], &env);
-    assert_eq!(dry.code, 0, "{}", dry.all());
-    assert!(dry.stdout.contains(&format!("destination: {origin}")), "{}", dry.stdout);
-    // The credential helper is bound in the receipt: changing it invalidates the plan.
-    let r = dry.receipt();
-    system_config(
-        &root,
-        &format!(
-            "[url \"{origin}\"]\n\tinsteadOf = https://git.example.invalid/lib.git\n[credential]\n\thelper = store\n"
-        ),
-        0o644,
-    );
-    let changed = edition_env(&work, &["tag", "0.6.0", "--apply", "--confirm", &r], &env);
-    assert_eq!(changed.code, 2, "{}", changed.all());
-    assert!(changed.stderr.contains("does not match this plan"), "{}", changed.stderr);
-    let ok = apply_env(&work, &["tag", "0.6.0"], &env);
-    assert_eq!(ok.code, 0, "{}", ok.all());
-    assert!(
-        git(&work, &["ls-remote", "--tags", &origin]).contains("refs/tags/v0.6.0"),
-        "Edition's push used the system config"
-    );
+    let mut g = edition::git::Git::new(&work);
+    assert!(!g.env.iter().any(|(k, _)| k == "GIT_CONFIG_NOSYSTEM"));
+    g.env.push(("GIT_CONFIG_SYSTEM".into(), sys.clone()));
+    let settings = g.config_settings().expect("settings");
+    assert!(settings.iter().any(|(scope, origin, k, _)| scope == "system"
+        && origin.as_deref() == Some(sys.as_str())
+        && k == "credential.helper"));
+    g.run(&["push", "-q", "https://git.example.invalid/lib.git", "refs/remotes/origin/main:refs/heads/through-system"])
+        .expect("push via the system rewrite");
+    assert!(git(&work, &["ls-remote", "--heads", &origin]).contains("through-system"));
 }
 
 #[test]
-fn git_configuration_from_an_untrustworthy_file_warns_or_refuses() {
+fn an_untrustworthy_config_file_is_refused_before_git_contacts_anything() {
+    use std::os::unix::fs::PermissionsExt;
     let (root, work) = project("untrusted-config", BASE_CONFIG, "0.6.0-dev");
-    // Harmless settings in a group-writable file: a warning, and the plan goes on.
-    let sys = system_config(&root, "[color]\n\tui = false\n", 0o664);
-    let env = [("GIT_CONFIG_SYSTEM", sys.as_str())];
-    let warn = edition_env(&work, &["deploy", "staging-home", "main"], &env);
-    assert_eq!(warn.code, 0, "{}", warn.all());
-    assert!(warn.stdout.contains("which is writable by its group or others"), "{}", warn.stdout);
-    // A setting that runs a program, from that file: refused.
-    system_config(&root, "[core]\n\tsshCommand = /tmp/evil\n", 0o666);
-    let refused = edition_env(&work, &["deploy", "staging-home", "main"], &env);
-    assert_eq!(refused.code, 1, "{}", refused.all());
-    assert!(refused.stderr.contains("git setting core.sshcommand comes from"), "{}", refused.stderr);
+    let marker = root.join("ssh-ran");
+    executable(&root, "evil-ssh", &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()));
+    git(&work, &["config", "core.sshCommand", root.join("evil-ssh").to_str().expect("utf8")]);
+    git(&work, &["config", "remote.origin.url", "ssh://git.example.invalid/lib.git"]);
+    std::fs::set_permissions(work.join(".git/config"), std::fs::Permissions::from_mode(0o664)).expect("chmod");
+    for args in [
+        vec!["deploy", "staging-home", "main"],
+        vec!["status", "--online"],
+        vec!["verify", "--online"],
+        vec!["tag", "0.6.0"],
+        vec!["forward"],
+    ] {
+        let out = edition(&work, &args);
+        assert_ne!(out.code, 0, "{args:?}: {}", out.all());
+        assert!(out.all().contains("is writable by its group or others"), "{args:?}: {}", out.all());
+        assert!(!marker.exists(), "{args:?}: git ran the configured ssh command");
+    }
+    let offline = edition(&work, &["verify"]);
+    assert!(offline.stdout.contains("offline, so nothing contacted it"), "{}", offline.stdout);
+    assert!(!marker.exists());
+}
+
+#[test]
+fn a_global_config_edit_between_dry_run_and_apply_invalidates_the_receipt() {
+    let (root, work) = project("global-edit", BASE_CONFIG, "0.6.0-dev");
+    let home = root.join("home");
+    std::fs::create_dir(&home).expect("mkdir");
+    write(&home, ".gitconfig", "[user]\n\tname = Test\n\temail = test@example.invalid\n");
+    let h = home.display().to_string();
+    let env = [("HOME", h.as_str())];
+    let dry = edition_env(&work, &["deploy", "staging-home", "main"], &env);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    assert!(dry.stdout.contains(&format!("{h}/.gitconfig (global)")), "{}", dry.stdout);
+    write(
+        &home,
+        ".gitconfig",
+        "[user]\n\tname = Test\n\temail = test@example.invalid\n[http]\n\tproxy = http://proxy.example.invalid\n",
+    );
+    let out = edition_env(&work, &["deploy", "staging-home", "main", "--apply", "--confirm", &dry.receipt()], &env);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.stderr.contains("does not match this plan"), "{}", out.stderr);
+}
+
+#[test]
+fn a_callers_git_config_global_is_ignored() {
+    let (root, work, mirror) = tag_ready("ignore-global");
+    let origin = root.join("origin.git").display().to_string();
+    let evil = system_config(&root, &format!("[url \"{mirror}\"]\n\tinsteadOf = {origin}\n"), 0o644);
+    let env = [("GIT_CONFIG_GLOBAL", evil.as_str()), ("GIT_CONFIG_SYSTEM", evil.as_str())];
+    let dry = edition_env(&work, &["tag", "0.6.0"], &env);
+    assert!(dry.stdout.contains(&format!("destination: {origin}")), "{}", dry.stdout);
+    let ok = apply_env(&work, &["tag", "0.6.0"], &env);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+    assert!(!git(&work, &["ls-remote", "--tags", &mirror]).contains("v0.6.0"));
+}
+
+#[test]
+fn a_signing_program_change_invalidates_a_tag_plan() {
+    let (_root, work, _mirror) = tag_ready("gpg-program");
+    let dry = edition(&work, &["tag", "0.6.0"]);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    git(&work, &["config", "gpg.program", "/usr/bin/true"]);
+    let out = edition(&work, &["tag", "0.6.0", "--apply", "--confirm", &dry.receipt()]);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.stderr.contains("does not match this plan"), "{}", out.stderr);
+    let again = edition(&work, &["tag", "0.6.0"]);
+    assert!(again.stdout.contains("gpg.program (local)"), "{}", again.stdout);
 }

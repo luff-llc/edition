@@ -248,24 +248,29 @@ Edition's own git and gh calls, read-only or outward, are bound the same way:
 - They run with a cleared environment: `PATH` (from `[run] path` or the default), `HOME`,
   `LANG`, `TMPDIR`, `SSH_AUTH_SOCK`, the git author and committer identity variables, and
   only those variables listed in `[run] tool_env` (such as `GH_TOKEN`,
-  `GH_ENTERPRISE_TOKEN`, `GPG_TTY` or `GNUPGHOME`), plus `GIT_CONFIG_SYSTEM` and
-  `GIT_CONFIG_GLOBAL`, which choose the system and global configuration files exactly as
-  `HOME` does. Other `GIT_*` variables, `GH_HOST`, `GH_REPO` and `GH_CONFIG_DIR` can
-  never be passed through, so `GIT_DIR`, `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n`,
-  `GIT_SSH_COMMAND` and the like in the caller's environment have no effect.
-- **Trust base.** The system configuration (for example `/opt/homebrew/etc/gitconfig`,
-  or Apple's git's, which is where stock macOS setups keep `credential.helper =
-  osxkeychain`), the global configuration and the repository's own configuration are
-  read as git normally reads them; that is how credential helpers keep working. Before
-  an outward plan, Edition lists every effective setting with its origin
-  (`git config --list --show-scope --show-origin`). A file that is writable by its group
-  or others, or owned by a user other than root or you, is named with a warning in the
-  plan. Settings that can redirect a push or run a program (`url.*.insteadOf` and
-  `pushInsteadOf`, `remote.*.url`, `pushurl`, `receivepack` and `uploadpack`,
-  `core.sshCommand`, `core.gitProxy`, `core.askpass`, `http.proxy` and `http.*.proxy`,
-  `credential.helper` and `credential.*.helper`) are bound in the plan hash, and one that
-  comes from such an untrustworthy file refuses the plan. Settings from trustworthy files
-  are trusted as they are, including helpers written as shell snippets (`!...`).
+  `GH_ENTERPRISE_TOKEN`, `GPG_TTY` or `GNUPGHOME`). `GIT_*` variables (including
+  `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_COUNT`), `GH_HOST`, `GH_REPO`
+  and `GH_CONFIG_DIR` can never be passed through, so `GIT_DIR`, `GIT_SSH_COMMAND` and
+  the like in the caller's environment have no effect.
+- **Trust base.** Git reads its default system file (for example Homebrew's
+  `/opt/homebrew/etc/gitconfig`, or Apple's git's, where stock macOS setups keep
+  `credential.helper = osxkeychain`), the global file chosen by `HOME`, the repository's
+  own file and every file they include. Before any git operation that can contact a
+  remote or run a helper (`status --online`, `verify --online`, and every outward plan),
+  Edition lists that chain with a purely local `git config --list --show-origin` and
+  refuses outright if any file in it is writable by its group or others or owned by a
+  user other than root or you; it does not judge which settings in such a file are
+  harmless. Offline, `verify` reports the same problem as a warning.
+- **Binding.** Every outward plan, including ones made only of notes such as
+  `ledger reconcile`, binds the identity of each file in the chain (path, owner, mode,
+  size, modification time and SHA-256 of its contents) and the settings that change how
+  git reaches a remote, authenticates or signs (`url.*`, `credential.*`, `http.*`,
+  `protocol.*`, `include.path`, `includeIf.*.path`, `gpg.program`, `gpg.*.program`,
+  `gpg.format`, `tag.gpgSign`, `commit.gpgSign`, `push.gpgSign`, `user.signingKey`,
+  `core.sshCommand`, `core.gitProxy`, `core.askPass`, `remote.*.url`, `pushurl`, `proxy`,
+  `receivepack`, `uploadpack`). An edit to any file between dry run and apply
+  invalidates the receipt. The plan prints the bound files and the names of the bound
+  settings.
 - Every git call forces `core.hooksPath=/dev/null`, `core.fsmonitor=false` and
   `protocol.ext.allow=never`, and names its subcommand explicitly.
 - When a plan is made, the remote is resolved to its effective fetch and push URLs (after

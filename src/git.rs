@@ -22,34 +22,11 @@ pub const TOOL_VARS: &[&str] = &[
     "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME",
     "GIT_COMMITTER_EMAIL",
-    // Which system and global configuration git reads: the same trust base as `HOME`.
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CONFIG_GLOBAL",
 ];
 
 /// Configuration forced on every git call.
 pub const SAFE_CONFIG: &[&str] =
     &["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.ext.allow=never"];
-
-/// Configuration keys that can redirect a push or run a program while git talks to a
-/// remote. They are bound in the plan, and refused when they come from a file that is
-/// not trustworthy.
-pub fn sensitive_config_key(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
-    k == "core.sshcommand"
-        || k == "core.gitproxy"
-        || k == "core.askpass"
-        || k == "http.proxy"
-        || k == "credential.helper"
-        || (k.starts_with("http.") && k.ends_with(".proxy"))
-        || (k.starts_with("credential.") && k.ends_with(".helper"))
-        || (k.starts_with("url.") && (k.ends_with(".insteadof") || k.ends_with(".pushinsteadof")))
-        || (k.starts_with("remote.")
-            && (k.ends_with(".url")
-                || k.ends_with(".pushurl")
-                || k.ends_with(".receivepack")
-                || k.ends_with(".uploadpack")))
-}
 
 /// One setting as git reports it: `(scope, origin file if any, key, value)`.
 pub type ConfigSetting = (String, Option<String>, String, String);

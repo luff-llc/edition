@@ -18,6 +18,8 @@ pub struct RemoteView {
     pub fetch_url: String,
     pub push_url: String,
     pub raw_url: String,
+    /// The audited git configuration chain (online only).
+    pub config: Option<crate::gitcfg::Chain>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +36,9 @@ impl RemoteView {
     /// offline, heads come from remote-tracking refs and are unverified.
     pub fn build(git: &Git, remote: &str, online: bool) -> Result<RemoteView, String> {
         if online {
+            // Before git may contact the remote (or run a helper), its configuration
+            // chain must be trustworthy.
+            let chain = crate::gitcfg::audit(git)?;
             let (fetch_url, push_url, raw_url) = git.remote_urls(remote)?;
             let (heads, tags) = git.ls_remote(&fetch_url)?;
             Ok(RemoteView {
@@ -44,6 +49,7 @@ impl RemoteView {
                 fetch_url,
                 push_url,
                 raw_url,
+                config: Some(chain),
             })
         } else {
             Ok(RemoteView {
@@ -54,6 +60,7 @@ impl RemoteView {
                 fetch_url: String::new(),
                 push_url: String::new(),
                 raw_url: String::new(),
+                config: None,
             })
         }
     }
