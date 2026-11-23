@@ -264,6 +264,20 @@ pub fn load_local(root: &Path) -> Result<Option<LocalCfg>, String> {
             ));
         }
     }
+    // It holds this machine's settings only: refuse it if git would commit it.
+    let git = crate::git::Git::new(root);
+    if git.is_repo() {
+        if git.is_tracked(LOCAL_FILE) {
+            return Err(format!(
+                "{LOCAL_FILE} is tracked by git; it is per-machine and must never be committed (git rm --cached it)"
+            ));
+        }
+        if !git.ok(&["check-ignore", "-q", "--", LOCAL_FILE]) {
+            return Err(format!(
+                "{LOCAL_FILE} is not ignored by git; add `.edition/` to .gitignore (or let Edition create .edition/.gitignore)"
+            ));
+        }
+    }
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let cfg: LocalCfg = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     for d in &cfg.run.trust_group_writable {
@@ -418,7 +432,7 @@ pub struct Loaded {
 }
 
 /// The effective user id, without libc: the owner of a file this process just created.
-fn current_uid() -> Result<u32, String> {
+pub fn current_uid() -> Result<u32, String> {
     use std::os::unix::fs::MetadataExt;
     static UID: std::sync::OnceLock<Result<u32, String>> = std::sync::OnceLock::new();
     UID.get_or_init(|| {

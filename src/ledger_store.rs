@@ -92,9 +92,93 @@ impl<'a> Store<'a> {
             _ => {}
         }
         if let Some(t) = &tip {
+            if self.cached().as_deref() != Some(t.as_str()) {
+                self.validate_new(self.cached().as_deref(), t)?;
+            }
             self.git.run(&["update-ref", CACHE, t])?;
         }
         Ok(tip)
+    }
+
+    /// The text a valid commit must hold: its parent's ledger (or the header, for the
+    /// first commit) followed by exactly one rendered entry.
+    fn expected_text(parent_text: &str, e: &Entry) -> String {
+        let mut t = if parent_text.is_empty() { ledger::HEADER.to_string() } else { parent_text.to_string() };
+        if !t.ends_with('\n') {
+            t.push('\n');
+        }
+        t.push_str(&ledger::render(e));
+        t
+    }
+
+    /// Checks every first-parent commit after `seen` (all of them, for a branch seen for
+    /// the first time) up to `tip`: each must be an exact one-entry extension of its
+    /// parent's ledger, chained correctly, with nothing else in its tree. Fails closed.
+    pub fn validate_new(&self, seen: Option<&str>, tip: &str) -> Result<(), String> {
+        let range = match seen {
+            Some(s) => format!("{s}..{tip}"),
+            None => tip.to_string(),
+        };
+        let list = self.git.run(&["rev-list", "--first-parent", "--reverse", "--parents", &range])?;
+        let bad = |c: &str, why: String| {
+            format!("the {} branch has an invalid commit {}: {why}", self.branch, crate::util::short(c))
+        };
+        for line in list.lines() {
+            let mut ids = line.split(' ');
+            let Some(c) = ids.next() else { continue };
+            let parents: Vec<&str> = ids.collect();
+            let parent = match (parents.as_slice(), seen) {
+                ([], _) => None,
+                ([p], _) => Some(*p),
+                _ => return Err(bad(c, "a merge commit".into())),
+            };
+            if parent.is_none() && seen.is_some() {
+                return Err(bad(c, "a second root commit".into()));
+            }
+            let tree = self.git.run(&["ls-tree", c])?;
+            let mut entries_in_tree = tree.lines();
+            let only = entries_in_tree.next().unwrap_or("");
+            if entries_in_tree.next().is_some()
+                || !only.starts_with("100644 blob ")
+                || !only.ends_with(&format!("\t{FILE}"))
+            {
+                return Err(bad(c, format!("its tree must hold only {FILE}")));
+            }
+            let text = self.git.show(c, FILE).ok_or_else(|| bad(c, format!("{FILE} is missing or unreadable")))?;
+            let parent_text = match parent {
+                Some(p) => self.git.show(p, FILE).ok_or_else(|| bad(p, format!("{FILE} is missing or unreadable")))?,
+                None => String::new(),
+            };
+            let before =
+                ledger::parse(&parent_text).map_err(|e| bad(c, format!("its parent's ledger does not parse: {e}")))?;
+            let after = ledger::parse(&text).map_err(|e| bad(c, format!("its ledger does not parse: {e}")))?;
+            if after.len() != before.len() + 1 || after[..before.len()] != before[..] {
+                return Err(bad(c, "it does not append exactly one entry to its parent's ledger".into()));
+            }
+            let new = &after[before.len()];
+            let want_prev = match before.last() {
+                Some(last) => ledger::entry_hash(self.git, last)?,
+                None => ledger::GENESIS.to_string(),
+            };
+            if new.prev != want_prev {
+                return Err(bad(c, "its entry does not chain to the entry before it".into()));
+            }
+            if before.iter().any(|e| e.id == new.id) {
+                return Err(bad(c, format!("its entry repeats an id already recorded ({})", new.id)));
+            }
+            // `git show` output is read without its final newline, so compare that way.
+            if text.trim_end() != Self::expected_text(&parent_text, new).trim_end() {
+                return Err(bad(c, "its ledger text is not the parent's text plus the rendered entry".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// The entry already recorded with this entry's id, if any. Ids embed the run's
+    /// receipt, so one run with several records (a tag and its forward merge) keeps them
+    /// apart while a retried push of the same record is recognised.
+    fn recorded(&self, entry: &Entry) -> Result<Option<Entry>, String> {
+        Ok(self.load_local()?.into_iter().find(|e| e.id == entry.id))
     }
 
     /// Builds a commit that appends `entry` on top of `base` (or a root commit).
@@ -107,11 +191,7 @@ impl<'a> Store<'a> {
             Some(last) => ledger::entry_hash(self.git, last)?,
             None => ledger::GENESIS.to_string(),
         };
-        let mut new_text = if text.is_empty() { ledger::HEADER.to_string() } else { text.clone() };
-        if !new_text.ends_with('\n') {
-            new_text.push('\n');
-        }
-        new_text.push_str(&ledger::render(&e));
+        let new_text = Self::expected_text(&text, &e);
         let blob = self.git.run_input(&["hash-object", "-w", "--stdin"], &new_text)?;
         let tree = self.git.run_input(&["mktree"], &format!("100644 blob {blob}\t{FILE}\n"))?;
         let msg = format!("Record {} {} {}", e.action, e.ref_, e.result);
@@ -129,6 +209,11 @@ impl<'a> Store<'a> {
         let mut last_err = String::new();
         for _ in 0..ATTEMPTS {
             let base = self.sync(fetch_url)?;
+            // An entry already on the branch (a push whose answer was lost, or a retry)
+            // is a success, never a second append.
+            if let Some(done) = self.recorded(entry)? {
+                return Ok(done);
+            }
             let (commit, written) = self.commit_on(base.as_deref(), entry)?;
             let lease = format!("--force-with-lease={}:{}", self.remote_ref(), base.clone().unwrap_or_default());
             let refspec = format!("{commit}:{}", self.remote_ref());

@@ -78,6 +78,7 @@ edition forward                        # pull requests: release/* -> main
 edition hooks install --apply          # pre-push: content check, versions, pins
 edition ledger --channel staging-home
 edition ledger migrate                 # move an in-tree ledger file to the ledger branch
+edition ledger reconcile               # publish an outcome a crash or outage left pending
 edition --version
 ```
 

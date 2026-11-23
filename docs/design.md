@@ -202,7 +202,8 @@ trust_group_writable = []
 The entries follow exactly the same directory rule as `[run] path`, with this file's
 `trust_group_writable` added to the committed one; a failing entry refuses the
 configuration. The file and `.edition/` must be owned by the user, not be links, and not
-be writable by group or others. Plans print `local path entries: ...`, and the entries
+be writable by group or others, and Edition refuses the file if git tracks it or does not
+ignore it (Edition writes `.edition/.gitignore` when it creates the directory). Plans print `local path entries: ...`, and the entries
 are part of the plan hash, so a receipt still binds what will run.
 
 A file, rather than environment variables such as `EDITION_PATH_PREPEND`, because it is
@@ -302,9 +303,19 @@ written.
   remote. Edition builds the commit with plumbing (`hash-object`, `mktree`,
   `commit-tree`), so the checkout is never touched, and pushes it with
   `--force-with-lease` on the tip it read. If another recorder won the race, Edition
-  re-reads the branch, re-chains the entry and tries again (up to eight times). A failed
-  or partial action is recorded the same way. If the remote cannot be reached at all,
-  Edition says the outcome could not be published.
+  re-reads the branch, re-chains the entry and tries again (up to eight times). An entry
+  whose id is already on the branch (a push that was accepted but whose answer was lost)
+  counts as published and is never appended twice; ids embed the run's receipt. A failed
+  or partial action is recorded the same way.
+- **Pending outcomes.** Before the first step of a recording plan runs, Edition writes
+  the prospective entries to `.edition/pending/` (a private directory, files mode 0600,
+  written atomically), rewrites them after every step, and removes them once the ledger
+  push succeeds. A step that had not finished when Edition stopped is recorded as
+  `unknown`. If Edition is killed, or the remote cannot be reached or the entry is
+  blocked by the content check, the outcome survives: `status` and `verify` report it as
+  unreconciled, every new outward plan is refused, and `edition ledger reconcile` (a dry
+  run, then the receipt) publishes it without running anything again;
+  `reconcile --abandon` records it as `abandoned` instead.
 - **Results.** `ok`: the step and everything after it succeeded. `partial`: the outward
   step succeeded and a later step (a probe, a Concordance record) failed, or a later
   outward step was stopped. `failed`: the outward step failed, a check before it failed,
@@ -314,9 +325,15 @@ written.
 - **History.** Each commit on the branch appends one entry; `verify` checks the chain and
   that along the branch's first-parent history every version is a prefix of the next,
   naming the first commit that edited, removed or reordered an entry.
-- **Anchor.** Edition keeps the last remote tip it saw in `refs/edition/ledger`. Every
-  outward plan and `verify --online` read the remote branch and refuse a tip that does not
-  descend from it (a force push, a deletion). Offline, `verify` says the anchor is
+- **Anchor and validation.** Edition keeps the last remote tip it saw in
+  `refs/edition/ledger`. Every outward plan and `verify --online` read the remote branch
+  and refuse a tip that does not descend from it (a force push, a deletion). When the tip
+  has moved, every new first-parent commit is validated as an exact one-entry extension
+  of its parent: the tree holds only `ledger.toml`, the text is the parent's text plus
+  one rendered entry, the entry chains to the one before and repeats no id, and a merge
+  or a second root is refused. A branch seen for the first time is validated from its
+  first commit, which must start at the genesis value. A missing or unreadable file fails
+  closed, and the refusal names the commit. Offline, `verify` says the anchor is
   unverified. The anchor is only as strong as the remote: protect the ledger branch
   against force pushes and deletion.
 - **Reading.** `status`, `ledger`, `promote` and the `requires` gate read the branch
@@ -359,9 +376,11 @@ in `[content] allow_paths` or it is allowed by id for one run.
   not on a release tag.
 - **`verify`** scans the tracked tree and commits not yet on each public remote, and
   fails on a finding when the action is `block`.
-- **The ledger branch** is pushed to the same remote, public or not. It is not scanned:
-  its only content is ledger entries, which Edition writes itself and redacts before
-  writing.
+- **The ledger branch** is pushed to the same remote. Its entries carry configuration
+  and user text (targets, notes), so before a ledger push to a public remote the new entry
+  is scanned with the same deny-list; a finding blocks the push (the outcome stays
+  pending) unless it is allowed by id with `--allow-finding`, for example on
+  `edition ledger reconcile`.
 
 ## How it fits with other tools
 

@@ -236,12 +236,11 @@ fn two_concurrent_recorders_both_land() {
     let r1 = edition(&work, &["deploy", "staging-home", "main"]).receipt();
     let r2 = edition(&other, &["deploy", "staging-home", "main"]).receipt();
     let (w, o) = (work.clone(), other.clone());
-    let t1 =
-        std::thread::spawn(move || edition(&w, &["deploy", "staging-home", "main", "--apply", "--confirm", &r1]).code);
-    let t2 =
-        std::thread::spawn(move || edition(&o, &["deploy", "staging-home", "main", "--apply", "--confirm", &r2]).code);
-    assert_eq!(t1.join().expect("t1"), 0);
-    assert_eq!(t2.join().expect("t2"), 0);
+    let t1 = std::thread::spawn(move || edition(&w, &["deploy", "staging-home", "main", "--apply", "--confirm", &r1]));
+    let t2 = std::thread::spawn(move || edition(&o, &["deploy", "staging-home", "main", "--apply", "--confirm", &r2]));
+    let (o1, o2) = (t1.join().expect("t1"), t2.join().expect("t2"));
+    assert_eq!(o1.code, 0, "{}", o1.all());
+    assert_eq!(o2.code, 0, "{}", o2.all());
     let text = ledger_text(&work);
     assert_eq!(text.matches("[[entry]]").count(), 2, "{text}");
     let v = edition(&work, &["verify", "--online"]);
@@ -259,8 +258,11 @@ fn edited_truncated_or_reordered_ledger_history_is_caught() {
     let edited = publish_ledger(&root, "o1", &text.replacen("note = \"first\"", "note = \"forged\"", 1), None, false);
     let forged = edition(&work, &["verify", "--online"]);
     assert_eq!(forged.code, 1, "{}", forged.all());
-    assert!(forged.stdout.contains("hash chain broken"), "{}", forged.stdout);
-    assert!(forged.stdout.contains(&format!("was rewritten at {}", &edited[..10])), "{}", forged.stdout);
+    assert!(forged.stdout.contains(&format!("invalid commit {}", &edited[..10])), "{}", forged.stdout);
+    // Outward planning refuses it too, naming the commit.
+    let d = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(d.code, 1, "{}", d.all());
+    assert!(d.stderr.contains(&format!("invalid commit {}", &edited[..10])), "{}", d.stderr);
 }
 
 #[test]
@@ -274,17 +276,17 @@ fn a_truncated_or_reordered_ledger_commit_is_caught() {
     let trunc = publish_ledger(&root, "o1", &text[..first_end + 1], None, false);
     let t = edition(&work, &["verify", "--online"]);
     assert_eq!(t.code, 1, "{}", t.all());
-    assert!(t.stdout.contains(&format!("was rewritten at {}", &trunc[..10])), "{}", t.stdout);
+    assert!(t.stdout.contains(&format!("invalid commit {}", &trunc[..10])), "{}", t.stdout);
 
     let (root2, work2) = two_entry_ledger("reorder");
     let text2 = ledger_text(&work2);
     let head = &text2[..text2.find("\n[[entry]]").expect("e")];
     let body = &text2[text2.find("\n[[entry]]").expect("entry")..];
     let second = body[1..].find("\n[[entry]]").map(|i| i + 1).expect("second");
-    publish_ledger(&root2, "o2", &format!("{head}{}{}", &body[second..], &body[..second]), None, false);
+    let re = publish_ledger(&root2, "o2", &format!("{head}{}{}", &body[second..], &body[..second]), None, false);
     let r = edition(&work2, &["verify", "--online"]);
     assert_eq!(r.code, 1, "{}", r.all());
-    assert!(r.stdout.contains("hash chain broken"), "{}", r.stdout);
+    assert!(r.stdout.contains(&format!("invalid commit {}", &re[..10])), "{}", r.stdout);
 }
 
 #[test]
@@ -1054,6 +1056,7 @@ fn write_local(work: &Path, text: &str) {
     if !dir.exists() {
         std::fs::DirBuilder::new().mode(0o700).create(&dir).expect("mkdir");
     }
+    std::fs::write(dir.join(".gitignore"), "*\n").expect("ignore");
     let p = dir.join("local.toml");
     std::fs::write(&p, text).expect("write");
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).expect("chmod");
@@ -1164,4 +1167,198 @@ fn version_help_and_the_detached_head_hint() {
     let d = edition(&work, &["deploy", "staging-home", "main"]);
     assert_eq!(d.code, 1);
     assert!(d.stderr.contains("a branch at the same commit as the remote tip is enough"), "{}", d.stderr);
+}
+
+fn entry(id: &str, prev: &str) -> edition::ledger::Entry {
+    edition::ledger::Entry {
+        id: id.into(),
+        at: NOW.into(),
+        by: "test".into(),
+        action: "deploy".into(),
+        product: "lib".into(),
+        channel: Some("staging-home".into()),
+        ref_: "main".into(),
+        commit: "0".repeat(40),
+        result: "ok".into(),
+        prev: prev.into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_fast_forward_that_replaces_or_deletes_the_ledger_is_refused() {
+    // A fresh, internally valid chain published on top of the real one.
+    let (root, work) = two_entry_ledger("ff-forgery");
+    let forged =
+        format!("{}{}", edition::ledger::HEADER, edition::ledger::render(&entry("forged", edition::ledger::GENESIS)));
+    let c = publish_ledger(&root, "o1", &forged, None, false);
+    let d = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(d.code, 1, "{}", d.all());
+    assert!(d.stderr.contains(&format!("invalid commit {}", &c[..10])), "{}", d.stderr);
+
+    // A commit that deletes the file.
+    let (root2, work2) = two_entry_ledger("ff-delete");
+    let other = other_clone(&root2, "o2");
+    git(&other, &["fetch", "-q", "origin", "edition/ledger:refs/remotes/origin/edition/ledger"]);
+    let empty = plumb(&other, &["mktree"], "");
+    let parent = git(&other, &["rev-parse", "origin/edition/ledger"]);
+    let del = plumb(&other, &["commit-tree", &empty, "-p", &parent, "-m", "delete"], "");
+    git(&other, &["push", "-q", "origin", &format!("{del}:refs/heads/edition/ledger")]);
+    let d2 = edition(&work2, &["deploy", "staging-home", "main"]);
+    assert_eq!(d2.code, 1, "{}", d2.all());
+    assert!(d2.stderr.contains(&format!("invalid commit {}", &del[..10])), "{}", d2.stderr);
+
+    // A clone that has never seen the branch validates it from its first commit.
+    let fresh = other_clone(&root2, "fresh");
+    git(&fresh, &["checkout", "-q", "main"]);
+    let d3 = edition(&fresh, &["deploy", "staging-home", "main"]);
+    assert_eq!(d3.code, 1, "{}", d3.all());
+    assert!(d3.stderr.contains("invalid commit"), "{}", d3.stderr);
+    let (root3, _work3) = two_entry_ledger("ff-fresh-ok");
+    let fresh_ok = other_clone(&root3, "fresh");
+    git(&fresh_ok, &["checkout", "-q", "main"]);
+    assert_eq!(
+        edition(&fresh_ok, &["deploy", "staging-home", "main"]).code,
+        0,
+        "a valid branch is accepted from scratch"
+    );
+}
+
+#[test]
+fn a_lost_push_answer_does_not_duplicate_the_entry() {
+    let (root, work) = project("dedupe", BASE_CONFIG, "0.6.0-dev");
+    let origin = root.join("origin.git").display().to_string();
+    let g = edition::git::Git::new(&work);
+    let store = edition::ledger_store::Store::new(&g, "edition/ledger");
+    let first = store.append(&origin, &origin, &entry("one", "")).expect("append");
+    let before = git(&work, &["rev-parse", edition::ledger_store::CACHE]);
+    store.append(&origin, &origin, &entry("two", "")).expect("append");
+    // The push of "two" went through, but this recorder never learned it.
+    git(&work, &["update-ref", edition::ledger_store::CACHE, &before]);
+    let again = store.append(&origin, &origin, &entry("two", "")).expect("retry");
+    assert_eq!(again.id, "two");
+    let text = ledger_text(&work);
+    assert_eq!(text.matches("[[entry]]").count(), 2, "{text}");
+    let _ = first;
+}
+
+#[test]
+fn an_outcome_survives_a_crash_after_the_outward_step_and_is_reconciled_once() {
+    let cfg = BASE_CONFIG.replace(
+        "run = [\"scripts/record.sh\", \"staging-deploys.txt\", \"{commit}\"]",
+        "run = [\"scripts/deploy-then-die.sh\", \"{commit}\"]",
+    );
+    let (_root, work) = project("crash", &cfg, "0.6.0-dev");
+    executable(&work, "scripts/deploy-then-die.sh", "#!/bin/sh\necho \"$1\" >> staging-deploys.txt\nkill -9 $PPID\n");
+    commit_all(&work, "Deploy script that dies");
+    git(&work, &["push", "-q", "origin", "main"]);
+    let crashed = apply(&work, &["deploy", "staging-home", "main"]);
+    assert_ne!(crashed.code, 0, "{}", crashed.all());
+    assert!(work.join("staging-deploys.txt").exists(), "the deploy itself happened");
+    assert!(ledger_text(&work).is_empty(), "nothing reached the ledger");
+
+    let status = edition(&work, &["status"]);
+    assert!(status.stdout.contains("UNRECONCILED"), "{}", status.stdout);
+    let v = edition(&work, &["verify"]);
+    assert!(v.stdout.contains("UNRECONCILED outcome"), "{}", v.stdout);
+    let next = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(next.code, 1, "{}", next.all());
+    assert!(next.stderr.contains("edition ledger reconcile"), "{}", next.stderr);
+
+    let dry = edition(&work, &["ledger", "reconcile"]);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    assert!(ledger_text(&work).is_empty(), "a dry run publishes nothing");
+    let ok = apply(&work, &["ledger", "reconcile"]);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+    let text = ledger_text(&work);
+    assert_eq!(text.matches("[[entry]]").count(), 1, "{text}");
+    assert!(text.contains("result = \"unknown\""), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(work.join("staging-deploys.txt")).expect("d").lines().count(),
+        1,
+        "nothing re-ran"
+    );
+    assert!(edition(&work, &["ledger", "reconcile"]).stdout.contains("Nothing is pending"));
+}
+
+#[test]
+fn an_unreachable_remote_after_the_deploy_keeps_the_outcome_and_abandon_is_recorded() {
+    let (root, work) = project("unreachable", BASE_CONFIG, "0.6.0-dev");
+    let origin = root.join("origin.git");
+    let gone = root.join("gone.git");
+    executable(
+        &work,
+        "scripts/deploy-then-cut.sh",
+        &format!("#!/bin/sh\necho \"$1\" >> staging-deploys.txt\nmv '{}' '{}'\n", origin.display(), gone.display()),
+    );
+    let cfg = BASE_CONFIG.replace(
+        "run = [\"scripts/record.sh\", \"staging-deploys.txt\", \"{commit}\"]",
+        "run = [\"scripts/deploy-then-cut.sh\", \"{commit}\"]",
+    );
+    write(&work, "edition.toml", &cfg);
+    commit_all(&work, "Deploy script that cuts the remote");
+    git(&work, &["push", "-q", "origin", "main"]);
+    let out = apply(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.stderr.contains("kept in .edition/pending"), "{}", out.stderr);
+    std::fs::rename(&gone, &origin).expect("restore");
+    let ok = apply(&work, &["ledger", "reconcile"]);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+    let text = ledger_text(&work);
+    assert_eq!(text.matches("[[entry]]").count(), 1, "{text}");
+    assert!(text.contains("result = \"ok\""), "{text}");
+
+    // Abandoning is itself recorded.
+    let cfg2 = cfg.replace(
+        "\"scripts/deploy-then-cut.sh\", \"{commit}\"",
+        "\"scripts/deploy-then-cut.sh\", \"{commit}\", \"again\"",
+    );
+    write(&work, "edition.toml", &cfg2);
+    commit_all(&work, "Again");
+    git(&work, &["push", "-q", "origin", "main"]);
+    assert_eq!(apply(&work, &["deploy", "staging-home", "main"]).code, 2);
+    std::fs::rename(&gone, &origin).expect("restore");
+    let ab = apply(&work, &["ledger", "reconcile", "--abandon"]);
+    assert_eq!(ab.code, 0, "{}", ab.all());
+    assert!(ledger_text(&work).contains("result = \"abandoned\""));
+}
+
+#[test]
+fn a_ledger_entry_bound_for_a_public_remote_is_scanned() {
+    let (_root, work) = public_project("ledger-scan");
+    let note = format!("Decisions {} Alex", "for");
+    let out = apply(&work, &["deploy", "staging-home", "main", "--note", &note]);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.stderr.contains("the ledger entry matches the content deny-list"), "{}", out.stderr);
+    assert!(ledger_text(&work).is_empty());
+    let id = out
+        .stderr
+        .split("--allow-finding ")
+        .nth(1)
+        .map(|s| s.chars().take(10).collect::<String>())
+        .expect("finding id");
+    let ok = apply(&work, &["ledger", "reconcile", "--allow-finding", &id]);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+    assert_eq!(ledger_text(&work).matches("[[entry]]").count(), 1);
+}
+
+#[test]
+fn local_toml_must_be_ignored_and_untracked() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let (_root, work) = project("local-git", BASE_CONFIG, "0.6.0-dev");
+    let dir = work.join(".edition");
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).expect("mkdir");
+    let p = dir.join("local.toml");
+    std::fs::write(&p, "[run]\npath_append = [\"/usr/bin\"]\n").expect("write");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let not_ignored = edition(&work, &["status"]);
+    assert_eq!(not_ignored.code, 2, "{}", not_ignored.all());
+    assert!(not_ignored.stderr.contains("not ignored by git"), "{}", not_ignored.stderr);
+    git(&work, &["add", "-f", ".edition/local.toml"]);
+    let tracked = edition(&work, &["status"]);
+    assert_eq!(tracked.code, 2, "{}", tracked.all());
+    assert!(tracked.stderr.contains("tracked by git"), "{}", tracked.stderr);
+    git(&work, &["rm", "-q", "--cached", ".edition/local.toml"]);
+    std::fs::write(dir.join(".gitignore"), "*\n").expect("ignore");
+    assert_eq!(edition(&work, &["status"]).code, 0);
 }

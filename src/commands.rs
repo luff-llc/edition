@@ -26,6 +26,7 @@ pub struct Ctx {
 pub type Res = Result<i32, String>;
 
 /// A ledger entry to write for the outward step at `index` once the plan has run.
+#[derive(Clone)]
 struct Record {
     index: usize,
     entry: Entry,
@@ -58,6 +59,21 @@ impl Ctx {
     /// Binds a plan to the remote's resolved URLs: reads and re-checks go to the fetch
     /// URL, pushes to the push URL, and all three URLs are part of the plan hash.
     fn bind(&self, plan: &mut Plan, view: &RemoteView) -> Result<(), String> {
+        let pending = crate::pending::Pending::at(&self.l.root).list()?;
+        if let Some((_, _, entries)) = pending.first() {
+            let what: Vec<String> = entries
+                .iter()
+                .map(|e| format!("{} ({}, {})", e.id, e.channel.as_deref().unwrap_or(&e.action), e.result))
+                .collect();
+            return Err(format!(
+                "an earlier run's outcome is not yet on the ledger: {}. Publish it with `edition ledger reconcile` (or record it as abandoned with `edition ledger reconcile --abandon`) before running another outward plan",
+                what.join(", ")
+            ));
+        }
+        self.bind_unchecked(plan, view)
+    }
+
+    fn bind_unchecked(&self, plan: &mut Plan, view: &RemoteView) -> Result<(), String> {
         plan.remote = view.fetch_url.clone();
         plan.fact("fetch-url", &view.fetch_url);
         plan.fact("push-url", &view.push_url);
@@ -223,6 +239,24 @@ impl Ctx {
         let Some((branch, push_url)) = &plan.record_to else {
             return Err("this plan has no ledger destination".into());
         };
+        // The ledger branch goes to the same remote: a public one gets the same scan.
+        if self.l.is_public(&self.l.cfg.remote) {
+            let scanner = crate::content::Scanner::new(&self.l);
+            let mut found = Vec::new();
+            for line in ledger::render(&ledger::redacted(e)).lines() {
+                scanner.scan_line(&format!("ledger entry {}", e.id), line, &mut found);
+            }
+            let blocked: Vec<String> = crate::content::identify(&self.git, found)
+                .into_iter()
+                .filter(|f| !self.allow_findings.contains(&f.id))
+                .map(|f| {
+                    format!("{} {} [{}] {} (allow with --allow-finding {})", f.id, f.place, f.pattern, f.excerpt, f.id)
+                })
+                .collect();
+            if !blocked.is_empty() {
+                return Err(format!("the ledger entry matches the content deny-list: {}", blocked.join("; ")));
+            }
+        }
         let written = self.store().append(&plan.remote, push_url, e)?;
         let _ = branch;
         let kind = if e.action == "deploy" { "channel-updated" } else { "ref-published" };
@@ -262,36 +296,103 @@ impl Ctx {
             return refuse(&[e]);
         }
         let plan = &plan;
-        match steps::execute(plan, &self.mode, &self.git, &self.l.root, &digest, self.l.receipt_ttl(), &used)? {
-            Ran::DryRun => Ok(0),
-            Ran::Ran { outcomes, receipt, stopped } => {
-                let ran: Vec<String> = outcomes.iter().map(|o| o.describe()).collect();
-                for r in records {
-                    let mut e = r.entry;
-                    let own = outcomes.iter().find(|o| o.index == r.index);
-                    let later_failed = outcomes.iter().any(|o| o.index > r.index && !o.ok());
-                    e.result = match own {
-                        Some(o) if o.ok() && (later_failed || stopped.is_some()) => "partial".into(),
-                        Some(o) if o.ok() => "ok".into(),
-                        _ => "failed".into(),
-                    };
-                    e.command = vec![plan.steps[r.index].description()];
-                    e.steps = ran.clone();
-                    if let Some(why) = &stopped {
-                        e.steps.push(format!("stopped: {why}"));
-                    }
-                    if let Some(r) = &receipt {
-                        e.id = format!("{}/{}", e.id, &r[..8.min(r.len())]);
-                    }
-                    e.receipt = receipt.clone();
-                    e.overrides = overrides.to_vec();
-                    self.record(&e, plan)?;
+        let pending = crate::pending::Pending::at(&self.l.root);
+        // Before anything runs, the prospective entries are written down, so an outcome
+        // survives a crash or an unreachable remote.
+        let key = match (&self.mode.confirm, self.mode.apply && !records.is_empty()) {
+            (Some(r), true) => Some(r.clone()),
+            _ => None,
+        };
+        let receipt = self.mode.confirm.clone();
+        if let Some(k) = &key {
+            pending.write(k, &finalize(plan, &records, &[], None, receipt.as_deref(), overrides, true))?;
+        }
+        let mut on_step = |outcomes: &[steps::Outcome]| -> Result<(), String> {
+            match &key {
+                Some(k) => {
+                    pending.write(k, &finalize(plan, &records, outcomes, None, receipt.as_deref(), overrides, true))
                 }
-                let all_ok = stopped.is_none() && outcomes.iter().all(|o| o.ok());
-                Ok(if all_ok { 0 } else { 1 })
+                None => Ok(()),
+            }
+        };
+        let ran = steps::execute(
+            plan,
+            &self.mode,
+            &self.git,
+            &self.l.root,
+            &digest,
+            self.l.receipt_ttl(),
+            &used,
+            &mut on_step,
+        );
+        let (outcomes, receipt, stopped) = match ran {
+            Err(e) => {
+                if let Some(k) = &key {
+                    pending.remove(k)?;
+                }
+                return Err(e);
+            }
+            Ok(Ran::DryRun) => return Ok(0),
+            Ok(Ran::Ran { outcomes, receipt, stopped }) => (outcomes, receipt, stopped),
+        };
+        let entries = finalize(plan, &records, &outcomes, stopped.as_deref(), receipt.as_deref(), overrides, false);
+        if let Some(k) = &key {
+            pending.write(k, &entries)?;
+        }
+        for e in &entries {
+            if let Err(err) = self.record(e, plan) {
+                return Err(format!(
+                    "{err}\nThe outcome is kept in .edition/pending and nothing will be re-run: publish it with `edition ledger reconcile`."
+                ));
             }
         }
+        if let Some(k) = &key {
+            pending.remove(k)?;
+        }
+        let all_ok = stopped.is_none() && outcomes.iter().all(|o| o.ok());
+        Ok(if all_ok { 0 } else { 1 })
     }
+}
+
+/// The ledger entries for a run so far. An entry is `ok` when its step and everything
+/// after it succeeded, `partial` when its step succeeded and a later one failed, and
+/// `failed` when its step failed or never ran. While the run is still going
+/// (`in_progress`), an entry whose step has not finished is `unknown`.
+fn finalize(
+    plan: &Plan,
+    records: &[Record],
+    outcomes: &[steps::Outcome],
+    stopped: Option<&str>,
+    receipt: Option<&str>,
+    overrides: &[String],
+    in_progress: bool,
+) -> Vec<Entry> {
+    let ran: Vec<String> = outcomes.iter().map(|o| o.describe()).collect();
+    records
+        .iter()
+        .map(|r| {
+            let mut e = r.entry.clone();
+            let own = outcomes.iter().find(|o| o.index == r.index);
+            let later_failed = outcomes.iter().any(|o| o.index > r.index && !o.ok());
+            e.result = match own {
+                None if in_progress => "unknown".into(),
+                Some(o) if o.ok() && (later_failed || stopped.is_some()) => "partial".into(),
+                Some(o) if o.ok() => "ok".into(),
+                _ => "failed".into(),
+            };
+            e.command = vec![plan.steps[r.index].description()];
+            e.steps = ran.clone();
+            if let Some(why) = stopped {
+                e.steps.push(format!("stopped: {why}"));
+            }
+            if let Some(rc) = receipt {
+                e.id = format!("{}/{}", e.id, &rc[..8.min(rc.len())]);
+            }
+            e.receipt = receipt.map(str::to_string);
+            e.overrides = overrides.to_vec();
+            e
+        })
+        .collect()
 }
 
 fn refuse(problems: &[String]) -> Res {
@@ -308,6 +409,16 @@ pub fn status(c: &Ctx) -> Res {
     let l = &c.l;
     let view = c.view()?;
     crate::say!("Edition: {} ({})", l.cfg.product, l.root.display());
+    for (_, _, entries) in crate::pending::Pending::at(&l.root).list()? {
+        for e in entries {
+            crate::say!(
+                "UNRECONCILED  {} ({}, {}): not yet on the ledger; run `edition ledger reconcile`",
+                e.id,
+                e.channel.as_deref().unwrap_or(&e.action),
+                e.result
+            );
+        }
+    }
     if !l.local_dirs.is_empty() {
         crate::say!("local path entries: {}", l.local_dirs.join(", "));
     }
@@ -1432,4 +1543,68 @@ pub fn ledger_migrate(c: &Ctx) -> Res {
         crate::say!("migrated; remove {} from the tree in an ordinary commit", l.cfg.ledger);
     }
     Ok(code)
+}
+
+// ---------------------------------------------------------------- ledger reconcile
+
+/// Publishes outcomes kept in `.edition/pending` without running anything again. With
+/// `abandon`, they are published with the result `abandoned`.
+pub fn ledger_reconcile(c: &Ctx, abandon: bool) -> Res {
+    let l = &c.l;
+    let pending = crate::pending::Pending::at(&l.root);
+    let runs = pending.list()?;
+    if runs.is_empty() {
+        crate::say!("Nothing is pending.");
+        return Ok(0);
+    }
+    let mut problems = c.input_problems();
+    problems.extend(c.clean_problems());
+    let view = c.live_view()?;
+    if !problems.is_empty() {
+        return refuse(&problems);
+    }
+    let count: usize = runs.iter().map(|(_, _, e)| e.len()).sum();
+    let verb = if abandon { "Record as abandoned" } else { "Publish" };
+    let mut plan = Plan::new(&format!("{verb} {count} pending ledger outcome(s)"), &l.cfg.remote);
+    if let Err(e) = c.bind_unchecked(&mut plan, &view) {
+        return refuse(&[e]);
+    }
+    plan.fact("abandon", if abandon { "yes" } else { "no" });
+    for (key, text, entries) in &runs {
+        plan.fact("pending", &format!("{key} {}", crate::util::sha256_hex(text.as_bytes())));
+        for e in entries {
+            plan.steps.push(Step::note(&format!(
+                "{} {} ({}, {})",
+                if abandon { "abandon" } else { "publish" },
+                e.id,
+                e.channel.as_deref().unwrap_or(&e.action),
+                e.result
+            )));
+        }
+    }
+    let digest = c.config_digest()?;
+    let used = c.receipt_used();
+    plan.run_path = l.run_path();
+    plan.tool_env = c.git.env.clone();
+    let mut no_steps = |_: &[steps::Outcome]| -> Result<(), String> { Ok(()) };
+    match steps::execute(&plan, &c.mode, &c.git, &l.root, &digest, l.receipt_ttl(), &used, &mut no_steps)? {
+        Ran::DryRun => Ok(0),
+        Ran::Ran { .. } => {
+            for (key, _, entries) in &runs {
+                for e in entries {
+                    let mut e = e.clone();
+                    if abandon {
+                        e.note = Some(format!("abandoned: the outcome was {} when Edition stopped", e.result));
+                        e.result = "abandoned".into();
+                        e.id = format!("{}/abandoned", e.id);
+                    } else if e.result == "unknown" {
+                        e.note = Some("Edition stopped before this step finished; its effect is unknown".into());
+                    }
+                    c.record(&e, &plan)?;
+                }
+                pending.remove(key)?;
+            }
+            Ok(0)
+        }
+    }
 }

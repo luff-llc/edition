@@ -24,6 +24,7 @@ USAGE
   edition verify [--online]              check every invariant (exit 1 on error)
   edition ledger [--channel C]           print the ledger (from the ledger branch)
   edition ledger migrate                 move an in-tree ledger file to the ledger branch
+  edition ledger reconcile [--abandon]   publish outcomes a crash or outage left unpublished
   edition --version | --help
 
 OPTIONS
@@ -62,6 +63,7 @@ struct Opts {
     note: Option<String>,
     channel: Option<String>,
     allow_findings: Vec<String>,
+    abandon: bool,
     pos: Vec<String>,
 }
 
@@ -83,6 +85,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--note" => o.note = Some(val(a)?),
             "--channel" => o.channel = Some(val(a)?),
             "--allow-finding" => o.allow_findings.push(val(a)?),
+            "--abandon" => o.abandon = true,
             s if s.starts_with('-') && s != "-" => return Err(format!("unknown option {s}")),
             s => o.pos.push(s.to_string()),
         }
@@ -178,6 +181,7 @@ fn dispatch(o: Opts) -> Result<i32, String> {
         }
         "ledger" => match p.get(1).map(String::as_str) {
             Some("migrate") => commands::ledger_migrate(&ctx),
+            Some("reconcile") => commands::ledger_reconcile(&ctx, o.abandon),
             Some(other) => Err(format!("unknown ledger step {other}")),
             None => commands::ledger_cmd(&ctx, o.channel.as_deref()),
         },

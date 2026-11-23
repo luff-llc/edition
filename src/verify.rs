@@ -219,6 +219,21 @@ fn pins(l: &Loaded, git: &Git, online: bool, r: &mut Report) {
 fn ledger_checks(l: &Loaded, git: &Git, view: &RemoteView, r: &mut Report) {
     let store = crate::ledger_store::Store::new(git, &l.cfg.ledger_branch);
     let branch = l.cfg.ledger_branch.clone();
+    match crate::pending::Pending::at(&l.root).list() {
+        Ok(runs) => {
+            for (_, _, entries) in runs {
+                for e in entries {
+                    r.errors.push(format!(
+                        "UNRECONCILED outcome {} ({}, {}) is not on the {branch} branch; run `edition ledger reconcile`",
+                        e.id,
+                        e.channel.as_deref().unwrap_or(&e.action),
+                        e.result
+                    ));
+                }
+            }
+        }
+        Err(e) => r.errors.push(e),
+    }
     if l.root.join(&l.cfg.ledger).is_file() {
         r.warnings.push(format!(
             "an in-tree ledger exists at {}; move it to the {branch} branch with `edition ledger migrate`",
