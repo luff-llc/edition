@@ -76,7 +76,13 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "-C" | "--config" => o.config = Some(val(a)?),
             "--root" => o.root = Some(val(a)?),
             "--apply" => o.apply = true,
-            "--confirm" => o.confirm = Some(val(a)?),
+            "--confirm" => {
+                let r = val(a)?;
+                if !crate::util::valid_receipt(&r) {
+                    return Err("--confirm takes the receipt a dry run printed: 32 lowercase hex characters".into());
+                }
+                o.confirm = Some(r);
+            }
             "--online" => o.online = true,
             "--by" => o.by = Some(val(a)?),
             "--build" => o.build = Some(val(a)?),

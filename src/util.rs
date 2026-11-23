@@ -53,6 +53,59 @@ pub fn random_hex(n: usize) -> Result<String, String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// A receipt as a dry run prints it: exactly 32 lowercase hex characters. Checked before
+/// the value is used for anything, including as part of a file name.
+pub fn valid_receipt(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// SHA-1 of `data`, hex-encoded (FIPS 180-4). Used only to compute git blob ids.
+pub fn sha1_hex(data: &[u8]) -> String {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut msg = data.to_vec();
+    let bits = (data.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bits.to_be_bytes());
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+        for (i, wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A827999),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        for (x, y) in h.iter_mut().zip([a, b, c, d, e]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    h.iter().map(|x| format!("{x:08x}")).collect()
+}
+
+/// Git's blob id for `text` (what `git hash-object --stdin` prints in a SHA-1 repository).
+pub fn git_blob_id(text: &str) -> String {
+    let mut data = format!("blob {}\0", text.len()).into_bytes();
+    data.extend_from_slice(text.as_bytes());
+    sha1_hex(&data)
+}
+
 /// SHA-256 of `data`, hex-encoded (FIPS 180-4).
 pub fn sha256_hex(data: &[u8]) -> String {
     const K: [u32; 64] = [
@@ -247,7 +300,12 @@ pub fn emit_event(kind: &str, fields: &[(&str, &str)]) {
         return;
     }
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&target) {
+    // The events file is the caller's choice of path; it is only ever appended to, and
+    // never through a link.
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Ok(mut f) =
+        std::fs::OpenOptions::new().create(true).append(true).custom_flags(crate::steps::NOFOLLOW).open(&target)
+    {
         let _ = f.write_all(line.as_bytes());
     }
 }
@@ -268,6 +326,24 @@ mod tests {
         assert_eq!(parse_utc("2026-11-23T08:35:00Z"), Some(1_795_422_900));
         assert_eq!(parse_utc("2000-02-29T00:00:00Z"), Some(951_782_400));
         assert_eq!(parse_utc("2026-13-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn sha1_and_receipts() {
+        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(git_blob_id(""), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
+        assert_eq!(git_blob_id("hello\n"), "ce013625030ba8dba906f756967f9e9ca394464a");
+        assert!(valid_receipt("0123456789abcdef0123456789abcdef"));
+        for bad in [
+            "../../victim",
+            "/etc/passwd",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "abc",
+            &"a".repeat(33),
+            &"a".repeat(4096),
+        ] {
+            assert!(!valid_receipt(bad), "{bad}");
+        }
     }
 
     #[test]

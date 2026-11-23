@@ -1324,22 +1324,136 @@ fn an_unreachable_remote_after_the_deploy_keeps_the_outcome_and_abandon_is_recor
 }
 
 #[test]
-fn a_ledger_entry_bound_for_a_public_remote_is_scanned() {
+fn a_ledger_entry_bound_for_a_public_remote_is_scanned_when_planned_and_overrides_are_bound() {
     let (_root, work) = public_project("ledger-scan");
     let note = format!("Decisions {} Alex", "for");
-    let out = apply(&work, &["deploy", "staging-home", "main", "--note", &note]);
-    assert_eq!(out.code, 2, "{}", out.all());
-    assert!(out.stderr.contains("the ledger entry matches the content deny-list"), "{}", out.stderr);
-    assert!(ledger_text(&work).is_empty());
-    let id = out
+
+    // Found while planning: the dry run is refused and names the finding.
+    let dry = edition(&work, &["deploy", "staging-home", "main", "--note", &note]);
+    assert_eq!(dry.code, 1, "{}", dry.all());
+    assert!(dry.stderr.contains("ledger entry (deploy staging-home)"), "{}", dry.stderr);
+    let id = dry
         .stderr
         .split("--allow-finding ")
         .nth(1)
         .map(|s| s.chars().take(10).collect::<String>())
         .expect("finding id");
-    let ok = apply(&work, &["ledger", "reconcile", "--allow-finding", &id]);
+
+    // A receipt issued without the override cannot be applied with one.
+    let clean = edition(&work, &["deploy", "staging-home", "main"]).receipt();
+    let swapped = edition(
+        &work,
+        &["deploy", "staging-home", "main", "--note", &note, "--allow-finding", &id, "--apply", "--confirm", &clean],
+    );
+    assert_eq!(swapped.code, 2, "{}", swapped.all());
+    assert!(swapped.stderr.contains("does not match this plan"), "{}", swapped.stderr);
+    assert!(ledger_text(&work).is_empty());
+
+    // Allowed in the dry run: shown, bound, and recorded.
+    let allowed = edition(&work, &["deploy", "staging-home", "main", "--note", &note, "--allow-finding", &id]);
+    assert_eq!(allowed.code, 0, "{}", allowed.all());
+    assert!(
+        allowed.stdout.contains(&format!("allowing content findings in the ledger entry: {id}")),
+        "{}",
+        allowed.stdout
+    );
+    let without = edition(
+        &work,
+        &["deploy", "staging-home", "main", "--note", &note, "--apply", "--confirm", &allowed.receipt()],
+    );
+    assert_ne!(without.code, 0, "the same receipt without the override is refused: {}", without.all());
+    let r = edition(&work, &["deploy", "staging-home", "main", "--note", &note, "--allow-finding", &id]).receipt();
+    let ok = edition(
+        &work,
+        &["deploy", "staging-home", "main", "--note", &note, "--allow-finding", &id, "--apply", "--confirm", &r],
+    );
     assert_eq!(ok.code, 0, "{}", ok.all());
-    assert_eq!(ledger_text(&work).matches("[[entry]]").count(), 1);
+    let text = ledger_text(&work);
+    assert!(text.contains(&format!("{id} ledger entry (deploy staging-home)")), "{text}");
+}
+
+fn snapshot(dir: &Path) -> Vec<(String, u64)> {
+    fn walk(p: &Path, out: &mut Vec<(String, u64)>) {
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                let path = e.path();
+                let m = std::fs::symlink_metadata(&path).expect("meta");
+                out.push((path.display().to_string(), m.len()));
+                if m.is_dir() && !m.file_type().is_symlink() {
+                    walk(&path, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn a_hostile_confirm_value_touches_nothing() {
+    let (root, work) = project("confirm-path", BASE_CONFIG, "0.6.0-dev");
+    staging_receipt(&work);
+    let victim = root.join("victim.toml");
+    std::fs::write(&victim, "keep me").expect("victim");
+    let before = snapshot(&root);
+    for bad in [
+        "../../victim",
+        "../../../victim",
+        "/tmp/victim",
+        &victim.display().to_string(),
+        "0123456789ABCDEF0123456789ABCDEF",
+        "0123456789abcdef0123456789abcde",
+        &"a".repeat(4096),
+        "0123456789abcdef0123456789abcdeg",
+    ] {
+        let out = edition(&work, &["deploy", "staging-home", "main", "--apply", "--confirm", bad]);
+        assert_eq!(out.code, 2, "{bad}: {}", out.all());
+        assert!(out.stderr.contains("32 lowercase hex"), "{bad}: {}", out.stderr);
+    }
+    // A well-formed receipt that is refused also creates and removes nothing.
+    let refused = edition(&work, &["deploy", "staging-home", "main", "--apply", "--confirm", &"0".repeat(32)]);
+    assert_eq!(refused.code, 2, "{}", refused.all());
+    assert_eq!(snapshot(&root), before, "the filesystem is unchanged");
+    assert_eq!(std::fs::read_to_string(&victim).expect("victim"), "keep me");
+    assert!(
+        !work.join(".edition/pending").exists()
+            || std::fs::read_dir(work.join(".edition/pending")).expect("dir").next().is_none()
+    );
+}
+
+#[test]
+fn configured_paths_stay_inside_the_repository() {
+    let (_root, work) = project("cfg-paths", BASE_CONFIG, "0.6.0-dev");
+    for (from, to) in [
+        ("path = \"Cargo.toml\"", "path = \"../outside/Cargo.toml\""),
+        ("path = \"Cargo.toml\"", "path = \"/etc/hosts\""),
+    ] {
+        write(&work, "edition.toml", &BASE_CONFIG.replace(from, to));
+        let out = edition(&work, &["status"]);
+        assert_eq!(out.code, 2, "{to}: {}", out.all());
+        assert!(out.stderr.contains("inside the repository"), "{}", out.stderr);
+    }
+    write(&work, "edition.toml", &format!("ledger = \"../elsewhere.toml\"\n{BASE_CONFIG}"));
+    assert_eq!(edition(&work, &["status"]).code, 2);
+    write(&work, "edition.toml", &format!("ledger_branch = \"main\"\n{BASE_CONFIG}"));
+    assert_eq!(edition(&work, &["status"]).code, 2);
+    write(&work, "edition.toml", &format!("ledger_branch = \"../x\"\n{BASE_CONFIG}"));
+    assert_eq!(edition(&work, &["status"]).code, 2);
+}
+
+#[test]
+fn the_events_file_is_never_written_through_a_link() {
+    let (root, work) = project("events-link", BASE_CONFIG, "0.6.0-dev");
+    let target = root.join("target.txt");
+    std::fs::write(&target, "untouched").expect("target");
+    let link = root.join("events.jsonl");
+    std::os::unix::fs::symlink(&target, &link).expect("link");
+    let out =
+        apply_env(&work, &["deploy", "staging-home", "main"], &[("EDITION_EVENTS", link.to_str().expect("utf8"))]);
+    assert_eq!(out.code, 0, "{}", out.all());
+    assert_eq!(std::fs::read_to_string(&target).expect("target"), "untouched");
 }
 
 #[test]
@@ -1361,4 +1475,43 @@ fn local_toml_must_be_ignored_and_untracked() {
     git(&work, &["rm", "-q", "--cached", ".edition/local.toml"]);
     std::fs::write(dir.join(".gitignore"), "*\n").expect("ignore");
     assert_eq!(edition(&work, &["status"]).code, 0);
+}
+
+/// Measures first-sync validation of a 5,000-entry ledger branch (run with --ignored).
+#[test]
+#[ignore]
+fn validation_cost_for_5000_entries() {
+    use std::io::Write;
+    let dir = tmp("ledger-5000");
+    git(&dir, &["init", "-q"]);
+    let g = edition::git::Git::new(&dir);
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["fast-import", "--quiet"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("fast-import");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut text = edition::ledger::HEADER.to_string();
+    let mut prev = edition::ledger::GENESIS.to_string();
+    for i in 0..5000 {
+        let e = entry(&format!("e{i}"), &prev);
+        prev = edition::ledger::entry_hash(&g, &e).expect("hash");
+        text.push_str(&edition::ledger::render(&e));
+        write!(
+            stdin,
+            "commit refs/heads/edition/ledger\ncommitter T <t@example.invalid> 0 +0000\ndata 1\nx\nM 100644 inline ledger.toml\ndata {}\n{}\n",
+            text.len(),
+            text
+        )
+        .expect("write");
+    }
+    drop(stdin);
+    assert!(child.wait().expect("wait").success());
+    let tip = git(&dir, &["rev-parse", "refs/heads/edition/ledger"]);
+    let store = edition::ledger_store::Store::new(&g, "edition/ledger");
+    let start = std::time::Instant::now();
+    store.validate_new(None, &tip).expect("valid");
+    eprintln!("validated 5000 ledger commits in {:?}", start.elapsed());
 }

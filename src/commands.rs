@@ -25,6 +25,10 @@ pub struct Ctx {
 
 pub type Res = Result<i32, String>;
 
+/// Content findings for a ledger entry: the allowed ones as `(id, description)`, and the
+/// blocking ones as messages.
+type Findings = (Vec<(String, String)>, Vec<String>);
+
 /// A ledger entry to write for the outward step at `index` once the plan has run.
 #[derive(Clone)]
 struct Record {
@@ -240,22 +244,15 @@ impl Ctx {
             return Err("this plan has no ledger destination".into());
         };
         // The ledger branch goes to the same remote: a public one gets the same scan.
-        if self.l.is_public(&self.l.cfg.remote) {
-            let scanner = crate::content::Scanner::new(&self.l);
-            let mut found = Vec::new();
-            for line in ledger::render(&ledger::redacted(e)).lines() {
-                scanner.scan_line(&format!("ledger entry {}", e.id), line, &mut found);
-            }
-            let blocked: Vec<String> = crate::content::identify(&self.git, found)
-                .into_iter()
-                .filter(|f| !self.allow_findings.contains(&f.id))
-                .map(|f| {
-                    format!("{} {} [{}] {} (allow with --allow-finding {})", f.id, f.place, f.pattern, f.excerpt, f.id)
-                })
-                .collect();
-            if !blocked.is_empty() {
-                return Err(format!("the ledger entry matches the content deny-list: {}", blocked.join("; ")));
-            }
+        // Only findings allowed when the plan was made (and so bound in its receipt) may
+        // pass; anything new blocks and the outcome stays pending.
+        let (_, blocked) = self.ledger_findings(plan, std::slice::from_ref(e))?;
+        let blocked: Vec<String> = blocked
+            .into_iter()
+            .filter(|b| !plan.allowed_findings.iter().any(|id| b.starts_with(id.as_str())))
+            .collect();
+        if !blocked.is_empty() {
+            return Err(format!("the ledger entry matches the content deny-list: {}", blocked.join("; ")));
         }
         let written = self.store().append(&plan.remote, push_url, e)?;
         let _ = branch;
@@ -273,6 +270,38 @@ impl Ctx {
         );
         crate::say!("recorded {} ({}) on the {} branch", e.id, e.result, self.l.cfg.ledger_branch);
         Ok(written)
+    }
+
+    /// Scans ledger entries bound for a public remote. Returns the findings allowed by
+    /// `--allow-finding` as `(id, description)` and the blocking ones as messages. The
+    /// finding's place names the action and channel, not the entry id, so it is the
+    /// same when planned and when applied.
+    fn ledger_findings(&self, plan: &Plan, entries: &[Entry]) -> Result<Findings, String> {
+        let _ = plan;
+        if !self.l.is_public(&self.l.cfg.remote) {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let scanner = crate::content::Scanner::new(&self.l);
+        let mut found = Vec::new();
+        for e in entries {
+            let place = format!("ledger entry ({} {})", e.action, e.channel.as_deref().unwrap_or(&e.ref_));
+            for line in ledger::render(&ledger::redacted(e)).lines() {
+                scanner.scan_line(&place, line, &mut found);
+            }
+        }
+        let mut allowed = Vec::new();
+        let mut blocked = Vec::new();
+        for f in crate::content::identify(&self.git, found) {
+            if self.allow_findings.contains(&f.id) {
+                allowed.push((f.id.clone(), format!("{} {} [{}]", f.id, f.place, f.pattern)));
+            } else {
+                blocked.push(format!(
+                    "{} {} [{}] {} (allow it for this run with --allow-finding {})",
+                    f.id, f.place, f.pattern, f.excerpt, f.id
+                ));
+            }
+        }
+        Ok((allowed, blocked))
     }
 
     fn receipt_used(&self) -> impl Fn(&str) -> bool {
@@ -295,25 +324,43 @@ impl Ctx {
         if let Err(e) = plan.resolve() {
             return refuse(&[e]);
         }
+        // The prospective ledger entries are scanned while the plan is made, so every
+        // override is part of the receipt.
+        let mut overrides = overrides.to_vec();
+        if plan.record_to.is_some() && !records.is_empty() {
+            let prospective = finalize(&plan, &records, &[], None, None, &overrides, true);
+            match self.ledger_findings(&plan, &prospective) {
+                Ok((allowed, blocked)) => {
+                    if !blocked.is_empty() {
+                        return refuse(&blocked);
+                    }
+                    for (id, text) in allowed {
+                        plan.fact("allowed-ledger-finding", &id);
+                        plan.allowed_findings.push(id);
+                        overrides.push(text);
+                    }
+                }
+                Err(e) => return refuse(&[e]),
+            }
+        }
+        let overrides = &overrides[..];
         let plan = &plan;
         let pending = crate::pending::Pending::at(&self.l.root);
-        // Before anything runs, the prospective entries are written down, so an outcome
-        // survives a crash or an unreachable remote.
-        let key = match (&self.mode.confirm, self.mode.apply && !records.is_empty()) {
-            (Some(r), true) => Some(r.clone()),
-            _ => None,
-        };
-        let receipt = self.mode.confirm.clone();
-        if let Some(k) = &key {
-            pending.write(k, &finalize(plan, &records, &[], None, receipt.as_deref(), overrides, true))?;
-        }
+        // Run state is created only once the receipt has been validated and spent (the
+        // first call of `on_step`), and only from that validated receipt. Then it is
+        // rewritten after every step, so an outcome survives a crash or an outage.
+        let records_apply = self.mode.apply && !records.is_empty();
+        let created = std::cell::RefCell::new(None::<String>);
         let mut on_step = |outcomes: &[steps::Outcome]| -> Result<(), String> {
-            match &key {
-                Some(k) => {
-                    pending.write(k, &finalize(plan, &records, outcomes, None, receipt.as_deref(), overrides, true))
-                }
-                None => Ok(()),
+            if !records_apply {
+                return Ok(());
             }
+            let Some(k) = self.mode.confirm.as_deref().filter(|k| crate::util::valid_receipt(k)) else {
+                return Err("no validated receipt for the pending record".into());
+            };
+            pending.write(k, &finalize(plan, &records, outcomes, None, Some(k), overrides, true))?;
+            *created.borrow_mut() = Some(k.to_string());
+            Ok(())
         };
         let ran = steps::execute(
             plan,
@@ -325,11 +372,10 @@ impl Ctx {
             &used,
             &mut on_step,
         );
+        let key = created.borrow().clone();
         let (outcomes, receipt, stopped) = match ran {
             Err(e) => {
-                if let Some(k) = &key {
-                    pending.remove(k)?;
-                }
+                // A refused receipt created nothing; a later failure keeps the record.
                 return Err(e);
             }
             Ok(Ran::DryRun) => return Ok(0),
@@ -1570,6 +1616,37 @@ pub fn ledger_reconcile(c: &Ctx, abandon: bool) -> Res {
         return refuse(&[e]);
     }
     plan.fact("abandon", if abandon { "yes" } else { "no" });
+    // What will be published, decided now so the scan and its overrides are part of
+    // the receipt.
+    let mut publish: Vec<(String, Vec<Entry>)> = Vec::new();
+    for (key, _, entries) in &runs {
+        let mut out = Vec::new();
+        for e in entries {
+            let mut e = e.clone();
+            if abandon {
+                e.note = Some(format!("abandoned: the outcome was {} when Edition stopped", e.result));
+                e.result = "abandoned".into();
+                e.id = format!("{}/abandoned", e.id);
+            } else if e.result == "unknown" {
+                e.note = Some("Edition stopped before this step finished; its effect is unknown".into());
+            }
+            out.push(e);
+        }
+        publish.push((key.clone(), out));
+    }
+    let all: Vec<Entry> = publish.iter().flat_map(|(_, es)| es.clone()).collect();
+    let (allowed, blocked) = match c.ledger_findings(&plan, &all) {
+        Ok(x) => x,
+        Err(e) => return refuse(&[e]),
+    };
+    if !blocked.is_empty() {
+        return refuse(&blocked);
+    }
+    let override_text: Vec<String> = allowed.iter().map(|(_, t)| t.clone()).collect();
+    for (id, _) in &allowed {
+        plan.fact("allowed-ledger-finding", id);
+        plan.allowed_findings.push(id.clone());
+    }
     for (key, text, entries) in &runs {
         plan.fact("pending", &format!("{key} {}", crate::util::sha256_hex(text.as_bytes())));
         for e in entries {
@@ -1590,15 +1667,13 @@ pub fn ledger_reconcile(c: &Ctx, abandon: bool) -> Res {
     match steps::execute(&plan, &c.mode, &c.git, &l.root, &digest, l.receipt_ttl(), &used, &mut no_steps)? {
         Ran::DryRun => Ok(0),
         Ran::Ran { .. } => {
-            for (key, _, entries) in &runs {
+            for (key, entries) in &publish {
                 for e in entries {
                     let mut e = e.clone();
-                    if abandon {
-                        e.note = Some(format!("abandoned: the outcome was {} when Edition stopped", e.result));
-                        e.result = "abandoned".into();
-                        e.id = format!("{}/abandoned", e.id);
-                    } else if e.result == "unknown" {
-                        e.note = Some("Edition stopped before this step finished; its effect is unknown".into());
+                    for t in &override_text {
+                        if !e.overrides.contains(t) {
+                            e.overrides.push(t.clone());
+                        }
                     }
                     c.record(&e, &plan)?;
                 }

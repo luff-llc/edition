@@ -152,7 +152,8 @@ pub fn render(e: &Entry) -> String {
 
 /// The chain hash of an entry: Git's blob hash of its canonical rendering.
 pub fn entry_hash(git: &Git, e: &Entry) -> Result<String, String> {
-    git.hash(&render(e))
+    let _ = git;
+    Ok(crate::util::git_blob_id(&render(e)))
 }
 
 /// Checks the chain. Returns the first broken link as `(index, message)`.

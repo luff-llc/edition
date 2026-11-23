@@ -268,22 +268,11 @@ fn ledger_checks(l: &Loaded, git: &Git, view: &RemoteView, r: &mut Report) {
         Ok(()) => {}
         Err((_, m)) => r.errors.push(format!("{branch}: hash chain broken: {m}")),
     }
-    // Along the branch's first-parent history, each version is a prefix of the next.
+    // The whole branch, commit by commit: each one an exact one-entry extension.
     if let Some(tip) = store.cached() {
-        let versions = store.history(&tip);
-        let mut ok = true;
-        for w in versions.windows(2) {
-            if !w[1].1.starts_with(w[0].1.trim_end()) {
-                ok = false;
-                r.errors.push(format!(
-                    "{branch} was rewritten at {}: the version before it is not a prefix (an entry was edited, removed or reordered)",
-                    short(&w[1].0)
-                ));
-                break;
-            }
-        }
-        if ok && versions.len() > 1 {
-            r.ok.push(format!("{branch} is append-only across {} commit(s)", versions.len()));
+        match store.validate_new(None, &tip) {
+            Ok(()) => r.ok.push(format!("{branch} is append-only, one valid entry per commit")),
+            Err(e) => r.errors.push(e),
         }
     }
     let mut ids: Vec<&str> = Vec::new();

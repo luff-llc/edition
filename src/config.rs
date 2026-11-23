@@ -687,6 +687,27 @@ impl Loaded {
         {
             errs.push(format!("ledger_branch `{}` must be a branch name of its own", c.ledger_branch));
         }
+        // Paths in the configuration stay inside the repository: `bump` writes version
+        // files, and `ledger migrate` reads the legacy ledger.
+        let inside = |p: &str| {
+            let path = Path::new(p);
+            !p.is_empty()
+                && path.is_relative()
+                && path.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+        };
+        if !inside(&c.ledger) {
+            errs.push(format!("ledger `{}` must be a relative path inside the repository", c.ledger));
+        }
+        for vf in &c.version_files {
+            if !inside(&vf.path) {
+                errs.push(format!("version_files path `{}` must be a relative path inside the repository", vf.path));
+            }
+        }
+        for p in &c.pins {
+            if !inside(&p.file) {
+                errs.push(format!("pin {}: file `{}` must be a relative path inside the repository", p.name, p.file));
+            }
+        }
         if c.product.trim().is_empty() {
             errs.push("product must not be empty".into());
         }

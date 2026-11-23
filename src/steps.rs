@@ -205,6 +205,8 @@ pub struct Plan {
     pub record_to: Option<(String, String)>,
     /// Per-machine `PATH` entries from `.edition/local.toml` (printed and hashed).
     pub local_dirs: Vec<String>,
+    /// Content findings in the prospective ledger entries that this plan allows.
+    pub allowed_findings: Vec<String>,
 }
 
 impl Plan {
@@ -248,6 +250,9 @@ impl Plan {
         }
         if !self.local_dirs.is_empty() {
             crate::say!("  local path entries: {}", self.local_dirs.join(", "));
+        }
+        if !self.allowed_findings.is_empty() {
+            crate::say!("  allowing content findings in the ledger entry: {}", self.allowed_findings.join(", "));
         }
         for s in &self.steps {
             crate::say!("{}", s.display());
@@ -403,6 +408,9 @@ pub fn write_private(path: &Path, text: &str) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
+/// `O_NOFOLLOW`, for other modules.
+pub const NOFOLLOW: i32 = O_NOFOLLOW;
+
 fn private(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     meta.permissions().mode() & 0o077 == 0
@@ -484,7 +492,7 @@ impl Receipts {
     /// Validates and spends a receipt under one lock. `used_elsewhere` reports whether
     /// the ledger already records it.
     pub fn redeem(&self, nonce: &str, plan_hash: &str, used_elsewhere: bool) -> Result<(), String> {
-        if nonce.len() != 32 || !nonce.chars().all(|c| c.is_ascii_hexdigit()) {
+        if !crate::util::valid_receipt(nonce) {
             return Err("a receipt is the 32-character value a dry run printed".into());
         }
         let mut f = self.open_locked()?;
@@ -583,6 +591,8 @@ pub fn execute(
         };
         receipts.redeem(nonce, &plan.digest(config_digest), used_in_ledger(nonce))?;
         receipt = Some(nonce.to_string());
+        // The receipt is valid and spent: only now may run state be created.
+        on_step(&[])?;
     }
     let mut outcomes = Vec::new();
     let mut stopped = None;

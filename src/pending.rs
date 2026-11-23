@@ -29,8 +29,13 @@ impl Pending {
         crate::steps::ensure_private_dir(&self.dir)
     }
 
-    fn path(&self, key: &str) -> PathBuf {
-        self.dir.join(format!("{key}.toml"))
+    /// The file for a run. Only a validated receipt names one, so no input can point
+    /// outside the pending directory.
+    fn path(&self, key: &str) -> Result<PathBuf, String> {
+        if !crate::util::valid_receipt(key) {
+            return Err("a pending record is named by a validated receipt only".into());
+        }
+        Ok(self.dir.join(format!("{key}.toml")))
     }
 
     /// Writes (or rewrites) the pending entries for one run.
@@ -42,11 +47,18 @@ impl Pending {
         for e in entries {
             text.push_str(&ledger::render(&ledger::redacted(e)));
         }
-        crate::steps::write_private(&self.path(key), &text)
+        crate::steps::write_private(&self.path(key)?, &text)
     }
 
     pub fn remove(&self, key: &str) -> Result<(), String> {
-        match std::fs::remove_file(self.path(key)) {
+        let path = self.path(key)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if !m.file_type().is_file() => {
+                return Err(format!("{} is not a regular file; not removing it", path.display()))
+            }
+            _ => {}
+        }
+        match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(format!("cannot remove a pending record: {e}")),
@@ -69,6 +81,11 @@ impl Pending {
         names.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
         for p in names {
             let key = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            if !crate::util::valid_receipt(&key)
+                || !std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_file())
+            {
+                continue;
+            }
             let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
             let entries = ledger::parse(&text).map_err(|e| format!("{}: {e}", p.display()))?;
             out.push((key, text, entries));

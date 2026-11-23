@@ -163,6 +163,22 @@ Outward plans also refuse a dirty working tree and a detached HEAD, so the confi
 and version files are exactly what was committed. A branch at the same commit as the
 remote tip is enough.
 
+### Inputs that name files or refs
+
+- `--confirm` must be exactly 32 lowercase hex characters, checked when the arguments
+  are parsed, before the value is used for anything. A refused receipt creates and
+  removes nothing.
+- Receipt state, pending records and `local.toml` live at fixed names under the private
+  `.edition/` directory; pending file names come only from validated receipts, and
+  Edition removes only regular files it created there.
+- `ledger`, `version_files` paths and pin files must be relative paths inside the
+  repository (no `..`, not absolute): `bump` writes version files and `ledger migrate`
+  reads the legacy ledger.
+- `ledger_branch`, refs and `--at` pass the ref grammar; the ledger branch cannot be
+  `main` or a release line.
+- `EDITION_EVENTS` is the caller's chosen output path; Edition only appends to it and
+  never writes through a link.
+
 ### Commands, placeholders and secrets
 
 - Channel and check commands are argument lists executed directly, never through a
@@ -307,9 +323,11 @@ written.
   whose id is already on the branch (a push that was accepted but whose answer was lost)
   counts as published and is never appended twice; ids embed the run's receipt. A failed
   or partial action is recorded the same way.
-- **Pending outcomes.** Before the first step of a recording plan runs, Edition writes
-  the prospective entries to `.edition/pending/` (a private directory, files mode 0600,
-  written atomically), rewrites them after every step, and removes them once the ledger
+- **Pending outcomes.** Once the receipt has been validated and spent, and before the
+  first step of a recording plan runs, Edition writes the prospective entries to
+  `.edition/pending/<receipt>.toml` (a private directory, files mode 0600, written
+  atomically without following links; the name comes only from the validated receipt),
+  rewrites them after every step, and removes them once the ledger
   push succeeds. A step that had not finished when Edition stopped is recorded as
   `unknown`. If Edition is killed, or the remote cannot be reached or the entry is
   blocked by the content check, the outcome survives: `status` and `verify` report it as
@@ -333,7 +351,10 @@ written.
   one rendered entry, the entry chains to the one before and repeats no id, and a merge
   or a second root is refused. A branch seen for the first time is validated from its
   first commit, which must start at the genesis value. A missing or unreadable file fails
-  closed, and the refusal names the commit. Offline, `verify` says the anchor is
+  closed, and the refusal names the commit. Validation reads one `git log -p` stream and
+  checks each commit's appended lines against a running chain state, so its cost is
+  linear: a first sync of a 5,000-entry branch took about 4.6 s in a debug build on an
+  Apple-silicon laptop (`validation_cost_for_5000_entries`, run with `--ignored`). Offline, `verify` says the anchor is
   unverified. The anchor is only as strong as the remote: protect the ledger branch
   against force pushes and deletion.
 - **Reading.** `status`, `ledger`, `promote` and the `requires` gate read the branch
@@ -377,10 +398,12 @@ in `[content] allow_paths` or it is allowed by id for one run.
 - **`verify`** scans the tracked tree and commits not yet on each public remote, and
   fails on a finding when the action is `block`.
 - **The ledger branch** is pushed to the same remote. Its entries carry configuration
-  and user text (targets, notes), so before a ledger push to a public remote the new entry
-  is scanned with the same deny-list; a finding blocks the push (the outcome stays
-  pending) unless it is allowed by id with `--allow-finding`, for example on
-  `edition ledger reconcile`.
+  and user text (targets, notes), so for a public remote the prospective entry is
+  scanned while the plan is made (for every recording plan and for `ledger reconcile`).
+  A finding refuses the plan unless it is allowed by id with `--allow-finding`; allowed
+  findings are printed with the plan, part of its hash, and recorded in the entry. The
+  final entry is scanned again before the push, and a finding that was not allowed when
+  the plan was made blocks it; the outcome stays pending.
 
 ## How it fits with other tools
 

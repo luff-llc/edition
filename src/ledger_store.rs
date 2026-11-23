@@ -114,62 +114,113 @@ impl<'a> Store<'a> {
     /// Checks every first-parent commit after `seen` (all of them, for a branch seen for
     /// the first time) up to `tip`: each must be an exact one-entry extension of its
     /// parent's ledger, chained correctly, with nothing else in its tree. Fails closed.
+    ///
+    /// It reads one `git log -p` stream and checks each commit's diff (the appended
+    /// lines) against a running chain state, so the cost grows with the number of
+    /// entries, not with their square.
     pub fn validate_new(&self, seen: Option<&str>, tip: &str) -> Result<(), String> {
+        let bad = |c: &str, why: &str| {
+            format!("the {} branch has an invalid commit {}: {why}", self.branch, crate::util::short(c))
+        };
+        // The state after `seen`, which was validated when it was first seen.
+        let (mut last_hash, mut ids, mut lines) = match seen {
+            Some(s) => {
+                let text = self.text_at(s);
+                let entries = ledger::parse(&text).map_err(|e| bad(s, &format!("its ledger does not parse: {e}")))?;
+                let last = match entries.last() {
+                    Some(e) => ledger::entry_hash(self.git, e)?,
+                    None => ledger::GENESIS.to_string(),
+                };
+                let ids: std::collections::HashSet<String> = entries.into_iter().map(|e| e.id).collect();
+                (last, ids, text.lines().count())
+            }
+            None => (ledger::GENESIS.to_string(), std::collections::HashSet::new(), 0usize),
+        };
         let range = match seen {
             Some(s) => format!("{s}..{tip}"),
             None => tip.to_string(),
         };
-        let list = self.git.run(&["rev-list", "--first-parent", "--reverse", "--parents", &range])?;
-        let bad = |c: &str, why: String| {
-            format!("the {} branch has an invalid commit {}: {why}", self.branch, crate::util::short(c))
-        };
-        for line in list.lines() {
-            let mut ids = line.split(' ');
-            let Some(c) = ids.next() else { continue };
-            let parents: Vec<&str> = ids.collect();
-            let parent = match (parents.as_slice(), seen) {
-                ([], _) => None,
-                ([p], _) => Some(*p),
-                _ => return Err(bad(c, "a merge commit".into())),
+        let out = self.git.run(&[
+            "log",
+            "--first-parent",
+            "--reverse",
+            "--root",
+            "-p",
+            "-U0",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-color",
+            "--format=%x1e%H %P",
+            &range,
+        ])?;
+        let mut first = true;
+        for rec in out.split('\u{1e}').filter(|r| !r.trim().is_empty()) {
+            let (head, diff) = rec.split_once('\n').unwrap_or((rec, ""));
+            let mut ids_in_head = head.split(' ').filter(|x| !x.is_empty());
+            let c = ids_in_head.next().unwrap_or("").to_string();
+            let parents: Vec<&str> = ids_in_head.collect();
+            match parents.len() {
+                0 if first && seen.is_none() => {}
+                0 => return Err(bad(&c, "a second root commit")),
+                1 => {}
+                _ => return Err(bad(&c, "a merge commit")),
+            }
+            first = false;
+            let mut added: Vec<&str> = Vec::new();
+            let mut files = 0;
+            for line in diff.lines() {
+                if let Some(rest) = line.strip_prefix("diff --git ") {
+                    files += 1;
+                    if rest != format!("a/{FILE} b/{FILE}") {
+                        return Err(bad(&c, &format!("it changes something other than {FILE}")));
+                    }
+                } else if line.starts_with("deleted file") || line.starts_with("Binary files") {
+                    return Err(bad(&c, &format!("{FILE} is deleted or unreadable")));
+                } else if line.starts_with("--- ")
+                    || line.starts_with("+++ ")
+                    || line.starts_with("index ")
+                    || line.starts_with("new file")
+                {
+                } else if let Some(h) = line.strip_prefix("@@ -") {
+                    // `@@ -N,0 +N+1,M @@`: an insertion after the last line only.
+                    let old = h.split(' ').next().unwrap_or("");
+                    let (start, count) = old.split_once(',').unwrap_or((old, "1"));
+                    if count != "0" || start.parse::<usize>().ok() != Some(lines) {
+                        return Err(bad(&c, "it changes existing lines instead of appending"));
+                    }
+                } else if let Some(a) = line.strip_prefix('+') {
+                    added.push(a);
+                } else if line.starts_with('-') || line.starts_with('\\') {
+                    return Err(bad(&c, "it removes or rewrites existing lines"));
+                }
+            }
+            if files != 1 || added.is_empty() {
+                return Err(bad(&c, "it does not append exactly one entry"));
+            }
+            let mut body: Vec<&str> = added.clone();
+            if lines == 0 {
+                let header: Vec<&str> = ledger::HEADER.lines().collect();
+                if body.len() < header.len() || body[..header.len()] != header[..] {
+                    return Err(bad(&c, "the first commit does not start with the ledger header"));
+                }
+                body.drain(..header.len());
+            }
+            let text = format!("{}\n", body.join("\n"));
+            let parsed = ledger::parse(&text).map_err(|e| bad(&c, &format!("its entry does not parse: {e}")))?;
+            let [e] = parsed.as_slice() else {
+                return Err(bad(&c, "it does not append exactly one entry"));
             };
-            if parent.is_none() && seen.is_some() {
-                return Err(bad(c, "a second root commit".into()));
+            if ledger::render(e).lines().collect::<Vec<_>>() != body {
+                return Err(bad(&c, "its appended text is not exactly the rendered entry"));
             }
-            let tree = self.git.run(&["ls-tree", c])?;
-            let mut entries_in_tree = tree.lines();
-            let only = entries_in_tree.next().unwrap_or("");
-            if entries_in_tree.next().is_some()
-                || !only.starts_with("100644 blob ")
-                || !only.ends_with(&format!("\t{FILE}"))
-            {
-                return Err(bad(c, format!("its tree must hold only {FILE}")));
+            if e.prev != last_hash {
+                return Err(bad(&c, "its entry does not chain to the entry before it"));
             }
-            let text = self.git.show(c, FILE).ok_or_else(|| bad(c, format!("{FILE} is missing or unreadable")))?;
-            let parent_text = match parent {
-                Some(p) => self.git.show(p, FILE).ok_or_else(|| bad(p, format!("{FILE} is missing or unreadable")))?,
-                None => String::new(),
-            };
-            let before =
-                ledger::parse(&parent_text).map_err(|e| bad(c, format!("its parent's ledger does not parse: {e}")))?;
-            let after = ledger::parse(&text).map_err(|e| bad(c, format!("its ledger does not parse: {e}")))?;
-            if after.len() != before.len() + 1 || after[..before.len()] != before[..] {
-                return Err(bad(c, "it does not append exactly one entry to its parent's ledger".into()));
+            if !ids.insert(e.id.clone()) {
+                return Err(bad(&c, &format!("its entry repeats an id already recorded ({})", e.id)));
             }
-            let new = &after[before.len()];
-            let want_prev = match before.last() {
-                Some(last) => ledger::entry_hash(self.git, last)?,
-                None => ledger::GENESIS.to_string(),
-            };
-            if new.prev != want_prev {
-                return Err(bad(c, "its entry does not chain to the entry before it".into()));
-            }
-            if before.iter().any(|e| e.id == new.id) {
-                return Err(bad(c, format!("its entry repeats an id already recorded ({})", new.id)));
-            }
-            // `git show` output is read without its final newline, so compare that way.
-            if text.trim_end() != Self::expected_text(&parent_text, new).trim_end() {
-                return Err(bad(c, "its ledger text is not the parent's text plus the rendered entry".into()));
-            }
+            last_hash = ledger::entry_hash(self.git, e)?;
+            lines += added.len();
         }
         Ok(())
     }
