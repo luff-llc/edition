@@ -105,7 +105,7 @@ fn the_remote_is_rechecked_immediately_before_each_outward_step() {
     assert_eq!(out.code, 1, "{}", out.all());
     assert!(out.stderr.contains("remote refs/heads/main is now"), "{}", out.stderr);
     assert!(!work.join("staging-deploys.txt").exists(), "the deploy never ran");
-    let ledger = std::fs::read_to_string(work.join("releases/ledger.toml")).expect("ledger");
+    let ledger = ledger_text(&work);
     assert!(ledger.contains("result = \"failed\""));
     assert!(ledger.contains("stopped: remote refs/heads/main is now"));
 }
@@ -170,50 +170,138 @@ fn prod_refuses_a_branch_or_commit_even_when_a_tag_points_at_it() {
 fn two_entry_ledger(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let (root, work) = project(name, BASE_CONFIG, "0.6.0-dev");
     assert_eq!(apply(&work, &["deploy", "staging-home", "main", "--note", "first"]).code, 0);
-    commit_all(&work, "Record first");
-    git(&work, &["push", "-q", "origin", "main"]);
     assert_eq!(apply(&work, &["deploy", "staging-home", "main", "--note", "second"]).code, 0);
-    commit_all(&work, "Record second");
-    git(&work, &["push", "-q", "origin", "main"]);
     (root, work)
 }
 
+fn plumb(dir: &Path, args: &[&str], input: &str) -> String {
+    use std::io::Write;
+    let mut c = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=Other", "-c", "user.email=other@example.invalid"])
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("git");
+    c.stdin.take().expect("stdin").write_all(input.as_bytes()).expect("write");
+    let out = c.wait_with_output().expect("git");
+    assert!(out.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Another clone publishes `text` as the ledger branch, on top of the current tip or
+/// (when `rewrite`) on top of `parent` with a force push.
+fn publish_ledger(root: &Path, name: &str, text: &str, parent: Option<&str>, force: bool) -> String {
+    let other = other_clone(root, name);
+    git(&other, &["fetch", "-q", "origin", "edition/ledger:refs/remotes/origin/edition/ledger"]);
+    let blob = plumb(&other, &["hash-object", "-w", "--stdin"], text);
+    let tree = plumb(&other, &["mktree"], &format!("100644 blob {blob}\tledger.toml\n"));
+    let parent = parent.map(str::to_string).unwrap_or_else(|| git(&other, &["rev-parse", "origin/edition/ledger"]));
+    let commit = plumb(&other, &["commit-tree", &tree, "-p", &parent, "-m", "edit"], "");
+    let mut args = vec!["push", "-q"];
+    if force {
+        args.push("-f");
+    }
+    let spec = format!("{commit}:refs/heads/edition/ledger");
+    args.extend(["origin", spec.as_str()]);
+    git(&other, &args);
+    commit
+}
+
 #[test]
-fn committed_ledger_forgery_truncation_and_reordering_are_caught() {
-    let (_root, work) = two_entry_ledger("forgery");
-    let v = edition(&work, &["verify"]);
+fn a_recorded_staging_deploy_leaves_main_untouched_and_staging_current() {
+    let (_root, work) = project("ledger-main", BASE_CONFIG, "0.6.0-dev");
+    let main_before = git(&work, &["ls-remote", "origin", "refs/heads/main"]);
+    let ok = apply(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+    assert!(ok.stdout.contains("record the outcome on the edition/ledger branch"), "{}", ok.stdout);
+    assert_eq!(git(&work, &["ls-remote", "origin", "refs/heads/main"]), main_before, "main did not move");
+    assert!(git(&work, &["status", "--porcelain"]).is_empty(), "the checkout is untouched");
+    assert!(ledger_text(&work).contains("tier = \"staging\""));
+    // Staging is still current: the same tip is accepted again, and status says so.
+    let again = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(again.code, 0, "{}", again.all());
+    let status = edition(&work, &["status", "--online"]);
+    let tip = git(&work, &["rev-parse", "origin/main"]);
+    assert!(status.stdout.contains(&format!("main ({})", &tip[..10])), "{}", status.stdout);
+}
+
+#[test]
+fn two_concurrent_recorders_both_land() {
+    let (root, work) = project("ledger-race", BASE_CONFIG, "0.6.0-dev");
+    let other = other_clone(&root, "other");
+    git(&other, &["checkout", "-q", "main"]);
+    let r1 = edition(&work, &["deploy", "staging-home", "main"]).receipt();
+    let r2 = edition(&other, &["deploy", "staging-home", "main"]).receipt();
+    let (w, o) = (work.clone(), other.clone());
+    let t1 =
+        std::thread::spawn(move || edition(&w, &["deploy", "staging-home", "main", "--apply", "--confirm", &r1]).code);
+    let t2 =
+        std::thread::spawn(move || edition(&o, &["deploy", "staging-home", "main", "--apply", "--confirm", &r2]).code);
+    assert_eq!(t1.join().expect("t1"), 0);
+    assert_eq!(t2.join().expect("t2"), 0);
+    let text = ledger_text(&work);
+    assert_eq!(text.matches("[[entry]]").count(), 2, "{text}");
+    let v = edition(&work, &["verify", "--online"]);
     assert!(v.stdout.contains("hash chain intact (2 entries)"), "{}", v.stdout);
-    let path = work.join("releases/ledger.toml");
-    let text = std::fs::read_to_string(&path).expect("ledger");
+}
 
-    // Forgery in the working copy.
-    write(&work, "releases/ledger.toml", &text.replacen("note = \"first\"", "note = \"forged\"", 1));
-    let forged = edition(&work, &["verify"]);
-    assert_eq!(forged.code, 1);
+#[test]
+fn edited_truncated_or_reordered_ledger_history_is_caught() {
+    let (root, work) = two_entry_ledger("forgery");
+    let v = edition(&work, &["verify", "--online"]);
+    assert!(v.stdout.contains("hash chain intact (2 entries)"), "{}", v.stdout);
+    let text = ledger_text(&work);
+
+    // An edited entry, appended as a new commit (no force push needed).
+    let edited = publish_ledger(&root, "o1", &text.replacen("note = \"first\"", "note = \"forged\"", 1), None, false);
+    let forged = edition(&work, &["verify", "--online"]);
+    assert_eq!(forged.code, 1, "{}", forged.all());
     assert!(forged.stdout.contains("hash chain broken"), "{}", forged.stdout);
+    assert!(forged.stdout.contains(&format!("was rewritten at {}", &edited[..10])), "{}", forged.stdout);
+}
 
-    // Truncation, committed: the history check names the commit.
+#[test]
+fn a_truncated_or_reordered_ledger_commit_is_caught() {
+    let (root, work) = two_entry_ledger("truncate");
+    let text = ledger_text(&work);
     let first_end = text
         .find("\n[[entry]]")
         .and_then(|a| text[a + 1..].find("\n[[entry]]").map(|b| a + 1 + b))
         .expect("two entries");
-    write(&work, "releases/ledger.toml", &text[..first_end + 1]);
-    let trunc = commit_all(&work, "Drop an entry");
-    let truncated = edition(&work, &["verify"]);
-    assert_eq!(truncated.code, 1);
-    assert!(truncated.stdout.contains(&format!("was rewritten at {}", &trunc[..10])), "{}", truncated.stdout);
+    let trunc = publish_ledger(&root, "o1", &text[..first_end + 1], None, false);
+    let t = edition(&work, &["verify", "--online"]);
+    assert_eq!(t.code, 1, "{}", t.all());
+    assert!(t.stdout.contains(&format!("was rewritten at {}", &trunc[..10])), "{}", t.stdout);
 
-    // Reordering, committed.
-    git(&work, &["reset", "-q", "--hard", "HEAD~1"]);
-    let body = &text[text.find("\n[[entry]]").expect("entry")..];
+    let (root2, work2) = two_entry_ledger("reorder");
+    let text2 = ledger_text(&work2);
+    let head = &text2[..text2.find("\n[[entry]]").expect("e")];
+    let body = &text2[text2.find("\n[[entry]]").expect("entry")..];
     let second = body[1..].find("\n[[entry]]").map(|i| i + 1).expect("second");
-    let reordered = format!("{}{}{}", &text[..text.find("\n[[entry]]").expect("e")], &body[second..], &body[..second]);
-    write(&work, "releases/ledger.toml", &reordered);
-    commit_all(&work, "Reorder");
-    let re = edition(&work, &["verify"]);
-    assert_eq!(re.code, 1);
-    assert!(re.stdout.contains("hash chain broken"), "{}", re.stdout);
-    assert!(re.stdout.contains("was rewritten at"), "{}", re.stdout);
+    publish_ledger(&root2, "o2", &format!("{head}{}{}", &body[second..], &body[..second]), None, false);
+    let r = edition(&work2, &["verify", "--online"]);
+    assert_eq!(r.code, 1, "{}", r.all());
+    assert!(r.stdout.contains("hash chain broken"), "{}", r.stdout);
+}
+
+#[test]
+fn a_ledger_branch_rewritten_on_the_remote_is_detected() {
+    let (root, work) = two_entry_ledger("rewrite");
+    assert_eq!(edition(&work, &["verify", "--online"]).code, 0);
+    // Someone force-pushes the branch back to its first commit plus a different one.
+    let first = git(&work, &["rev-parse", "refs/edition/ledger~1"]);
+    let one = git(&work, &["show", &format!("{first}:ledger.toml")]);
+    publish_ledger(&root, "o1", &one, Some(&first), true);
+    let v = edition(&work, &["verify", "--online"]);
+    assert_eq!(v.code, 1, "{}", v.all());
+    assert!(v.stdout.contains("branch was rewritten"), "{}", v.stdout);
+    // Outward plans refuse to record onto it too.
+    let d = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(d.code, 1, "{}", d.all());
+    assert!(d.stderr.contains("branch was rewritten"), "{}", d.stderr);
 }
 
 #[test]
@@ -330,7 +418,7 @@ fn values_from_the_environment_are_printed_by_name_and_never_recorded() {
     let ok = apply_env(&work, &["deploy", "staging-home", "main"], &env);
     assert_eq!(ok.code, 0, "{}", ok.all());
     assert!(work.join(secret).exists(), "the real value reached the command");
-    let ledger = std::fs::read_to_string(work.join("releases/ledger.toml")).expect("ledger");
+    let ledger = ledger_text(&work);
     assert!(!ledger.contains("SECRET-7f3a"), "{ledger}");
     assert!(ledger.contains("{var.out}"));
 }
@@ -548,21 +636,6 @@ fn pushes_are_compare_and_swap() {
 }
 
 #[test]
-fn verify_anchors_the_ledger_to_the_remote() {
-    let (_root, work) = two_entry_ledger("anchor");
-    let ok = edition(&work, &["verify", "--online"]);
-    assert!(ok.stdout.contains("extends the ledger on origin/main"), "{}", ok.stdout);
-    let offline = edition(&work, &["verify"]);
-    assert!(offline.stdout.contains("remote anchor is unverified offline"), "{}", offline.stdout);
-    let path = work.join("releases/ledger.toml");
-    let text = std::fs::read_to_string(&path).expect("ledger");
-    write(&work, "releases/ledger.toml", &text.replacen("note = \"first\"", "note = \"rewritten\"", 1));
-    let bad = edition(&work, &["verify", "--online"]);
-    assert_eq!(bad.code, 1);
-    assert!(bad.stdout.contains("does not extend the ledger on origin/main"), "{}", bad.stdout);
-}
-
-#[test]
 fn the_scanner_fails_closed() {
     let (_root, work) = public_project("fail-closed");
     let loaded = edition::config::Loaded::load(&work.join("edition.toml")).expect("config");
@@ -719,9 +792,8 @@ fn assert_no_secret(work: &Path, outs: &[&Out], events: &Path) {
     for o in outs {
         assert!(!o.all().contains("SECRET"), "{}", o.all());
     }
-    if let Ok(l) = std::fs::read_to_string(work.join("releases/ledger.toml")) {
-        assert!(!l.contains("SECRET"), "{l}");
-    }
+    let l = ledger_text(work);
+    assert!(!l.contains("SECRET"), "{l}");
     if let Ok(e) = std::fs::read_to_string(events) {
         assert!(!e.contains("SECRET"), "{e}");
     }
@@ -766,8 +838,9 @@ fn credentials_in_remote_urls_are_never_shown_or_recorded() {
     let verify = edition_env(&work, &["verify", "--online"], &env);
 
     assert_no_secret(&work, &[&dry, &ok, &deploy, &dry2, &failed, &refused, &verify], &events);
-    let ledger = std::fs::read_to_string(work.join("releases/ledger.toml")).expect("ledger");
-    assert!(ledger.contains("result = \"failed\""), "{ledger}");
+    // The failed push went to an unreachable URL, so its outcome could not be published
+    // there either; Edition says so rather than pretending it was recorded.
+    assert!(failed.stderr.contains("could not publish the ledger entry"), "{}", failed.stderr);
 }
 
 #[test]
@@ -842,7 +915,7 @@ fn credentials_in_any_config_text_never_reach_output_ledger_or_events() {
     assert_eq!(failed.code, 1, "{}", failed.all());
     let verify = edition_env(&work, &["verify", "--online"], &env);
     assert_no_secret(&work, &[&status, &plan, &dry, &failed, &verify], &events);
-    let ledger = std::fs::read_to_string(work.join("releases/ledger.toml")).expect("ledger");
+    let ledger = ledger_text(&work);
     assert!(ledger.contains("result = \"failed\""), "{ledger}");
     assert!(ledger.contains("notes.example.com/page"), "{ledger}");
 }
@@ -973,4 +1046,122 @@ fn a_missing_program_names_the_default_directories_skipped_as_group_writable() {
     let canon = std::fs::canonicalize(dir).expect("canon").display().to_string();
     assert!(out.stderr.contains(&canon), "{}", out.stderr);
     assert!(out.stderr.contains("trust_group_writable"), "{}", out.stderr);
+}
+
+fn write_local(work: &Path, text: &str) {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = work.join(".edition");
+    if !dir.exists() {
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).expect("mkdir");
+    }
+    let p = dir.join("local.toml");
+    std::fs::write(&p, text).expect("write");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+}
+
+#[test]
+fn per_machine_path_entries_follow_the_rules_are_shown_and_bound() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, work) = project("local-path", BASE_CONFIG, "0.6.0-dev");
+    let bin = root.join("local-bin");
+    std::fs::create_dir(&bin).expect("mkdir");
+    let canon = std::fs::canonicalize(&bin).expect("canon").display().to_string();
+
+    // Receipt binding: a dry run without the local file, then the file appears.
+    let r = staging_receipt(&work);
+    write_local(&work, &format!("[run]\npath_prepend = [\"{canon}\"]\n"));
+    let changed = edition(&work, &["deploy", "staging-home", "main", "--apply", "--confirm", &r]);
+    assert_eq!(changed.code, 2, "{}", changed.all());
+    assert!(changed.stderr.contains("does not match this plan"), "{}", changed.stderr);
+
+    // Display, in the plan and in status; and the file is never committed.
+    let dry = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    assert!(dry.stdout.contains(&format!("local path entries: {canon}")), "{}", dry.stdout);
+    assert!(edition(&work, &["status"]).stdout.contains(&format!("local path entries: {canon}")));
+    assert!(git(&work, &["status", "--porcelain"]).is_empty());
+
+    // The same directory rules: group-writable is refused unless trusted locally.
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o775)).expect("chmod");
+    let g = edition(&work, &["status"]);
+    assert_eq!(g.code, 2, "{}", g.all());
+    assert!(g.stderr.contains(".edition/local.toml") && g.stderr.contains("trust_group_writable"), "{}", g.stderr);
+    write_local(&work, &format!("[run]\npath_append = [\"{canon}\"]\ntrust_group_writable = [\"{canon}\"]\n"));
+    let trusted = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(trusted.code, 0, "{}", trusted.all());
+    assert!(
+        trusted.stdout.contains(&format!("trusting group-writable PATH directories: {canon}")),
+        "{}",
+        trusted.stdout
+    );
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+    assert_eq!(edition(&work, &["status"]).code, 2, "other-writable is always refused");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    // The local file itself must not be writable by others or relative.
+    write_local(&work, "[run]\npath_prepend = [\"relative/bin\"]\n");
+    assert_eq!(edition(&work, &["status"]).code, 2);
+    write_local(&work, &format!("[run]\npath_prepend = [\"{canon}\"]\n"));
+    std::fs::set_permissions(work.join(".edition/local.toml"), std::fs::Permissions::from_mode(0o666)).expect("chmod");
+    let open = edition(&work, &["status"]);
+    assert_eq!(open.code, 2, "{}", open.all());
+    assert!(open.stderr.contains("not writable by group or others"), "{}", open.stderr);
+}
+
+#[test]
+fn an_in_tree_ledger_migrates_to_the_branch_once() {
+    let (_root, work) = project("migrate", BASE_CONFIG, "0.6.0-dev");
+    let g = edition::git::Git::new(&work);
+    let path = work.join("releases/ledger.toml");
+    for i in 0..2 {
+        let e = edition::ledger::Entry {
+            id: format!("legacy-{i}"),
+            at: NOW.into(),
+            by: "test".into(),
+            action: "deploy".into(),
+            product: "lib".into(),
+            channel: Some("staging-home".into()),
+            ref_: "main".into(),
+            commit: git(&work, &["rev-parse", "HEAD"]),
+            result: "ok".into(),
+            ..Default::default()
+        };
+        edition::ledger::append(&g, &path, &e).expect("append");
+    }
+    commit_all(&work, "Legacy ledger");
+    git(&work, &["push", "-q", "origin", "main"]);
+    let v = edition(&work, &["verify"]);
+    assert!(v.stdout.contains("edition ledger migrate"), "{}", v.stdout);
+
+    let dry = edition(&work, &["ledger", "migrate"]);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    assert!(dry.stdout.contains("Move 2 ledger entries"), "{}", dry.stdout);
+    assert!(ledger_text(&work).is_empty(), "a dry run publishes nothing");
+    let ok = apply(&work, &["ledger", "migrate"]);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+    let text = ledger_text(&work);
+    assert_eq!(text.matches("[[entry]]").count(), 2, "{text}");
+    let commits = git(&work, &["rev-list", "--count", "refs/edition/ledger"]);
+    assert_eq!(commits, "2", "one commit per entry");
+    let listed = edition(&work, &["ledger"]);
+    assert_eq!(listed.stdout.matches("deploy").count(), 2, "{}", listed.stdout);
+    let v2 = edition(&work, &["verify", "--online"]);
+    assert!(v2.stdout.contains("hash chain intact (2 entries)"), "{}", v2.stdout);
+    assert_eq!(edition(&work, &["ledger", "migrate"]).code, 1, "a second migration is refused");
+}
+
+#[test]
+fn version_help_and_the_detached_head_hint() {
+    let (_root, work) = project("cli", BASE_CONFIG, "0.6.0-dev");
+    let v = edition(&work, &["--version"]);
+    assert_eq!(v.code, 0);
+    assert!(v.stdout.starts_with("edition "), "{}", v.stdout);
+    assert_eq!(edition(&work, &["-V"]).code, 0);
+    let h = edition(&work, &["deploy", "--help"]);
+    assert_eq!(h.code, 0);
+    assert!(h.stdout.contains("USAGE"));
+    git(&work, &["checkout", "-q", "--detach", "HEAD"]);
+    let d = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(d.code, 1);
+    assert!(d.stderr.contains("a branch at the same commit as the remote tip is enough"), "{}", d.stderr);
 }

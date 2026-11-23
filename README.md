@@ -14,7 +14,8 @@ Edition answers three questions from files in the repository, not from memory:
   refs, the configuration, the environment and the remote are exactly as they were
   checked. Pushes are compare-and-swap, and deploy commands get the verified SHA.
 - **What is deployed where?** Each deploy, pushed branch or tag, and forward-merge pull
-  request is appended to a hash-chained ledger in the repository, with the commit, the
+  request is appended to a hash-chained ledger on its own branch (`edition/ledger`, so
+  recording never moves `main`), with the commit, the
   tree, who ran it, the receipt and the steps that ran. `edition verify` checks the
   ledger, tags, version files and pinned dependencies against each other and the remote.
 
@@ -76,6 +77,8 @@ edition forward                        # pull requests: release/* -> main
 
 edition hooks install --apply          # pre-push: content check, versions, pins
 edition ledger --channel staging-home
+edition ledger migrate                 # move an in-tree ledger file to the ledger branch
+edition --version
 ```
 
 Every plan with outward steps refuses to run from a dirty tree or a detached HEAD, and
@@ -87,7 +90,9 @@ and the variables a channel declares), so a deploy script that needs a credentia
 declare it, and must deploy the commit SHA it is given. Edition's own git and gh calls
 also run with a cleared environment, with repository hooks off, and push to the remote
 URL resolved when the plan was made; the plan shows every destination. The ledger's remote anchor is the
-default branch: protect it against force pushes.
+ledger branch: protect it against force pushes. Per-machine tool directories go in the
+git-ignored `.edition/local.toml` (`[run] path_prepend`, `path_append`), under the same
+directory rules, and are shown in every plan.
 
 Exit codes: `0` success or a printed dry run, `1` refused or a failed step, `2` usage,
 configuration or receipt error.
@@ -140,7 +145,7 @@ app: [examples/library](examples/library/edition.toml) and
   as it is.
 - Pull-request heads are mutable: Edition records the head SHA it checked, but the branch
   can move after the pull request is opened.
-- Ledger anchoring depends on a protected remote default branch.
+- Ledger anchoring depends on a protected remote ledger branch.
 - Locking is POSIX advisory locking, which some network filesystems do not honour.
 - Signed-tag setups may need `GPG_TTY` or `GNUPGHOME` declared in `run.tool_env`.
 - Output printed by configured channel commands is passed through to the terminal as-is;

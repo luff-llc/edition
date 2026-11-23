@@ -217,9 +217,31 @@ fn pins(l: &Loaded, git: &Git, online: bool, r: &mut Report) {
 }
 
 fn ledger_checks(l: &Loaded, git: &Git, view: &RemoteView, r: &mut Report) {
-    let path = l.ledger_path();
-    let rel = l.cfg.ledger.clone();
-    let entries = match ledger::load(&path) {
+    let store = crate::ledger_store::Store::new(git, &l.cfg.ledger_branch);
+    let branch = l.cfg.ledger_branch.clone();
+    if l.root.join(&l.cfg.ledger).is_file() {
+        r.warnings.push(format!(
+            "an in-tree ledger exists at {}; move it to the {branch} branch with `edition ledger migrate`",
+            l.cfg.ledger
+        ));
+    }
+    // The remote anchors the ledger: its branch must descend from everything seen
+    // before. Whoever can rewrite that branch on the remote can rewrite the ledger.
+    if view.online() {
+        match store.sync(&view.fetch_url) {
+            Ok(Some(tip)) => {
+                r.ok.push(format!("{branch} on {} is at {} and extends what was seen", view.remote, short(&tip)))
+            }
+            Ok(None) => r.ok.push(format!("{branch}: not on {} yet; nothing recorded", view.remote)),
+            Err(e) => {
+                r.errors.push(e);
+                return;
+            }
+        }
+    } else {
+        r.warnings.push(format!("{branch}: the remote anchor is unverified offline (pass --online)"));
+    }
+    let entries = match store.load_local() {
         Ok(e) => e,
         Err(e) => {
             r.errors.push(e);
@@ -227,81 +249,27 @@ fn ledger_checks(l: &Loaded, git: &Git, view: &RemoteView, r: &mut Report) {
         }
     };
     match ledger::check_chain(git, &entries) {
-        Ok(()) if !entries.is_empty() => r.ok.push(format!("{rel}: hash chain intact ({} entries)", entries.len())),
+        Ok(()) if !entries.is_empty() => r.ok.push(format!("{branch}: hash chain intact ({} entries)", entries.len())),
         Ok(()) => {}
-        Err((_, m)) => r.errors.push(format!("{rel}: hash chain broken: {m}")),
+        Err((_, m)) => r.errors.push(format!("{branch}: hash chain broken: {m}")),
     }
-    // The remote anchors the ledger: the local ledger must extend the one on the
-    // remote's default branch. Whoever can rewrite that branch can rewrite the ledger;
-    // protect it.
-    if view.online() {
-        match view.branch(&l.cfg.main).map(str::to_string) {
-            Some(tip) => {
-                if git.resolve(&tip).is_none() {
-                    let _ = git.run(&["fetch", "-q", "--no-tags", &view.remote, &format!("refs/heads/{}", l.cfg.main)]);
-                }
-                match (git.resolve(&tip), git.show(&tip, &rel)) {
-                    (None, _) => r.errors.push(format!(
-                        "{rel}: {}/{} ({}) could not be fetched; the remote anchor is unverified",
-                        view.remote,
-                        l.cfg.main,
-                        short(&tip)
-                    )),
-                    (Some(_), None) => {
-                        r.ok.push(format!("{rel}: not on {}/{} yet; nothing to anchor", view.remote, l.cfg.main))
-                    }
-                    (Some(_), Some(remote_text)) => {
-                        let local = std::fs::read_to_string(&path).unwrap_or_default();
-                        if local.starts_with(remote_text.trim_end()) {
-                            r.ok.push(format!("{rel} extends the ledger on {}/{}", view.remote, l.cfg.main));
-                        } else {
-                            r.errors.push(format!(
-                                "{rel} does not extend the ledger on {}/{} ({}): local entries were edited, removed or reordered",
-                                view.remote,
-                                l.cfg.main,
-                                short(&tip)
-                            ));
-                        }
-                    }
-                }
-            }
-            None => {
-                r.errors.push(format!("{} has no {} branch; the ledger anchor is unverified", view.remote, l.cfg.main))
+    // Along the branch's first-parent history, each version is a prefix of the next.
+    if let Some(tip) = store.cached() {
+        let versions = store.history(&tip);
+        let mut ok = true;
+        for w in versions.windows(2) {
+            if !w[1].1.starts_with(w[0].1.trim_end()) {
+                ok = false;
+                r.errors.push(format!(
+                    "{branch} was rewritten at {}: the version before it is not a prefix (an entry was edited, removed or reordered)",
+                    short(&w[1].0)
+                ));
+                break;
             }
         }
-    } else {
-        r.warnings.push(format!("{rel}: the remote anchor is unverified offline (pass --online)"));
-    }
-    // Along the first-parent history of main (and then HEAD and the working copy), each
-    // committed version of the ledger must be a prefix of the next.
-    let main_ref = view.branch(&l.cfg.main).map(str::to_string).filter(|c| git.resolve(c).is_some());
-    let mut versions: Vec<(String, String)> = Vec::new();
-    for rev in main_ref.iter().map(String::as_str).chain(std::iter::once("HEAD")) {
-        let commits =
-            git.run(&["log", "--first-parent", "--reverse", "--format=%H", rev, "--", &rel]).unwrap_or_default();
-        for c in commits.lines() {
-            if versions.iter().any(|(h, _)| h == c) {
-                continue;
-            }
-            let text = git.show(c, &rel).unwrap_or_default();
-            versions.push((c.to_string(), text));
+        if ok && versions.len() > 1 {
+            r.ok.push(format!("{branch} is append-only across {} commit(s)", versions.len()));
         }
-    }
-    versions.push(("the working copy".into(), std::fs::read_to_string(&path).unwrap_or_default()));
-    let mut history_ok = true;
-    for w in versions.windows(2) {
-        let (prev, next) = (&w[0], &w[1]);
-        if !next.1.starts_with(prev.1.trim_end()) {
-            history_ok = false;
-            let at = if next.0.len() == 40 { short(&next.0).to_string() } else { next.0.clone() };
-            r.errors.push(format!(
-                "{rel} was rewritten at {at}: the version before it is not a prefix (an entry was edited, removed or reordered)"
-            ));
-            break;
-        }
-    }
-    if history_ok && versions.len() > 1 {
-        r.ok.push(format!("{rel} is append-only across {} committed version(s)", versions.len() - 1));
     }
     let mut ids: Vec<&str> = Vec::new();
     for e in &entries {

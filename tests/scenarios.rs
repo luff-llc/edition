@@ -14,7 +14,7 @@ fn cut_rc_and_tag_follow_the_line_model() {
     assert!(dry.stdout.contains("[OUTWARD] publish release/0.6"));
     assert!(dry.stdout.contains("requires remote refs/heads/release/0.6 = absent"));
     let receipt = dry.receipt();
-    assert!(!work.join("releases/ledger.toml").exists());
+    assert!(ledger_text(&work).is_empty());
 
     let unconfirmed = edition(&work, &["cut", "0.6", "--apply"]);
     assert_eq!(unconfirmed.code, 2, "{}", unconfirmed.all());
@@ -24,7 +24,7 @@ fn cut_rc_and_tag_follow_the_line_model() {
     let applied = edition(&work, &["cut", "0.6", "--apply", "--confirm", &receipt]);
     assert_eq!(applied.code, 0, "{}", applied.all());
     assert!(git(&work, &["ls-remote", "--heads", "origin"]).contains("refs/heads/release/0.6"));
-    let ledger = std::fs::read_to_string(work.join("releases/ledger.toml")).expect("ledger");
+    let ledger = ledger_text(&work);
     assert!(ledger.contains("action = \"push-branch\""));
     assert!(ledger.contains("by = \"test-agent\""));
     assert!(ledger.contains(&format!("receipt = \"{receipt}\"")));
@@ -98,7 +98,7 @@ fn staging_takes_only_the_tip_of_main() {
     let ok = apply(&work, &["deploy", "staging-home", "main"]);
     assert_eq!(ok.code, 0, "{}", ok.all());
     assert_eq!(std::fs::read_to_string(work.join("staging-deploys.txt")).expect("deployed").trim(), tip);
-    let ledger = std::fs::read_to_string(work.join("releases/ledger.toml")).expect("ledger");
+    let ledger = ledger_text(&work);
     assert!(ledger.contains("tier = \"staging\""));
     assert!(ledger.contains(&format!("commit = \"{tip}\"")));
     assert!(ledger.contains("check unit: exit 0"));
@@ -119,7 +119,7 @@ fn dev_tier_runs_locally_and_records_nothing() {
     let out = edition(&work, &["deploy", "local", "wip", "--apply"]);
     assert_eq!(out.code, 0, "{}", out.all());
     assert_eq!(std::fs::read_to_string(work.join("dev-deploys.txt")).expect("ran").trim(), wip);
-    assert!(!work.join("releases/ledger.toml").exists(), "dev deploys are never recorded");
+    assert!(ledger_text(&work).is_empty(), "dev deploys are never recorded");
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn prod_needs_a_final_tag_on_the_remote_and_an_approval() {
 
     let ok = apply(&work, &["deploy", "production-home", "v0.6.0", "--approved-by", "owner"]);
     assert_eq!(ok.code, 0, "{}", ok.all());
-    let ledger = std::fs::read_to_string(work.join("releases/ledger.toml")).expect("ledger");
+    let ledger = ledger_text(&work);
     assert!(ledger.contains("approved_by = \"owner\""));
     assert!(ledger.contains("ref = \"v0.6.0\""));
 
@@ -250,7 +250,7 @@ fn hotfix_start_then_finish_tags_and_opens_the_forward_merge_in_one_plan() {
         ),
         "{calls}"
     );
-    let ledger = std::fs::read_to_string(work.join("releases/ledger.toml")).expect("ledger");
+    let ledger = ledger_text(&work);
     assert!(ledger.contains("action = \"push-tag\""));
     assert!(ledger.contains("action = \"open-pr\""));
     assert!(ledger.contains(&format!("commit = \"{fix}\"")));
@@ -538,7 +538,7 @@ fn one_version_many_platforms_with_gates_before_production() {
     let ok = apply(&work, &["deploy", "app-store", "v1.2.0"]);
     assert_eq!(ok.code, 0, "{}", ok.all());
     assert!(ok.stdout.contains("gate: testflight-external already holds"));
-    let ledger = std::fs::read_to_string(work.join("releases/ledger.toml")).expect("ledger");
+    let ledger = ledger_text(&work);
     assert!(ledger.contains("2/2 carried items ready on every platform"), "{ledger}");
     assert!(ledger.contains("platform = \"ios\""));
 

@@ -243,6 +243,28 @@ impl Git {
         self.run(&["config", "user.name"]).ok().filter(|s| !s.is_empty())
     }
 
+    /// Runs git with `input` on standard input.
+    pub fn run_input(&self, args: &[&str], input: &str) -> Result<String, String> {
+        use std::io::Write;
+        let mut child = self
+            .command(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot run git: {e}"))?;
+        child.stdin.take().ok_or("no stdin for git")?.write_all(input.as_bytes()).map_err(|e| e.to_string())?;
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(crate::util::redact(&format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
     /// Git's object hash of `text` (as a blob). Used for receipts and the ledger chain.
     pub fn hash(&self, text: &str) -> Result<String, String> {
         use std::io::Write;

@@ -200,6 +200,11 @@ pub struct Plan {
     /// Default `PATH` directories skipped for being group-writable (named when a program
     /// is not found).
     pub skipped_dirs: Vec<String>,
+    /// Where the ledger entry is published: `(branch, push URL)`. The push is a
+    /// compare-and-swap on that branch, run after the plan's steps.
+    pub record_to: Option<(String, String)>,
+    /// Per-machine `PATH` entries from `.edition/local.toml` (printed and hashed).
+    pub local_dirs: Vec<String>,
 }
 
 impl Plan {
@@ -240,8 +245,15 @@ impl Plan {
         if !self.trusted_dirs.is_empty() {
             crate::say!("  trusting group-writable PATH directories: {}", self.trusted_dirs.join(", "));
         }
+        if !self.local_dirs.is_empty() {
+            crate::say!("  local path entries: {}", self.local_dirs.join(", "));
+        }
         for s in &self.steps {
             crate::say!("{}", s.display());
+        }
+        if let Some((branch, url)) = &self.record_to {
+            crate::say!("  [OUTWARD] record the outcome on the {branch} branch (compare-and-swap)");
+            crate::say!("      destination: {url}");
         }
     }
 
@@ -253,6 +265,12 @@ impl Plan {
         t.push_str(&format!("config {config_digest}\nremote {}\nrun-path {:?}\n", self.remote, self.run_path));
         for d in &self.trusted_dirs {
             t.push_str(&format!("trusted-group-writable {d:?}\n"));
+        }
+        for d in &self.local_dirs {
+            t.push_str(&format!("local-path {d:?}\n"));
+        }
+        if let Some((branch, url)) = &self.record_to {
+            t.push_str(&format!("record {branch:?} {url:?}\n"));
         }
         for f in &self.facts {
             t.push_str(&format!("fact {f:?}\n"));

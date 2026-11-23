@@ -57,22 +57,40 @@ impl Ctx {
 
     /// Binds a plan to the remote's resolved URLs: reads and re-checks go to the fetch
     /// URL, pushes to the push URL, and all three URLs are part of the plan hash.
-    fn bind(&self, plan: &mut Plan, view: &RemoteView) {
+    fn bind(&self, plan: &mut Plan, view: &RemoteView) -> Result<(), String> {
         plan.remote = view.fetch_url.clone();
         plan.fact("fetch-url", &view.fetch_url);
         plan.fact("push-url", &view.push_url);
         plan.fact("configured-url", &view.raw_url);
+        // The ledger is read from, and will be pushed to, the same remote.
+        self.store().sync(&view.fetch_url)?;
+        plan.record_to = Some((self.l.cfg.ledger_branch.clone(), view.push_url.clone()));
+        Ok(())
     }
 
-    /// Outward plans run from a clean checkout on a branch, so the ledger is committed
-    /// on top of exactly what was checked.
+    pub fn store(&self) -> crate::ledger_store::Store<'_> {
+        crate::ledger_store::Store::new(&self.git, &self.l.cfg.ledger_branch)
+    }
+
+    /// Ledger entries: synchronised with the remote when online, else as last seen.
+    fn entries(&self, view: Option<&RemoteView>) -> Result<Vec<Entry>, String> {
+        if let Some(v) = view.filter(|v| v.online()) {
+            self.store().sync(&v.fetch_url)?;
+        }
+        self.store().load_local()
+    }
+
+    /// Outward plans run from a clean checkout on a branch, so the configuration and
+    /// version files are exactly what was committed.
     fn clean_problems(&self) -> Vec<String> {
         let mut p = Vec::new();
         if self.git.is_detached() {
-            p.push("HEAD is detached; check out a branch before running an outward plan".into());
+            p.push(format!(
+                "HEAD is detached; check out a branch first (a branch at the same commit as the remote tip is enough, for example `git switch -c release-run {}/{}`)",
+                self.l.cfg.remote, self.l.cfg.main
+            ));
         }
-        let ledger = self.l.cfg.ledger.clone();
-        let dirty: Vec<String> = self.git.dirty_paths().into_iter().filter(|d| *d != ledger).collect();
+        let dirty: Vec<String> = self.git.dirty_paths();
         if !dirty.is_empty() {
             p.push(format!("the working tree has uncommitted changes: {}", dirty.join(", ")));
         }
@@ -190,7 +208,7 @@ impl Ctx {
         }
     }
 
-    fn record(&self, e: &Entry) -> Result<Entry, String> {
+    fn record(&self, e: &Entry, plan: &Plan) -> Result<Entry, String> {
         // Nothing that reaches the ledger may carry credentials from a URL.
         let r = crate::util::redact;
         let mut e = e.clone();
@@ -202,7 +220,11 @@ impl Ctx {
         e.target = e.target.as_deref().map(r);
         e.note = e.note.as_deref().map(r);
         let e = &e;
-        let written = ledger::append(&self.git, &self.l.ledger_path(), e)?;
+        let Some((branch, push_url)) = &plan.record_to else {
+            return Err("this plan has no ledger destination".into());
+        };
+        let written = self.store().append(&plan.remote, push_url, e)?;
+        let _ = branch;
         let kind = if e.action == "deploy" { "channel-updated" } else { "ref-published" };
         crate::util::emit_event(
             kind,
@@ -215,12 +237,12 @@ impl Ctx {
                 ("by", &e.by),
             ],
         );
-        crate::say!("recorded {} ({}) in {}", e.id, e.result, self.l.cfg.ledger);
+        crate::say!("recorded {} ({}) on the {} branch", e.id, e.result, self.l.cfg.ledger_branch);
         Ok(written)
     }
 
     fn receipt_used(&self) -> impl Fn(&str) -> bool {
-        let entries = ledger::load(&self.l.ledger_path()).unwrap_or_default();
+        let entries = self.store().load_local().unwrap_or_default();
         move |r: &str| entries.iter().any(|e| e.receipt.as_deref() == Some(r))
     }
 
@@ -235,6 +257,7 @@ impl Ctx {
         plan.tool_env = self.git.env.clone();
         plan.trusted_dirs = self.l.trusted_dirs.clone();
         plan.skipped_dirs = self.l.skipped_dirs.clone();
+        plan.local_dirs = self.l.local_dirs.clone();
         if let Err(e) = plan.resolve() {
             return refuse(&[e]);
         }
@@ -262,7 +285,7 @@ impl Ctx {
                     }
                     e.receipt = receipt.clone();
                     e.overrides = overrides.to_vec();
-                    self.record(&e)?;
+                    self.record(&e, plan)?;
                 }
                 let all_ok = stopped.is_none() && outcomes.iter().all(|o| o.ok());
                 Ok(if all_ok { 0 } else { 1 })
@@ -285,6 +308,9 @@ pub fn status(c: &Ctx) -> Res {
     let l = &c.l;
     let view = c.view()?;
     crate::say!("Edition: {} ({})", l.cfg.product, l.root.display());
+    if !l.local_dirs.is_empty() {
+        crate::say!("local path entries: {}", l.local_dirs.join(", "));
+    }
     let main = &l.cfg.main;
     match view.branch(main) {
         Some(tip) => {
@@ -320,14 +346,21 @@ pub fn status(c: &Ctx) -> Res {
     if !any {
         crate::say!("line   none");
     }
-    let entries = ledger::load(&l.ledger_path())?;
+    let entries = c.entries(Some(&view))?;
     let current = ledger::current_by_channel(&entries);
     crate::say!("\nchannels:");
     for (name, ch) in &l.cfg.channels {
         let held = current
             .iter()
             .find(|(n, _)| n == name)
-            .map(|(_, e)| format!("{} ({}) {}", e.ref_, short(&e.commit), e.at))
+            .map(|(_, e)| {
+                let freshness = match (ch.tier, view.branch(&l.cfg.main)) {
+                    (Tier::Staging, Some(tip)) if tip == e.commit => ", current",
+                    (Tier::Staging, Some(_)) => ", behind main",
+                    _ => "",
+                };
+                format!("{} ({}) {}{freshness}", e.ref_, short(&e.commit), e.at)
+            })
             .unwrap_or_else(
                 || if ch.tier == Tier::Dev { "not recorded (dev)".into() } else { "nothing recorded".into() },
             );
@@ -549,7 +582,9 @@ pub fn cut(c: &Ctx, line: &str) -> Res {
         Err(e) => problems.push(e),
     }
     let mut plan = Plan::new(&format!("Cut the {line} line from {}", short(&from_commit)), &l.cfg.remote);
-    c.bind(&mut plan, &view);
+    if let Err(e) = c.bind(&mut plan, &view) {
+        return refuse(&[e]);
+    }
     let (content, overrides) = c.content_gate(&view, std::slice::from_ref(&from_commit), &mut plan);
     problems.extend(content);
     if !problems.is_empty() {
@@ -700,7 +735,9 @@ fn tag_plan(c: &Ctx, version: &str, pre: bool) -> Res {
     let Some(t) = tag_parts(c, &view, version, pre, &mut problems) else { return refuse(&problems) };
     let title = format!("{} {} at {}", if pre { "Pre-release" } else { "Release" }, t.name, short(&t.commit));
     let mut plan = Plan::new(&title, &c.l.cfg.remote);
-    c.bind(&mut plan, &view);
+    if let Err(e) = c.bind(&mut plan, &view) {
+        return refuse(&[e]);
+    }
     let (content, overrides) = c.content_gate(&view, std::slice::from_ref(&t.commit), &mut plan);
     problems.extend(content);
     if !problems.is_empty() {
@@ -772,7 +809,9 @@ pub fn hotfix_finish(c: &Ctx, version: &str) -> Res {
         return refuse(&[format!("{} has no {} branch", l.cfg.remote, l.cfg.main)]);
     };
     let mut plan = Plan::new(&format!("Finish hotfix {} at {}", t.name, short(&t.commit)), &l.cfg.remote);
-    c.bind(&mut plan, &view);
+    if let Err(e) = c.bind(&mut plan, &view) {
+        return refuse(&[e]);
+    }
     let (content, overrides) = c.content_gate(&view, std::slice::from_ref(&t.commit), &mut plan);
     problems.extend(content);
     if !problems.is_empty() {
@@ -856,7 +895,9 @@ pub fn forward(c: &Ctx) -> Res {
         return refuse(&[format!("{} has no {} branch", l.cfg.remote, l.cfg.main)]);
     };
     let mut plan = Plan::new("Forward merges", &l.cfg.remote);
-    c.bind(&mut plan, &view);
+    if let Err(e) = c.bind(&mut plan, &view) {
+        return refuse(&[e]);
+    }
     plan.fact("action", "forward");
     let mut records = Vec::new();
     for (name, tip) in &view.branches {
@@ -1059,7 +1100,7 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
     }
     // Readiness gate: channels that must already hold this commit, per the ledger.
     if !ch.requires.is_empty() {
-        let entries = ledger::load(&l.ledger_path())?;
+        let entries = c.entries(Some(&view))?;
         for req in &ch.requires {
             let held = entries.iter().any(|e| {
                 e.action == "deploy"
@@ -1115,7 +1156,9 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
     let title = format!("Deploy {r} ({}) to {channel} [{} tier, {}]", short(&commit), ch.tier.name(), ch.target);
     let mut plan = Plan::new(&title, &l.cfg.remote);
     if !dev {
-        c.bind(&mut plan, &view);
+        if let Err(e) = c.bind(&mut plan, &view) {
+            return refuse(&[e]);
+        }
     }
     for (k, v) in [
         ("action", "deploy"),
@@ -1195,7 +1238,7 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
         }
     }
     if !dev {
-        steps_list.push(Step::note(&format!("append an entry to {}", l.cfg.ledger)));
+        steps_list.push(Step::note(&format!("append an entry to the {} branch", l.cfg.ledger_branch)));
     }
     plan.steps = steps_list;
     if dev {
@@ -1230,7 +1273,8 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
 /// commit must carry a release tag; promote never tags anything itself.
 pub fn promote(c: &Ctx, from: &str, to: &str) -> Res {
     let l = &c.l;
-    let entries = ledger::load(&l.ledger_path())?;
+    let view = c.view()?;
+    let entries = c.entries(Some(&view))?;
     let current = ledger::current_by_channel(&entries);
     let Some((_, held)) = current.iter().find(|(n, _)| n == from) else {
         return refuse(&[format!("the ledger records nothing on {from}")]);
@@ -1268,7 +1312,8 @@ pub fn promote(c: &Ctx, from: &str, to: &str) -> Res {
 // ---------------------------------------------------------------- ledger
 
 pub fn ledger_cmd(c: &Ctx, channel: Option<&str>) -> Res {
-    let entries = ledger::load(&c.l.ledger_path())?;
+    let view = c.view()?;
+    let entries = c.entries(Some(&view))?;
     let mut n = 0;
     for e in entries.iter().filter(|e| channel.is_none_or(|ch| e.channel.as_deref() == Some(ch))) {
         n += 1;
@@ -1284,7 +1329,7 @@ pub fn ledger_cmd(c: &Ctx, channel: Option<&str>) -> Res {
         );
     }
     if n == 0 {
-        crate::say!("(no entries in {})", c.l.cfg.ledger);
+        crate::say!("(no entries on the {} branch)", c.l.cfg.ledger_branch);
     }
     Ok(0)
 }
@@ -1325,4 +1370,66 @@ pub fn hooks_install(c: &Ctx) -> Res {
     }
     crate::say!("installed");
     Ok(0)
+}
+
+// ---------------------------------------------------------------- ledger migrate
+
+/// Moves an in-tree ledger file (from before the ledger branch) to the ledger branch:
+/// one commit per entry, published with a push that requires the branch to be absent.
+pub fn ledger_migrate(c: &Ctx) -> Res {
+    let l = &c.l;
+    let file = l.root.join(&l.cfg.ledger);
+    let text = std::fs::read_to_string(&file)
+        .map_err(|e| format!("there is no in-tree ledger to migrate at {} ({e})", l.cfg.ledger))?;
+    let entries = ledger::parse(&text).map_err(|e| format!("{}: {e}", l.cfg.ledger))?;
+    if let Err((_, m)) = ledger::check_chain(&c.git, &entries) {
+        return refuse(&[format!("{}: the hash chain is broken ({m}); it cannot be migrated as it is", l.cfg.ledger)]);
+    }
+    let mut problems = c.input_problems();
+    problems.extend(c.clean_problems());
+    let view = c.live_view()?;
+    let branch = l.cfg.ledger_branch.clone();
+    if view.branch(&branch).is_some() {
+        problems.push(format!("{} already has a {branch} branch; nothing to migrate onto", view.remote));
+    }
+    if !problems.is_empty() {
+        return refuse(&problems);
+    }
+    let staging = "refs/edition/ledger-migrate";
+    let mut plan = Plan::new(
+        &format!("Move {} ledger entries from {} to the {branch} branch", entries.len(), l.cfg.ledger),
+        &l.cfg.remote,
+    );
+    plan.remote = view.fetch_url.clone();
+    plan.fact("fetch-url", &view.fetch_url);
+    plan.fact("push-url", &view.push_url);
+    plan.fact("ledger-sha256", &crate::util::sha256_hex(text.as_bytes()));
+    plan.steps = vec![
+        Step::note(&format!("build {branch} locally: one commit per entry, entries unchanged")),
+        c.git_step(
+            Kind::Outward,
+            &format!("publish {branch}"),
+            &[
+                "push",
+                "--atomic",
+                &format!("--force-with-lease=refs/heads/{branch}:"),
+                &view.push_url,
+                &format!("{staging}:refs/heads/{branch}"),
+            ],
+        )
+        .expecting(&format!("refs/heads/{branch}"), None)
+        .to(&view.push_url),
+        Step::note(&format!("then remove {} in an ordinary commit", l.cfg.ledger)),
+    ];
+    if c.mode.apply {
+        c.store().build_history(&entries, staging)?;
+    }
+    let code = c.run(&plan, Vec::new(), &[])?;
+    if c.mode.apply && code == 0 {
+        if let Some(tip) = c.git.resolve(staging) {
+            c.git.run(&["update-ref", crate::ledger_store::CACHE, &tip])?;
+        }
+        crate::say!("migrated; remove {} from the tree in an ordinary commit", l.cfg.ledger);
+    }
+    Ok(code)
 }

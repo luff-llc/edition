@@ -169,7 +169,7 @@ pub fn check_chain(git: &Git, entries: &[Entry]) -> Result<(), (usize, String)> 
 
 /// The entry with URL credentials removed from every free-text field: nothing recorded
 /// may carry them.
-fn redacted(e: &Entry) -> Entry {
+pub fn redacted(e: &Entry) -> Entry {
     let r = crate::util::redact;
     let o = |v: &Option<String>| v.as_deref().map(r);
     let l = |v: &[String]| v.iter().map(|x| r(x)).collect::<Vec<_>>();

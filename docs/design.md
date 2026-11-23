@@ -159,8 +159,9 @@ deploy script must deploy by SHA. The one remaining gap is the forward-merge pul
 request, which names a branch that can move after it is opened; Edition records the head
 SHA it checked in the ledger entry and in the pull request body.
 
-Outward plans also refuse a dirty working tree (other than the ledger) and a detached
-HEAD, so the ledger is committed on top of exactly what was checked.
+Outward plans also refuse a dirty working tree and a detached HEAD, so the configuration
+and version files are exactly what was committed. A branch at the same commit as the
+remote tip is enough.
 
 ### Commands, placeholders and secrets
 
@@ -185,6 +186,30 @@ HEAD, so the ledger is committed on top of exactly what was checked.
   variable (for example `env = { DEPLOY_TOKEN = "{var.deploy_token}" }`). The program is
   resolved to an absolute path when the plan is made, and that path is part of the plan
   hash.
+
+### Per-machine PATH
+
+A tool that lives in a directory only one machine has (for example `~/.local/bin`) is
+added in `.edition/local.toml`, which is never committed:
+
+```toml
+[run]
+path_prepend = ["~/.local/bin"]
+path_append = []
+trust_group_writable = []
+```
+
+The entries follow exactly the same directory rule as `[run] path`, with this file's
+`trust_group_writable` added to the committed one; a failing entry refuses the
+configuration. The file and `.edition/` must be owned by the user, not be links, and not
+be writable by group or others. Plans print `local path entries: ...`, and the entries
+are part of the plan hash, so a receipt still binds what will run.
+
+A file, rather than environment variables such as `EDITION_PATH_PREPEND`, because it is
+persistent and visible per checkout, lives in the private state directory with the same
+ownership checks as the receipts, and can carry its own trust list. Edition deliberately
+distrusts ambient environment elsewhere (git, gh and configured commands all run with a
+cleared environment); a PATH that any parent process could extend would undo that.
 
 ### git and gh
 
@@ -258,34 +283,54 @@ detectable.
 
 ### The ledger
 
-`releases/ledger.toml` (configurable) is an append-only list of `[[entry]]` tables, one
-per outward action: `deploy`, `push-branch`, `push-tag`, `open-pr`. Each entry records
-the time, the actor, the channel and tier, the ref and commit, the tree hash, the
-version, platform and build, the result, the receipt, the approval, the step's configured
-command (never expanded values), every step that ran with its exit code, gate evidence,
-every pin with its tag, and any content findings explicitly allowed.
+The ledger is a file, `ledger.toml`, on its own orphan branch (`ledger_branch`, default
+`edition/ledger`), never in the product's history. Keeping it out of `main` matters: the
+staging tier accepts exactly the tip of `main`, so a ledger committed to `main` would move
+`main` with every recorded deploy, leave staging permanently one commit behind, and start
+CI for every record.
 
+It is an append-only list of `[[entry]]` tables, one per outward action: `deploy`,
+`push-branch`, `push-tag`, `open-pr`. Each entry records the time, the actor, the
+channel and tier, the ref and commit, the tree hash, the version, platform and build, the
+result, the receipt, the approval, the step's configured command (never expanded
+values), every step that ran with its exit code, gate evidence, every pin with its tag,
+and any content findings explicitly allowed. Entries are redacted before they are
+written.
+
+- **Writing.** Every plan that records ends with one more outward step, printed with the
+  plan and bound in its receipt: publish the outcome on the ledger branch of the same
+  remote. Edition builds the commit with plumbing (`hash-object`, `mktree`,
+  `commit-tree`), so the checkout is never touched, and pushes it with
+  `--force-with-lease` on the tip it read. If another recorder won the race, Edition
+  re-reads the branch, re-chains the entry and tries again (up to eight times). A failed
+  or partial action is recorded the same way. If the remote cannot be reached at all,
+  Edition says the outcome could not be published.
 - **Results.** `ok`: the step and everything after it succeeded. `partial`: the outward
   step succeeded and a later step (a probe, a Concordance record) failed, or a later
   outward step was stopped. `failed`: the outward step failed, a check before it failed,
   or a remote expectation stopped it.
 - **Hash chain.** Each entry's `prev` is Git's hash of the previous entry's canonical
-  text (the first entry's is all zeros). Appends take a lock (`ledger.toml.lock`), check
-  the existing chain, and refuse to extend a broken one.
-- **History.** `verify` checks the chain, and that along the first-parent history of
-  `main` (then HEAD, then the working copy) every committed version of the ledger is a
-  prefix of the next. An edit, removal or reordering is reported with the first commit
-  that introduced it.
-- **Anchor.** `verify --online` reads the ledger on the remote's default branch and
-  requires the local ledger to extend it; offline it says the anchor is unverified. The
-  anchor is only as strong as that branch: whoever can rewrite the remote default branch
-  can rewrite the ledger. Protect it (no force pushes, required reviews).
+  text (the first entry's is all zeros). A broken chain is never extended.
+- **History.** Each commit on the branch appends one entry; `verify` checks the chain and
+  that along the branch's first-parent history every version is a prefix of the next,
+  naming the first commit that edited, removed or reordered an entry.
+- **Anchor.** Edition keeps the last remote tip it saw in `refs/edition/ledger`. Every
+  outward plan and `verify --online` read the remote branch and refuse a tip that does not
+  descend from it (a force push, a deletion). Offline, `verify` says the anchor is
+  unverified. The anchor is only as strong as the remote: protect the ledger branch
+  against force pushes and deletion.
+- **Reading.** `status`, `ledger`, `promote` and the `requires` gate read the branch
+  (synchronised first when the remote is read, as it always is for outward plans).
 - Dev-tier deploys are never recorded.
 - `verify` checks every successful entry: its commit is reachable from the remote; a
   staging entry's commit is on `main`; a prod entry's ref is a release tag at that commit.
-- "What is deployed where" is the latest successful entry per channel.
-
-The ledger is committed with the repository's other changes, through its normal review.
+- "What is deployed where" is the latest successful entry per channel; `status` also says
+  whether each staging channel is current with `main`.
+- **Migration.** A repository with an in-tree ledger file (`ledger`, default
+  `releases/ledger.toml`) gets a warning from `verify`; `edition ledger migrate` (a dry run
+  first, then the receipt) publishes it as the ledger branch, one commit per entry, with a
+  push that requires the branch not to exist. Remove the file afterwards in an ordinary
+  commit.
 
 ### Content check
 
@@ -314,6 +359,9 @@ in `[content] allow_paths` or it is allowed by id for one run.
   not on a release tag.
 - **`verify`** scans the tracked tree and commits not yet on each public remote, and
   fails on a finding when the action is `block`.
+- **The ledger branch** is pushed to the same remote, public or not. It is not scanned:
+  its only content is ledger entries, which Edition writes itself and redacts before
+  writing.
 
 ## How it fits with other tools
 
@@ -351,7 +399,9 @@ offset. Edition never reads it back.
 
 | Key | Meaning |
 | --- | --- |
-| `product`, `remote`, `main`, `ledger` | product name; the remote (default `origin`); the main branch; the ledger path |
+| `product`, `remote`, `main` | product name; the remote (default `origin`); the main branch |
+| `ledger_branch` | the orphan branch that holds the ledger (default `edition/ledger`) |
+| `ledger` | where an in-tree ledger from before the ledger branch lives, for `edition ledger migrate` (default `releases/ledger.toml`) |
 | `[tags] final`, `prerelease`, `prerelease_files` | tag templates (`v{version}`, `v{version}-rc.{n}`); what version files say at a candidate (`base` or `full`) |
 | `[lines] branch`, `dev_suffix`, `hotfix_branch` | `release/{line}`; `dev`; `hotfix/{version}` |
 | `[[version_files]] path`, `pattern`, `after` | where the version is stated |

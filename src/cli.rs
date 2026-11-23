@@ -22,7 +22,9 @@ USAGE
   edition check-push <remote> [<url>]    content, version and pin checks for a push
   edition hooks install                  install the pre-push hook that runs check-push
   edition verify [--online]              check every invariant (exit 1 on error)
-  edition ledger [--channel C]           print the ledger
+  edition ledger [--channel C]           print the ledger (from the ledger branch)
+  edition ledger migrate                 move an in-tree ledger file to the ledger branch
+  edition --version | --help
 
 OPTIONS
   -C, --config <path>   edition.toml (default: found in this directory or a parent)
@@ -89,7 +91,15 @@ fn parse(args: &[String]) -> Result<Opts, String> {
 }
 
 pub fn run(args: &[String]) -> i32 {
-    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
+    if matches!(args.first().map(String::as_str), Some("-V" | "--version")) {
+        crate::say!("edition {}", env!("CARGO_PKG_VERSION"));
+        return 0;
+    }
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        crate::say!("{USAGE}");
+        return 0;
+    }
+    if args.is_empty() || matches!(args[0].as_str(), "help") {
         crate::say!("{USAGE}");
         return if args.is_empty() { 2 } else { 0 };
     }
@@ -166,7 +176,11 @@ fn dispatch(o: Opts) -> Result<i32, String> {
             r.print();
             Ok(if r.errors.is_empty() { 0 } else { 1 })
         }
-        "ledger" => commands::ledger_cmd(&ctx, o.channel.as_deref()),
+        "ledger" => match p.get(1).map(String::as_str) {
+            Some("migrate") => commands::ledger_migrate(&ctx),
+            Some(other) => Err(format!("unknown ledger step {other}")),
+            None => commands::ledger_cmd(&ctx, o.channel.as_deref()),
+        },
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     }
 }
