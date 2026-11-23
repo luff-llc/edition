@@ -153,6 +153,12 @@ app: [examples/library](examples/library/edition.toml) and
   Edition does not redact it.
 - Trusting a group-writable directory (`[run] trust_group_writable`) lets any member of
   that group replace the tools Edition runs.
+- Pending outcomes (`.edition/pending/`) are editable by processes running as the same
+  user.
+- A crash can leave a step recorded as `unknown`, which needs operator judgment at
+  `edition ledger reconcile`.
+- Concurrent writers to the working tree are outside the filesystem-safety boundary: the
+  configured-path checks are not atomic.
 
 ## Development
 

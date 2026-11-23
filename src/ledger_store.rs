@@ -49,7 +49,7 @@ impl<'a> Store<'a> {
     /// Entries as last seen (offline: unverified against the remote).
     pub fn load_local(&self) -> Result<Vec<Entry>, String> {
         match self.cached() {
-            Some(c) => ledger::parse(&self.text_at(&c)).map_err(|e| format!("{}:{FILE}: {e}", self.branch)),
+            Some(c) => ledger::parse_ledger(&self.text_at(&c)).map_err(|e| format!("{}:{FILE}: {e}", self.branch)),
             None => Ok(Vec::new()),
         }
     }
@@ -126,7 +126,8 @@ impl<'a> Store<'a> {
         let (mut last_hash, mut ids, mut lines) = match seen {
             Some(s) => {
                 let text = self.text_at(s);
-                let entries = ledger::parse(&text).map_err(|e| bad(s, &format!("its ledger does not parse: {e}")))?;
+                let entries =
+                    ledger::parse_ledger(&text).map_err(|e| bad(s, &format!("its ledger does not parse: {e}")))?;
                 let last = match entries.last() {
                     Some(e) => ledger::entry_hash(self.git, e)?,
                     None => ledger::GENESIS.to_string(),
@@ -250,7 +251,7 @@ impl<'a> Store<'a> {
     /// Builds a commit that appends `entry` on top of `base` (or a root commit).
     fn commit_on(&self, base: Option<&str>, entry: &Entry) -> Result<(String, Entry), String> {
         let text = base.map(|b| self.text_at(b)).unwrap_or_default();
-        let entries = ledger::parse(&text).map_err(|e| format!("the ledger branch is invalid: {e}"))?;
+        let entries = ledger::parse_ledger(&text).map_err(|e| format!("the ledger branch is invalid: {e}"))?;
         ledger::check_chain(self.git, &entries).map_err(|(_, m)| format!("the ledger chain is broken: {m}"))?;
         let mut e = ledger::redacted(entry);
         e.prev = match entries.last() {
@@ -300,7 +301,7 @@ impl<'a> Store<'a> {
         let mut base: Option<String> = None;
         let mut chained: Vec<Entry> = Vec::new();
         for e in entries {
-            // Keep each entry exactly as recorded; only `prev` is recomputed if missing.
+            // The entries arrive chained for format 2.
             let mut text = if chained.is_empty() {
                 ledger::HEADER.to_string()
             } else {

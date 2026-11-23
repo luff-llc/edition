@@ -175,8 +175,15 @@ remote tip is enough.
   repository (no `..`, not absolute): `bump` writes version files and `ledger migrate`
   reads the legacy ledger. Every component of such a path is checked with `lstat` from
   the repository root and a symbolic link anywhere refuses it; the file is opened with
-  `O_NOFOLLOW`; `bump` writes a new file beside the old one (same mode), checks the path
-  again, and renames it into place, so no write passes through a link. The content scan
+  `O_NOFOLLOW`; `bump` writes a new file beside the old one (same mode) and renames it
+  into place, so no write passes through a link. Before and after creating the new file,
+  and just before and just after the rename, it re-checks the path and compares the
+  parent directory's and the new file's device and inode; a change before the rename
+  aborts and removes the new file, and a change seen after it is reported. **Residual:**
+  without `openat`/`renameat` the parent is named by path at each step, so a process that
+  can write to that directory can still swap it in the moments between the last check and
+  the rename; Edition detects that afterwards but cannot prevent it. Concurrent writers to
+  the working tree are outside this boundary. The content scan
   reads a tracked link as its target text and never follows it.
 - Ledger validation accepts only mode 100644 for `ledger.toml` and rejects any other diff
   metadata (mode changes, renames, copies, deletions, binary changes).
@@ -344,8 +351,13 @@ written.
   step succeeded and a later step (a probe, a Concordance record) failed, or a later
   outward step was stopped. `failed`: the outward step failed, a check before it failed,
   or a remote expectation stopped it.
-- **Hash chain.** Each entry's `prev` is Git's hash of the previous entry's canonical
-  text (the first entry's is all zeros). A broken chain is never extended.
+- **Hash chain and format.** The file starts with `format = 2`. Each entry's `prev` is
+  the SHA-256 of the previous entry's canonical text (64 zeros for the first), computed
+  by Edition itself, so the chain is the same in SHA-1 and SHA-256 git repositories. A
+  broken chain is never extended, and a file without the marker or with another format
+  is refused. Format 1 (no marker, chained with the repository's `git hash-object`) is
+  converted by `edition ledger migrate`, which re-chains the entries (keeping everything
+  else) and appends an entry recording the migration.
 - **History.** Each commit on the branch appends one entry; `verify` checks the chain and
   that along the branch's first-parent history every version is a prefix of the next,
   naming the first commit that edited, removed or reordered an entry.

@@ -1611,3 +1611,109 @@ fn a_ledger_commit_that_changes_the_file_mode_is_refused() {
     assert_eq!(d.code, 1, "{}", d.all());
     assert!(d.stderr.contains(&format!("invalid commit {}", &c[..10])), "{}", d.stderr);
 }
+
+const HEADER_V1: &str = "# Edition ledger: what went where. Append-only; written by `edition`, never by hand.\n# A correction is a new entry; see Edition's docs/design.md.\n";
+
+/// A format 1 in-tree ledger, chained with the repository's own object hashes.
+fn write_format1_ledger(work: &Path, n: usize) {
+    let g = edition::git::Git::new(work);
+    let mut text = HEADER_V1.to_string();
+    let mut prev = edition::ledger::GENESIS_V1.to_string();
+    for i in 0..n {
+        let mut e = entry(&format!("legacy-{i}"), &prev);
+        e.commit = git(work, &["rev-parse", "HEAD"]);
+        prev = edition::ledger::entry_hash_v1(&g, &e).expect("hash");
+        text.push_str(&edition::ledger::render(&e));
+    }
+    write(work, "releases/ledger.toml", &text);
+}
+
+fn migrates_format1(work: &Path) {
+    write_format1_ledger(work, 3);
+    commit_all(work, "Format 1 ledger");
+    git(work, &["push", "-q", "origin", "main"]);
+    let dry = edition(work, &["ledger", "migrate"]);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    assert!(dry.stdout.contains("re-chained from format 1"), "{}", dry.stdout);
+    let ok = apply(work, &["ledger", "migrate"]);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+    let text = ledger_text(work);
+    assert!(text.contains("format = 2"), "{text}");
+    assert_eq!(text.matches("[[entry]]").count(), 4, "three entries and the migration record: {text}");
+    assert!(text.contains("action = \"migrate\""));
+    assert!(text.contains("re-chained 3 entries from ledger format 1"));
+    let v = edition(work, &["verify", "--online"]);
+    assert!(v.stdout.contains("hash chain intact (4 entries)"), "{}", v.stdout);
+    // The chain continues normally afterwards.
+    assert_eq!(apply(work, &["deploy", "staging-home", "main"]).code, 0);
+    assert_eq!(ledger_text(work).matches("[[entry]]").count(), 5);
+}
+
+#[test]
+fn a_format1_ledger_is_re_chained_by_migration() {
+    let (_root, work) = project("format1", BASE_CONFIG, "0.6.0-dev");
+    migrates_format1(&work);
+}
+
+#[test]
+fn unknown_ledger_formats_are_refused() {
+    assert!(edition::ledger::parse_ledger("format = 3\n").is_err());
+    let none = edition::ledger::parse_ledger(&format!("{HEADER_V1}\n[[entry]]\nid = \"x\"\nat = \"a\"\nby = \"b\"\naction = \"deploy\"\nproduct = \"p\"\nref = \"main\"\ncommit = \"c\"\nresult = \"ok\"\n"));
+    assert!(none.is_err_and(|e| e.contains("ledger migrate")));
+    let (root, work) = project("format3", BASE_CONFIG, "0.6.0-dev");
+    let other = other_clone(&root, "o1");
+    let text = format!(
+        "{}{}",
+        edition::ledger::HEADER.replace("format = 2", "format = 3"),
+        edition::ledger::render(&entry("x", edition::ledger::GENESIS))
+    );
+    let blob = plumb(&other, &["hash-object", "-w", "--stdin"], &text);
+    let tree = plumb(&other, &["mktree"], &format!("100644 blob {blob}\tledger.toml\n"));
+    let c = plumb(&other, &["commit-tree", &tree, "-m", "format 3"], "");
+    git(&other, &["push", "-q", "origin", &format!("{c}:refs/heads/edition/ledger")]);
+    let d = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(d.code, 1, "{}", d.all());
+    assert!(d.stderr.contains(&format!("invalid commit {}", &c[..10])), "{}", d.stderr);
+}
+
+fn sha256_project(name: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let root = tmp(name);
+    let probe = std::process::Command::new("git")
+        .args(["init", "-q", "--bare", "--object-format=sha256"])
+        .arg(root.join("origin.git"))
+        .output()
+        .expect("git");
+    if !probe.status.success() {
+        eprintln!("skipped: this git cannot create SHA-256 repositories");
+        return None;
+    }
+    git(&root, &["clone", "-q", root.join("origin.git").to_str().expect("utf8"), "work"]);
+    let work = root.join("work");
+    git(&work, &["checkout", "-q", "-b", "main"]);
+    write(&work, "edition.toml", BASE_CONFIG);
+    write(&work, ".gitignore", "*deploys*.txt\nreview.txt\n");
+    executable(&work, "scripts/record.sh", RECORD_SH);
+    set_version(&work, "0.6.0-dev");
+    let head = commit_all(&work, "Start");
+    assert_eq!(head.len(), 64, "a SHA-256 repository");
+    git(&work, &["push", "-q", "origin", "main"]);
+    Some((root, work))
+}
+
+#[test]
+fn the_ledger_works_the_same_in_a_sha256_repository() {
+    let Some((_root, work)) = sha256_project("sha256") else { return };
+    let ok = apply(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+    let v = edition(&work, &["verify", "--online"]);
+    assert!(v.stdout.contains("hash chain intact (1 entries)"), "{}", v.stdout);
+    let text = ledger_text(&work);
+    assert!(text.contains(&format!("prev = \"{}\"", edition::ledger::GENESIS)), "{text}");
+    eprintln!("ran in a SHA-256 repository");
+}
+
+#[test]
+fn a_format1_ledger_from_a_sha256_repository_migrates() {
+    let Some((_root, work)) = sha256_project("sha256-migrate") else { return };
+    migrates_format1(&work);
+}

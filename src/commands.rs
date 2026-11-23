@@ -1553,9 +1553,42 @@ pub fn ledger_migrate(c: &Ctx) -> Res {
     let _ = &file;
     let text = crate::safefs::read(&l.root, &l.cfg.ledger)
         .map_err(|e| format!("there is no in-tree ledger to migrate at {} ({e})", l.cfg.ledger))?;
+    let format = ledger::format_of(&text).map_err(|e| format!("{}: {e}", l.cfg.ledger))?;
     let entries = ledger::parse(&text).map_err(|e| format!("{}: {e}", l.cfg.ledger))?;
-    if let Err((_, m)) = ledger::check_chain(&c.git, &entries) {
+    let checked = match format {
+        None => ledger::check_chain_v1(&c.git, &entries),
+        Some(_) => ledger::check_chain(&c.git, &entries),
+    };
+    if let Err((_, m)) = checked {
         return refuse(&[format!("{}: the hash chain is broken ({m}); it cannot be migrated as it is", l.cfg.ledger)]);
+    }
+    // Format 1 chained entries with git object hashes; format 2 uses SHA-256. Entries
+    // keep everything but `prev`, which is re-derived, and a final entry records that.
+    let mut entries = entries;
+    let mut prev = ledger::GENESIS.to_string();
+    for e in entries.iter_mut() {
+        e.prev = prev.clone();
+        prev = ledger::entry_hash(&c.git, e)?;
+    }
+    if format.is_none() && !entries.is_empty() {
+        let at = now_utc();
+        entries.push(Entry {
+            id: format!("{at}/migrate/{}", &crate::util::sha256_hex(text.as_bytes())[..10]),
+            at,
+            by: c.by.clone(),
+            action: "migrate".into(),
+            product: l.cfg.product.clone(),
+            ref_: l.cfg.ledger_branch.clone(),
+            commit: c.git.resolve("HEAD").unwrap_or_default(),
+            result: "ok".into(),
+            prev: prev.clone(),
+            note: Some(format!(
+                "re-chained {} entries from ledger format 1 (git object hashes) to format 2 (SHA-256); in-tree ledger sha256 {}",
+                entries.len(),
+                crate::util::sha256_hex(text.as_bytes())
+            )),
+            ..Entry::default()
+        });
     }
     let mut problems = c.input_problems();
     problems.extend(c.clean_problems());
@@ -1577,7 +1610,14 @@ pub fn ledger_migrate(c: &Ctx) -> Res {
     plan.fact("push-url", &view.push_url);
     plan.fact("ledger-sha256", &crate::util::sha256_hex(text.as_bytes()));
     plan.steps = vec![
-        Step::note(&format!("build {branch} locally: one commit per entry, entries unchanged")),
+        Step::note(&format!(
+            "build {branch} locally: one commit per entry{}",
+            if format.is_none() {
+                ", re-chained from format 1 with SHA-256, plus an entry recording the migration"
+            } else {
+                ""
+            }
+        )),
         c.git_step(
             Kind::Outward,
             &format!("publish {branch}"),
