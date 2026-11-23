@@ -102,7 +102,8 @@ pub fn identify(git: &Git, found: Vec<Finding>) -> Vec<Finding> {
         if out.iter().any(|o| o.place == f.place && o.pattern == f.pattern && o.excerpt == f.excerpt) {
             continue;
         }
-        let h = git.hash(&format!("{}\0{}\0{}", f.place, f.pattern, f.excerpt)).unwrap_or_default();
+        let _ = git;
+        let h = crate::util::sha256_hex(format!("{}\0{}\0{}", f.place, f.pattern, f.excerpt).as_bytes());
         f.id = h.chars().take(10).collect();
         out.push(f);
     }
@@ -140,11 +141,18 @@ impl Scanner {
         }
     }
 
+    /// A finding for content that could not be read as text. It blocks like any other
+    /// finding unless its path is exempt or it is allowed by id.
+    fn unscanned(&self, place: String, why: &str, out: &mut Vec<Finding>) {
+        out.push(Finding { place, pattern: UNSCANNED.into(), excerpt: why.into(), id: String::new() });
+    }
+
     /// Commits in `range` (git log arguments): their messages and every line they add.
     /// Renames are shown as a deletion and an addition, so a file moved out of an allowed
     /// path is scanned in full. Merges are shown as combined diffs, and a line counts as
     /// added by the merge only when it is new against every parent (merge-only changes).
-    pub fn scan_commits(&self, git: &Git, range: &[String]) -> Vec<Finding> {
+    /// Binary files are reported as unscanned. Any error fails the scan.
+    pub fn scan_commits(&self, git: &Git, range: &[String]) -> Result<Vec<Finding>, String> {
         let mut args = vec![
             "log",
             "--no-show-signature",
@@ -152,12 +160,13 @@ impl Scanner {
             "--cc",
             "--no-renames",
             "--no-ext-diff",
+            "--no-textconv",
             "--no-color",
             "--format=%x1e%H%x1f%B%x1f",
         ];
         args.extend(range.iter().map(String::as_str));
         args.push("--");
-        let out = git.run(&args).unwrap_or_default();
+        let out = git.run(&args).map_err(|e| format!("content scan failed: {e}"))?;
         let mut found = Vec::new();
         for rec in out.split('\u{1e}') {
             let mut f = rec.splitn(3, '\u{1f}');
@@ -169,40 +178,64 @@ impl Scanner {
             let mut path = String::new();
             let mut parents = 1usize;
             for line in diff.unwrap_or("").lines() {
-                if let Some(p) = line.strip_prefix("+++ ") {
-                    path = p.strip_prefix("b/").unwrap_or(p).to_string();
+                if let Some(rest) = line.strip_prefix("diff --git ") {
+                    path = rest.rsplit(" b/").next().unwrap_or(rest).to_string();
+                } else if let Some(rest) =
+                    line.strip_prefix("diff --cc ").or_else(|| line.strip_prefix("diff --combined "))
+                {
+                    path = rest.to_string();
+                } else if let Some(p) = line.strip_prefix("+++ ") {
+                    if p != "/dev/null" {
+                        path = p.strip_prefix("b/").unwrap_or(p).to_string();
+                    }
+                } else if line.starts_with("Binary files ") && line.ends_with(" differ") {
+                    if !line.ends_with("and /dev/null differ") && !self.allowed(&path) {
+                        self.unscanned(format!("commit {hash} {path}"), "binary file", &mut found);
+                    }
                 } else if line.starts_with("@@") {
                     parents = line.chars().take_while(|c| *c == '@').count().saturating_sub(1).max(1);
                 } else if line.len() >= parents
                     && line.is_char_boundary(parents)
                     && line[..parents].chars().all(|c| c == '+')
+                    && !line.starts_with("+++ ")
                     && !self.allowed(&path)
                 {
                     self.scan_line(&format!("commit {hash} {path}"), &line[parents..], &mut found);
                 }
             }
         }
-        identify(git, found)
+        Ok(identify(git, found))
     }
 
     /// Exactly what a push would publish: every commit reachable from `tips` and from
     /// none of the commits the remote already has.
-    pub fn scan_publish(&self, git: &Git, tips: &[String], remote_has: &[String]) -> Vec<Finding> {
+    pub fn scan_publish(&self, git: &Git, tips: &[String], remote_has: &[String]) -> Result<Vec<Finding>, String> {
         let mut range: Vec<String> = tips.to_vec();
         range.push("--not".into());
         range.extend(remote_has.iter().filter(|c| git.resolve(c).is_some()).cloned());
         self.scan_commits(git, &range)
     }
 
-    /// Every tracked text file in the working tree.
-    pub fn scan_tree(&self, l: &Loaded, git: &Git) -> Vec<Finding> {
+    /// Every tracked file in the working tree. Binary and oversize files are reported as
+    /// unscanned; any error fails the scan.
+    pub fn scan_tree(&self, l: &Loaded, git: &Git) -> Result<Vec<Finding>, String> {
         let mut found = Vec::new();
-        for path in git.run(&["ls-files", "-z"]).unwrap_or_default().split('\0').filter(|p| !p.is_empty()) {
+        let list = git.run(&["ls-files", "-z"]).map_err(|e| format!("content scan failed: {e}"))?;
+        for path in list.split('\0').filter(|p| !p.is_empty()) {
             if self.allowed(path) {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(l.root.join(path)) else { continue };
-            if bytes.len() > 2_000_000 || bytes.contains(&0) {
+            let bytes = match std::fs::read(l.root.join(path)) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("content scan failed: cannot read {path}: {e}")),
+            };
+            if bytes.len() > MAX_SCAN_BYTES {
+                self.unscanned(path.to_string(), "larger than the scan limit", &mut found);
+                continue;
+            }
+            if bytes.contains(&0) {
+                self.unscanned(path.to_string(), "binary file", &mut found);
                 continue;
             }
             let text = String::from_utf8_lossy(&bytes);
@@ -210,9 +243,15 @@ impl Scanner {
                 self.scan_line(&format!("{path}:{}", n + 1), line, &mut found);
             }
         }
-        identify(git, found)
+        Ok(identify(git, found))
     }
 }
+
+/// The pattern name of findings for content that could not be scanned.
+pub const UNSCANNED: &str = "unscanned";
+
+/// Files above this size are reported as unscanned rather than read.
+pub const MAX_SCAN_BYTES: usize = 4_000_000;
 
 fn summarize(found: &[Finding], limit: usize) -> String {
     found
@@ -232,7 +271,13 @@ pub fn verify(l: &Loaded, git: &Git, r: &mut Report) {
     let s = Scanner::new(l);
     let block = l.cfg.content.action == "block";
     let mut push = |msg: String| if block { r.errors.push(msg) } else { r.warnings.push(msg) };
-    let tree = s.scan_tree(l, git);
+    let tree = match s.scan_tree(l, git) {
+        Ok(t) => t,
+        Err(e) => {
+            r.errors.push(e);
+            return;
+        }
+    };
     let mut clean = tree.is_empty();
     if !tree.is_empty() {
         push(format!(
@@ -243,7 +288,14 @@ pub fn verify(l: &Loaded, git: &Git, r: &mut Report) {
     }
     for remote in public {
         let range = vec!["HEAD".to_string(), "--not".to_string(), format!("--remotes={remote}")];
-        let commits = s.scan_commits(git, &range);
+        let commits = match s.scan_commits(git, &range) {
+            Ok(c) => c,
+            Err(e) => {
+                clean = false;
+                push(e);
+                continue;
+            }
+        };
         if !commits.is_empty() {
             clean = false;
             push(format!(
@@ -291,7 +343,13 @@ pub fn check_push(l: &Loaded, git: &Git, remote: &str) -> Result<i32, String> {
     let s = Scanner::new(l);
     let mut found = Vec::new();
     for r in &ranges {
-        found.extend(s.scan_commits(git, r));
+        match s.scan_commits(git, r) {
+            Ok(f) => found.extend(f),
+            Err(e) => {
+                eprintln!("edition: {e}; push blocked (the scan fails closed)");
+                return Ok(1);
+            }
+        }
     }
     // Version agreement and pins at what is being pushed (HEAD when run by hand).
     let mut other = Vec::new();

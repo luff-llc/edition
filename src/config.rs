@@ -219,6 +219,21 @@ pub struct ConcordanceCfg {
     pub bin: String,
 }
 
+/// How configured commands run.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunCfg {
+    /// `PATH` for channel, check and probe commands (default: a fixed system path).
+    pub path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptCfg {
+    /// Receipt lifetime in minutes (default 30, at most 60).
+    pub ttl_minutes: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifyCfg {
@@ -261,6 +276,10 @@ pub struct Config {
     pub concordance: Option<ConcordanceCfg>,
     #[serde(default)]
     pub verify: VerifyCfg,
+    #[serde(default)]
+    pub run: RunCfg,
+    #[serde(default)]
+    pub receipts: ReceiptCfg,
 }
 
 fn d_final() -> String {
@@ -323,7 +342,8 @@ pub struct Loaded {
 pub const REVIEW_KINDS: &[&str] = &["testflight", "play-testing", "store-review", "beta"];
 
 /// Placeholders a command may use, each as a whole argument or environment value.
-pub const PLACEHOLDERS: &[&str] = &["commit", "ref", "tag", "version", "build", "channel", "target"];
+/// Commands get the verified commit, never a ref name that could move.
+pub const PLACEHOLDERS: &[&str] = &["commit", "version", "build", "channel", "target"];
 
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"];
 
@@ -508,6 +528,16 @@ impl Loaded {
                 }
             }
         }
+        if let Some(t) = c.receipts.ttl_minutes {
+            if t == 0 || t > crate::steps::RECEIPT_TTL_MAX {
+                errs.push(format!("receipts.ttl_minutes must be between 1 and {}", crate::steps::RECEIPT_TTL_MAX));
+            }
+        }
+        if let Some(p) = &c.run.path {
+            if p.split(':').any(|d| !d.starts_with('/')) {
+                errs.push("run.path must list absolute directories".into());
+            }
+        }
         if !matches!(c.content.action.as_str(), "report" | "block") {
             errs.push("content.action must be `report` or `block`".into());
         }
@@ -573,6 +603,14 @@ impl Loaded {
         self.pre_tag.render(&[("version", version), ("n", &n)]).unwrap_or_else(|_| format!("v{version}-rc.{n}"))
     }
 
+    pub fn receipt_ttl(&self) -> u64 {
+        self.cfg.receipts.ttl_minutes.unwrap_or(crate::steps::RECEIPT_TTL_DEFAULT)
+    }
+
+    pub fn run_path(&self) -> String {
+        self.cfg.run.path.clone().unwrap_or_else(|| crate::steps::DEFAULT_PATH.to_string())
+    }
+
     pub fn is_public(&self, remote: &str) -> bool {
         self.cfg.remotes.get(remote).is_some_and(|r| r.public)
     }
@@ -634,7 +672,7 @@ mod tests {
     fn globs() {
         assert!(glob_match("release/*", "release/0.6"));
         assert!(!glob_match("release/*", "release/0.6/x"));
-        assert!(!glob_match("release/*", "colophon-06-sync"));
+        assert!(!glob_match("release/*", "feature-sync"));
         assert!(glob_match("main", "main"));
         assert!(glob_match("docs/*-review-*.md", "docs/0.6-review-notes.md"));
         assert!(glob_match("docs/**/*.md", "docs/a/b/c.md"));

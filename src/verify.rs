@@ -231,6 +231,47 @@ fn ledger_checks(l: &Loaded, git: &Git, view: &RemoteView, r: &mut Report) {
         Ok(()) => {}
         Err((_, m)) => r.errors.push(format!("{rel}: hash chain broken: {m}")),
     }
+    // The remote anchors the ledger: the local ledger must extend the one on the
+    // remote's default branch. Whoever can rewrite that branch can rewrite the ledger;
+    // protect it.
+    if view.online() {
+        match view.branch(&l.cfg.main).map(str::to_string) {
+            Some(tip) => {
+                if git.resolve(&tip).is_none() {
+                    let _ = git.run(&["fetch", "-q", "--no-tags", &view.remote, &format!("refs/heads/{}", l.cfg.main)]);
+                }
+                match (git.resolve(&tip), git.show(&tip, &rel)) {
+                    (None, _) => r.errors.push(format!(
+                        "{rel}: {}/{} ({}) could not be fetched; the remote anchor is unverified",
+                        view.remote,
+                        l.cfg.main,
+                        short(&tip)
+                    )),
+                    (Some(_), None) => {
+                        r.ok.push(format!("{rel}: not on {}/{} yet; nothing to anchor", view.remote, l.cfg.main))
+                    }
+                    (Some(_), Some(remote_text)) => {
+                        let local = std::fs::read_to_string(&path).unwrap_or_default();
+                        if local.starts_with(remote_text.trim_end()) {
+                            r.ok.push(format!("{rel} extends the ledger on {}/{}", view.remote, l.cfg.main));
+                        } else {
+                            r.errors.push(format!(
+                                "{rel} does not extend the ledger on {}/{} ({}): local entries were edited, removed or reordered",
+                                view.remote,
+                                l.cfg.main,
+                                short(&tip)
+                            ));
+                        }
+                    }
+                }
+            }
+            None => {
+                r.errors.push(format!("{} has no {} branch; the ledger anchor is unverified", view.remote, l.cfg.main))
+            }
+        }
+    } else {
+        r.warnings.push(format!("{rel}: the remote anchor is unverified offline (pass --online)"));
+    }
     // Along the first-parent history of main (and then HEAD and the working copy), each
     // committed version of the ledger must be a prefix of the next.
     let main_ref = view.branch(&l.cfg.main).map(str::to_string).filter(|c| git.resolve(c).is_some());

@@ -59,12 +59,30 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
 
 pub const NOW: &str = "2026-11-23T12:00:00Z";
 
+/// Moves a receipt's expiry into the past by editing the state file, standing in for
+/// the passage of time (Edition has no clock override).
+pub fn expire_receipt(work: &Path, receipt: &str) {
+    let path = work.join(".edition/receipts");
+    let text = std::fs::read_to_string(&path).expect("receipts");
+    let out: String = text
+        .lines()
+        .map(|l| {
+            let p: Vec<&str> = l.split(' ').collect();
+            if p.len() == 5 && p[0] == "issued" && p[1] == receipt {
+                format!("issued {} {} {} 1\n", p[1], p[2], p[3])
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&path, out).expect("write receipts");
+}
+
 pub fn edition_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Out {
     let mut c = Command::new(env!("CARGO_BIN_EXE_edition"));
     c.args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
-        .env("EDITION_NOW", NOW)
         .env("EDITION_ACTOR", "test-agent")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_AUTHOR_NAME", "Test")
@@ -153,14 +171,14 @@ tier = "prod"
 kind = "home"
 target = "https://home.example.com"
 approval = "owner"
-run = ["scripts/record.sh", "prod-deploys.txt", "{tag}"]
+run = ["scripts/record.sh", "prod-deploys.txt", "{commit}"]
 
 [channels.store-review]
 tier = "prod"
 kind = "testflight"
 target = "external testers"
 allow_prerelease = true
-run = ["scripts/record.sh", "review.txt", "{tag}"]
+run = ["scripts/record.sh", "review.txt", "{commit}"]
 "#;
 
 pub const RECORD_SH: &str = "#!/bin/sh\nout=\"$1\"; shift; printf '%s\\n' \"$*\" >> \"$out\"\n";

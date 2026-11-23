@@ -108,25 +108,27 @@ a target, the platform it ships, the checks it needs, and the command that perfo
 
 ### Receipts
 
-A dry run of a plan with outward steps prints a receipt: the first 16 hex digits of
-Git's hash of the plan's canonical text. That text contains the configuration file's
+A dry run of a plan with outward steps prints a **receipt**: a random 128-bit nonce from
+the operating system's random source. Edition stores, under `.edition/` beside the
+configuration (a mode-0700 directory with a mode-0600 file, never committed, refused if
+group or others can read it), the nonce with the SHA-256 of the plan's canonical text, the
+issue time and a fixed expiry. The canonical text contains the configuration file's
 digest, every fact the plan was checked against (resolved commits, tags, version, build,
-approver, pins, allowed content findings), and for every step its kind, arguments,
-environment (values included, so a changed secret changes the receipt, though it is
-never printed), working directory and remote expectations. Timestamps and notes are not
-part of it.
+approver, pins, allowed content findings), and for every step its kind, resolved program
+path, arguments, the complete environment it will run with (values included, so a changed
+value changes the hash, though values are never printed), working directory and remote
+expectations. Timestamps and notes are not part of it.
 
-`--apply --confirm <receipt>` recomputes the plan from scratch and runs it only if:
+`--apply --confirm <receipt>` recomputes the plan from scratch, then, holding one
+exclusive lock on the receipts file across all of it, checks that the receipt was issued
+here, has not expired, has not been used (locally or in the ledger), and was issued for a
+plan with the same hash, and marks it used. Only then does the first step run. A crash
+after that leaves the receipt spent: run the dry run again.
 
-- the recomputed plan hashes to the same receipt (any change of ref, configuration or
-  remote state since the dry run produces a different one);
-- the receipt was issued here, by a dry run, less than `EDITION_RECEIPT_TTL` seconds ago
-  (default 1800);
-- it has not been used: used receipts are recorded in `.edition/receipts` (local state,
-  never committed) and in the ledger entry, and either one refuses a replay.
-
-There is no way to run an outward step without a receipt from a prior dry run of the same
-plan.
+- The lifetime is 30 minutes, configurable as `[receipts] ttl_minutes` up to 60. There is
+  no clock or lifetime override in the environment.
+- There is no way to run an outward step without a receipt from a prior dry run of the
+  same plan.
 
 ### Remote state
 
@@ -138,6 +140,14 @@ Each outward step also carries expectations, printed with the plan, such as "rem
 the step runs the remote is read again. If any expectation fails, the step and everything
 after it is skipped and the ledger records the run as `failed` with the reason.
 
+Where git can compare and swap, the push itself enforces the expectation too: branch
+creation and tag pushes use `git push --atomic --force-with-lease=<ref>:`, which the
+remote refuses if the ref appeared in the meantime. Deploy commands receive the verified
+commit SHA, never a ref name (`{ref}` and `{tag}` are not available to commands), so a
+deploy script must deploy by SHA. The one remaining gap is the forward-merge pull
+request, which names a branch that can move after it is opened; Edition records the head
+SHA it checked in the ledger entry and in the pull request body.
+
 Outward plans also refuse a dirty working tree (other than the ledger) and a detached
 HEAD, so the ledger is committed on top of exactly what was checked.
 
@@ -146,8 +156,8 @@ HEAD, so the ledger is committed on top of exactly what was checked.
 - Channel and check commands are argument lists executed directly, never through a
   shell; `sh -c` (and the other common shells with `-c`) is rejected when the
   configuration loads. A pipeline belongs in a script file.
-- A placeholder (`{commit}`, `{ref}`, `{tag}`, `{version}`, `{build}`, `{channel}`,
-  `{target}`, `{var.NAME}`) must be a whole argument or environment value. Text such as
+- A placeholder (`{commit}`, `{version}`, `{build}`, `{channel}`, `{target}`,
+  `{var.NAME}`) must be a whole argument or environment value. Text such as
   `--sha={commit}` is rejected.
 - Inputs are checked against strict grammars before use: refs and `--at` (letters,
   digits, `.`, `_`, `/`, `-`; no leading `-`, no `..`), build labels (letters, digits,
@@ -157,6 +167,14 @@ HEAD, so the ledger is committed on top of exactly what was checked.
   values are treated as secret: plans print `<var.NAME>`, environment variables are
   printed by name only, and the ledger records each step's configured template
   (`{var.NAME}`), never expanded values.
+- Configured commands (channel `run` and `probe`, and checks) run with a **cleared
+  environment**: `PATH` (from `[run] path`, or `/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`),
+  `HOME`, `LANG`, `TMPDIR`, and the variables the channel or check declares in `env`.
+  Nothing else is inherited, so a script that needs a credential must declare the
+  variable (for example `env = { DEPLOY_TOKEN = "{var.deploy_token}" }`). The program is
+  resolved to an absolute path when the plan is made, and that path is part of the plan
+  hash. Edition's own `git` and `gh` steps keep the caller's environment, which they need
+  for authentication; their resolved paths are hashed the same way.
 
 ### Gates
 
@@ -215,6 +233,10 @@ every pin with its tag, and any content findings explicitly allowed.
   `main` (then HEAD, then the working copy) every committed version of the ledger is a
   prefix of the next. An edit, removal or reordering is reported with the first commit
   that introduced it.
+- **Anchor.** `verify --online` reads the ledger on the remote's default branch and
+  requires the local ledger to extend it; offline it says the anchor is unverified. The
+  anchor is only as strong as that branch: whoever can rewrite the remote default branch
+  can rewrite the ledger. Protect it (no force pushes, required reviews).
 - Dev-tier deploys are never recorded.
 - `verify` checks every successful entry: its commit is reachable from the remote; a
   staging entry's commit is on `main`; a prod entry's ref is a release tag at that commit.
@@ -230,7 +252,12 @@ home-directory paths and private-key headers. The scan covers every commit reach
 from what is pushed and from nothing the remote already has: commit messages and every
 added line, with renames shown as a deletion plus an addition (so a file moved out of an
 exempt path is scanned in full) and merges as combined diffs (a line counts as added by a
-merge only when it is new against every parent). Binary files are skipped.
+merge only when it is new against every parent).
+
+The scan fails closed: if git cannot produce the history, the plan, push or `verify`
+fails. Content it cannot read as text (binary files, and in the tree files over 4 MB) is
+reported as an `unscanned` finding, which blocks like any other unless its path is listed
+in `[content] allow_paths` or it is allowed by id for one run.
 
 - **Edition's own plans.** Every plan that pushes to a public remote runs the scan when
   the plan is made, and findings refuse the plan. A finding can be let through only by
@@ -258,7 +285,7 @@ merge only when it is new against every parent). Binary files are skipped.
   should agree.
 - **Secrets** stay in whatever vault the delivery scripts use, behind their own
   approvals. Edition never sees them.
-- **An attention board or agent runner** (Galley, for example) can follow the event
+- **An attention board or agent runner** can follow the event
   stream below instead of polling repositories.
 
 ## Worker contract
@@ -294,12 +321,14 @@ offset. Edition never reads it back.
 | `[content] deny`, `allow_paths`, `action` | the content check's patterns (`<word>` matches one word), exempt path globs, `block` (default) or `report` |
 | `[concordance] catalog`, `release`, `bin` | the Concordance catalog; the release id template (`{version}`) |
 | `[vars] NAME` | values for `{var.NAME}`; an empty value must come from `EDITION_VAR_NAME` on the machine and is treated as secret |
+| `[run] path` | `PATH` for configured commands (absolute directories) |
+| `[receipts] ttl_minutes` | receipt lifetime, 1 to 60 (default 30) |
 | `[verify] tags_since` | older tags are not checked against version files |
 
 Placeholders in `run`, `probe`, `env` and check commands, each a whole argument or value:
-`{commit}`, `{ref}`, `{tag}`, `{version}`, `{build}`, `{channel}`, `{target}`,
-`{var.NAME}`. Environment variables: `EDITION_ACTOR`, `EDITION_EVENTS`,
-`EDITION_RECEIPT_TTL`, `EDITION_VAR_<NAME>`.
+`{commit}` (the verified SHA), `{version}`, `{build}`, `{channel}`, `{target}`,
+`{var.NAME}`. Environment variables Edition reads: `EDITION_ACTOR`, `EDITION_EVENTS`,
+`EDITION_VAR_<NAME>`.
 
 ## Roadmap
 

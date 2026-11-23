@@ -9,9 +9,10 @@ Edition answers three questions from files in the repository, not from memory:
   track, a production server) has a tier, and the tier decides which refs it accepts.
   The decision is made against the remote's live heads and tags.
 - **What exactly will happen?** Every mutating command prints the plan first. A plan
-  that leaves the machine runs only with the **receipt** its dry run issued: a token
-  derived from a hash of the plan, valid once, for 30 minutes, and only while the refs,
-  the configuration and the remote are exactly as they were checked.
+  that leaves the machine runs only with the **receipt** its dry run issued: a random
+  nonce bound to a SHA-256 of the plan, valid once, for 30 minutes, and only while the
+  refs, the configuration, the environment and the remote are exactly as they were
+  checked. Pushes are compare-and-swap, and deploy commands get the verified SHA.
 - **What is deployed where?** Each deploy, pushed branch or tag, and forward-merge pull
   request is appended to a hash-chained ledger in the repository, with the commit, the
   tree, who ran it, the receipt and the steps that ran. `edition verify` checks the
@@ -81,6 +82,11 @@ Every plan with outward steps refuses to run from a dirty tree or a detached HEA
 while the remote cannot be read. Read-only commands work offline and say the remote
 state is unverified.
 
+Configured commands run with a cleared environment (`PATH`, `HOME`, `LANG`, `TMPDIR`
+and the variables a channel declares), so a deploy script that needs a credential must
+declare it, and must deploy the commit SHA it is given. The ledger's remote anchor is the
+default branch: protect it against force pushes.
+
 Exit codes: `0` success or a printed dry run, `1` refused or a failed step, `2` usage,
 configuration or receipt error.
 
@@ -117,7 +123,7 @@ deploy_script = ""   # per machine: EDITION_VAR_DEPLOY_SCRIPT (printed by name o
 public = true        # pushes are scanned for internal notes first
 ```
 
-Commands are argument lists, run directly. A placeholder (`{commit}`, `{tag}`,
+Commands are argument lists, run directly. A placeholder (`{commit}`, `{version}`,
 `{var.NAME}`, ...) must be a whole argument or environment value; `sh -c` is rejected.
 Full examples for a fictional library with a home server and a fictional two-platform
 app: [examples/library](examples/library/edition.toml) and

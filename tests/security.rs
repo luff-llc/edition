@@ -43,17 +43,17 @@ fn a_receipt_binds_the_exact_plan_and_is_single_use() {
 
     // Expired.
     let r3 = staging_receipt(&work);
-    let late = edition_env(
-        &work,
-        &["deploy", "staging-home", "main", "--apply", "--confirm", &r3],
-        &[("EDITION_NOW", "2026-11-23T12:31:00Z")],
-    );
+    expire_receipt(&work, &r3);
+    let late = edition(&work, &["deploy", "staging-home", "main", "--apply", "--confirm", &r3]);
     assert_eq!(late.code, 2, "{}", late.all());
     assert!(late.stderr.contains("expired"), "{}", late.stderr);
 
     // A receipt the dry run never issued.
     let forged = edition(&work, &["deploy", "staging-home", "main", "--apply", "--confirm", "0123456789abcdef"]);
     assert_eq!(forged.code, 2);
+    let guessed = edition(&work, &["deploy", "staging-home", "main", "--apply", "--confirm", &"0".repeat(32)]);
+    assert_eq!(guessed.code, 2);
+    assert!(guessed.stderr.contains("was not issued"), "{}", guessed.stderr);
 
     // Used once, then refused.
     let r4 = staging_receipt(&work);
@@ -356,7 +356,7 @@ fn the_publish_scan_covers_exactly_what_the_remote_lacks_and_verify_blocks_witho
     let g = edition::git::Git::new(&work);
     let view = edition::policy::RemoteView::build(&g, "origin", true).expect("remote");
     let scanner = edition::content::Scanner::new(&loaded);
-    let found = scanner.scan_publish(&g, std::slice::from_ref(&local), &view.tips());
+    let found = scanner.scan_publish(&g, std::slice::from_ref(&local), &view.tips()).expect("scan");
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].place.contains("docs/plan.md"));
     assert_eq!(found[0].id.len(), 10);
@@ -369,7 +369,7 @@ fn the_publish_scan_covers_exactly_what_the_remote_lacks_and_verify_blocks_witho
     // Once the remote has it, nothing is left to publish.
     git(&work, &["push", "-q", "origin", "main"]);
     let view2 = edition::policy::RemoteView::build(&g, "origin", true).expect("remote");
-    assert!(scanner.scan_publish(&g, &[local], &view2.tips()).is_empty());
+    assert!(scanner.scan_publish(&g, &[local], &view2.tips()).expect("scan").is_empty());
 }
 
 #[test]
@@ -430,4 +430,203 @@ fn outward_plans_are_refused_when_the_remote_cannot_be_read() {
     assert!(out.stderr.contains("outward steps are refused"), "{}", out.stderr);
     let status = edition(&work, &["status"]);
     assert_eq!(status.code, 0, "read-only commands still work: {}", status.all());
+}
+
+#[test]
+fn receipts_are_random_and_differ_for_the_same_plan() {
+    let (_root, work) = project("nonce", BASE_CONFIG, "0.6.0-dev");
+    let a = staging_receipt(&work);
+    let b = staging_receipt(&work);
+    assert_eq!(a.len(), 32);
+    assert_ne!(a, b, "a receipt is a fresh nonce, not a hash of the plan");
+    // Each nonce is bound to the plan it was issued for.
+    let text = std::fs::read_to_string(work.join(".edition/receipts")).expect("state");
+    assert!(text
+        .lines()
+        .any(|l| l.starts_with(&format!("issued {a} ")) && l.split(' ').nth(2).is_some_and(|h| h.len() == 64)));
+}
+
+#[test]
+fn the_receipt_state_must_be_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_root, work) = project("perms", BASE_CONFIG, "0.6.0-dev");
+    let r = staging_receipt(&work);
+    let dir = work.join(".edition");
+    assert_eq!(std::fs::metadata(&dir).expect("dir").permissions().mode() & 0o777, 0o700);
+    assert_eq!(std::fs::metadata(dir.join("receipts")).expect("file").permissions().mode() & 0o777, 0o600);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let out = edition(&work, &["deploy", "staging-home", "main", "--apply", "--confirm", &r]);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.stderr.contains("must be a private directory"), "{}", out.stderr);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    std::fs::set_permissions(dir.join("receipts"), std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let out2 = edition(&work, &["deploy", "staging-home", "main", "--apply", "--confirm", &r]);
+    assert_eq!(out2.code, 2, "{}", out2.all());
+    assert!(out2.stderr.contains("must be private"), "{}", out2.stderr);
+}
+
+#[test]
+fn concurrent_applies_of_one_receipt_run_exactly_once() {
+    let (_root, work) = project("race", BASE_CONFIG, "0.6.0-dev");
+    let r = staging_receipt(&work);
+    let handles: Vec<_> = (0..6)
+        .map(|_| {
+            let work = work.clone();
+            let r = r.clone();
+            std::thread::spawn(move || {
+                edition(&work, &["deploy", "staging-home", "main", "--apply", "--confirm", &r]).code
+            })
+        })
+        .collect();
+    let codes: Vec<i32> = handles.into_iter().map(|h| h.join().expect("thread")).collect();
+    assert_eq!(codes.iter().filter(|c| **c == 0).count(), 1, "{codes:?}");
+    let deployed = std::fs::read_to_string(work.join("staging-deploys.txt")).expect("deployed");
+    assert_eq!(deployed.lines().count(), 1, "{deployed}");
+}
+
+#[test]
+fn channel_commands_see_only_declared_environment() {
+    let cfg = BASE_CONFIG
+        .replace(
+            "run = [\"scripts/record.sh\", \"staging-deploys.txt\", \"{commit}\"]\nprobe",
+            "run = [\"scripts/env.sh\", \"{commit}\"]\nenv = { DECLARED = \"{var.token}\" }\nprobe",
+        )
+        .replace("[checks.unit]", "[vars]\ntoken = \"\"\n\n[checks.unit]");
+    let (_root, work) = project("env", &cfg, "0.6.0-dev");
+    executable(&work, "scripts/env.sh", "#!/bin/sh\nenv > env-deploys.txt\n");
+    commit_all(&work, "env script");
+    git(&work, &["push", "-q", "origin", "main"]);
+    let env = [("EDITION_VAR_TOKEN", "declared-value"), ("AMBIENT_SECRET", "should-not-leak")];
+    let ok = apply_env(&work, &["deploy", "staging-home", "main"], &env);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+    let seen = std::fs::read_to_string(work.join("env-deploys.txt")).expect("env");
+    assert!(seen.contains("DECLARED=declared-value"), "{seen}");
+    assert!(!seen.contains("AMBIENT_SECRET"), "{seen}");
+    assert!(!seen.contains("EDITION_VAR_TOKEN"), "{seen}");
+
+    // A changed declared value invalidates the receipt.
+    let dry = edition_env(&work, &["deploy", "staging-home", "main"], &env);
+    let r = dry.receipt();
+    let changed = edition_env(
+        &work,
+        &["deploy", "staging-home", "main", "--apply", "--confirm", &r],
+        &[("EDITION_VAR_TOKEN", "other-value")],
+    );
+    assert_eq!(changed.code, 2, "{}", changed.all());
+    assert!(changed.stderr.contains("does not match this plan"));
+}
+
+#[test]
+fn deploy_commands_get_the_commit_never_a_ref_name() {
+    let (_root, work) = project("sha-only", BASE_CONFIG, "0.6.0-dev");
+    let cfg = BASE_CONFIG.replace("\"staging-deploys.txt\", \"{commit}\"", "\"staging-deploys.txt\", \"{ref}\"");
+    write(&work, "edition.toml", &cfg);
+    let out = edition(&work, &["status"]);
+    assert_eq!(out.code, 2);
+    assert!(out.stderr.contains("unknown placeholder {ref}"), "{}", out.stderr);
+}
+
+#[test]
+fn pushes_are_compare_and_swap() {
+    let (root, work) = project("cas", BASE_CONFIG, "0.7.0-dev");
+    line_with_version(&work, "0.6", "0.6.0");
+    let dry = edition(&work, &["tag", "0.6.0"]);
+    assert!(
+        dry.stdout.contains("push --atomic '--force-with-lease=refs/tags/v0.6.0:' origin refs/tags/v0.6.0")
+            || dry.stdout.contains("push --atomic --force-with-lease=refs/tags/v0.6.0: origin refs/tags/v0.6.0"),
+        "{}",
+        dry.stdout
+    );
+    let cut = edition(&work, &["cut", "0.7"]);
+    assert!(cut.stdout.contains("--force-with-lease=refs/heads/release/0.7:"), "{}", cut.stdout);
+    // The lease refuses a tag that appeared on the remote meanwhile.
+    let other = other_clone(&root, "other");
+    git(&other, &["tag", "v0.6.0", "origin/main"]);
+    git(&other, &["push", "-q", "origin", "v0.6.0"]);
+    git(&work, &["tag", "-a", "v0.6.0", "origin/release/0.6", "-m", "mine"]);
+    let lease = std::process::Command::new("git")
+        .current_dir(&work)
+        .args(["push", "--atomic", "--force-with-lease=refs/tags/v0.6.0:", "origin", "refs/tags/v0.6.0"])
+        .output()
+        .expect("git");
+    assert!(!lease.status.success(), "the lease must refuse an existing tag");
+}
+
+#[test]
+fn verify_anchors_the_ledger_to_the_remote() {
+    let (_root, work) = two_entry_ledger("anchor");
+    let ok = edition(&work, &["verify", "--online"]);
+    assert!(ok.stdout.contains("extends the ledger on origin/main"), "{}", ok.stdout);
+    let offline = edition(&work, &["verify"]);
+    assert!(offline.stdout.contains("remote anchor is unverified offline"), "{}", offline.stdout);
+    let path = work.join("releases/ledger.toml");
+    let text = std::fs::read_to_string(&path).expect("ledger");
+    write(&work, "releases/ledger.toml", &text.replacen("note = \"first\"", "note = \"rewritten\"", 1));
+    let bad = edition(&work, &["verify", "--online"]);
+    assert_eq!(bad.code, 1);
+    assert!(bad.stdout.contains("does not extend the ledger on origin/main"), "{}", bad.stdout);
+}
+
+#[test]
+fn the_scanner_fails_closed() {
+    let (_root, work) = public_project("fail-closed");
+    let loaded = edition::config::Loaded::load(&work.join("edition.toml")).expect("config");
+    let g = edition::git::Git::new(&work);
+    let scanner = edition::content::Scanner::new(&loaded);
+    assert!(scanner.scan_commits(&g, &["no-such-ref".to_string()]).is_err());
+
+    // Binary content is reported as unscanned, in commits and in the tree, and blocks.
+    std::fs::write(work.join("blob.bin"), [0u8, 1, 2, 0, 3]).expect("bin");
+    commit_all(&work, "Binary");
+    let push = edition(&work, &["check-push", "origin"]);
+    assert_eq!(push.code, 1, "{}", push.all());
+    assert!(push.stderr.contains("[unscanned] binary file"), "{}", push.stderr);
+    let v = edition(&work, &["verify"]);
+    assert_eq!(v.code, 1);
+    assert!(v.stdout.contains("blob.bin [unscanned] binary file"), "{}", v.stdout);
+
+    // An oversize file in the tree is reported as unscanned.
+    git(&work, &["reset", "-q", "--hard", "origin/main"]);
+    let big = "a".repeat(edition::content::MAX_SCAN_BYTES + 1);
+    write(&work, "big.md", &big);
+    commit_all(&work, "Big");
+    git(&work, &["push", "-q", "origin", "main"]);
+    let v2 = edition(&work, &["verify"]);
+    assert_eq!(v2.code, 1);
+    assert!(v2.stdout.contains("big.md [unscanned] larger than the scan limit"), "{}", v2.stdout);
+
+    // An exempt path is the explicit way to accept such files.
+    let cfg = std::fs::read_to_string(work.join("edition.toml"))
+        .expect("cfg")
+        .replace("allow_paths = [\"allowed/**\"]", "allow_paths = [\"allowed/**\", \"big.md\"]");
+    write(&work, "edition.toml", &cfg);
+    commit_all(&work, "Exempt big.md");
+    git(&work, &["push", "-q", "origin", "main"]);
+    let v3 = edition(&work, &["verify"]);
+    assert!(!v3.stdout.contains("big.md [unscanned]"), "{}", v3.stdout);
+}
+
+#[test]
+fn redemption_is_atomic_under_contention() {
+    let dir = tmp("redeem-race");
+    let receipts = std::sync::Arc::new(edition::steps::Receipts::at(&dir));
+    let hash = "a".repeat(64);
+    for _ in 0..40 {
+        let nonce = receipts.issue(&hash, 5).expect("issue");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let r = receipts.clone();
+                let b = barrier.clone();
+                let n = nonce.clone();
+                let h = hash.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    r.redeem(&n, &h, false).is_ok()
+                })
+            })
+            .collect();
+        let wins = handles.into_iter().map(|h| h.join().expect("thread")).filter(|w| *w).count();
+        assert_eq!(wins, 1, "a receipt was redeemed {wins} times");
+    }
 }

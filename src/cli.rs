@@ -42,7 +42,6 @@ ENVIRONMENT
   EDITION_ACTOR         recorded actor
   EDITION_EVENTS        append JSON-lines events here (`-` for standard error)
   EDITION_VAR_<NAME>    machine-specific values for {var.name}; printed by name, never recorded
-  EDITION_RECEIPT_TTL   receipt lifetime in seconds (default 1800)
 
 Tiers: dev (any ref, local, unrecorded), staging (tip of main only), prod (final release
 tag on a release line, on the remote, every pin on a release tag).";

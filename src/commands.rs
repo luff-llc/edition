@@ -98,7 +98,10 @@ impl Ctx {
         if !self.l.is_public(&view.remote) {
             return (Vec::new(), Vec::new());
         }
-        let found = crate::content::Scanner::new(&self.l).scan_publish(&self.git, tips, &view.tips());
+        let found = match crate::content::Scanner::new(&self.l).scan_publish(&self.git, tips, &view.tips()) {
+            Ok(f) => f,
+            Err(e) => return (vec![format!("{e}; the plan is refused (the scan fails closed)")], Vec::new()),
+        };
         let mut problems = Vec::new();
         let mut overrides = Vec::new();
         for f in found {
@@ -206,7 +209,13 @@ impl Ctx {
     fn run(&self, plan: &Plan, records: Vec<Record>, overrides: &[String]) -> Res {
         let digest = self.config_digest()?;
         let used = self.receipt_used();
-        match steps::execute(plan, &self.mode, &self.git, &self.l.root, &digest, &used)? {
+        let mut plan = plan.clone();
+        plan.run_path = self.l.run_path();
+        if let Err(e) = plan.resolve() {
+            return refuse(&[e]);
+        }
+        let plan = &plan;
+        match steps::execute(plan, &self.mode, &self.git, &self.l.root, &digest, self.l.receipt_ttl(), &used)? {
             Ran::DryRun => Ok(0),
             Ran::Ran { outcomes, receipt, stopped } => {
                 let ran: Vec<String> = outcomes.iter().map(|o| o.describe()).collect();
@@ -223,6 +232,9 @@ impl Ctx {
                     e.steps = ran.clone();
                     if let Some(why) = &stopped {
                         e.steps.push(format!("stopped: {why}"));
+                    }
+                    if let Some(r) = &receipt {
+                        e.id = format!("{}/{}", e.id, &r[..8.min(r.len())]);
                     }
                     e.receipt = receipt.clone();
                     e.overrides = overrides.to_vec();
@@ -526,7 +538,13 @@ pub fn cut(c: &Ctx, line: &str) -> Res {
         c.git_step(
             Kind::Outward,
             &format!("publish {branch}"),
-            &["push", &l.cfg.remote, &format!("{from_commit}:refs/heads/{branch}")],
+            &[
+                "push",
+                "--atomic",
+                &format!("--force-with-lease=refs/heads/{branch}:"),
+                &l.cfg.remote,
+                &format!("{from_commit}:refs/heads/{branch}"),
+            ],
         )
         .expecting(&format!("refs/heads/{branch}"), None)
         .expecting(&format!("refs/heads/{}", l.cfg.main), Some(&main_tip)),
@@ -629,7 +647,13 @@ fn push_tag_steps(c: &Ctx, t: &TagParts) -> Vec<Step> {
         c.git_step(
             Kind::Outward,
             &format!("publish {}", t.name),
-            &["push", &c.l.cfg.remote, &format!("refs/tags/{}", t.name)],
+            &[
+                "push",
+                "--atomic",
+                &format!("--force-with-lease=refs/tags/{}:", t.name),
+                &c.l.cfg.remote,
+                &format!("refs/tags/{}", t.name),
+            ],
         )
         .expecting(&format!("refs/tags/{}", t.name), None)
         .expecting(&format!("refs/heads/{}", t.line_branch), Some(&t.line_tip)),
@@ -744,7 +768,7 @@ fn forward_step(c: &Ctx, branch: &str, tip: &str, main_tip: &str) -> Step {
     let l = &c.l;
     let title = format!("Merge {branch} forward into {}", l.cfg.main);
     let body = format!(
-        "Brings the commits shipped on {branch} into {}. Release lines merge forward only; {} is never merged into {branch}.\n\nOpened by edition.",
+        "Brings the commits shipped on {branch} into {}, as of {tip}. Release lines merge forward only; {} is never merged into {branch}.\n\nOpened by edition.",
         l.cfg.main, l.cfg.main
     );
     Step::plain(
@@ -884,6 +908,8 @@ fn cmd_step(
         env: env_out,
         cwd: c.l.root.clone(),
         expects: Vec::new(),
+        isolated: true,
+        program: std::path::PathBuf::new(),
     })
 }
 /// A platform's build number at a commit, from its configured build file.
@@ -1022,9 +1048,7 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
     let build = build.unwrap_or_default();
     let vals: Vec<(&str, &str)> = vec![
         ("commit", &commit),
-        ("ref", r),
         ("version", &version),
-        ("tag", &tag),
         ("build", &build),
         ("channel", channel),
         ("target", &ch.target),

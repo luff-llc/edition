@@ -367,7 +367,7 @@ mod tests {
         let pin = FilePattern::parse("=\"{version}\" x", &["version"]);
         assert!(pin.is_ok());
         let dep = FilePattern::parse("version = \"={version}\"", &["version"]).expect("pattern");
-        let line = "colophon-core = { path = \"../colophon-core\", version = \"=0.5.2\", features = [\"w\"] }";
+        let line = "inkwell-core = { path = \"../inkwell-core\", version = \"=0.5.2\", features = [\"w\"] }";
         assert_eq!(dep.find_all(line, None), vec![(1, "0.5.2".to_string())]);
         let bare = FilePattern::parse("{version}", &["version"]).expect("bare pattern");
         let pre = FilePattern::parse("v={version}", &["version"]).expect("pattern");

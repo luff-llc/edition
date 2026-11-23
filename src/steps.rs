@@ -9,8 +9,8 @@
 //! expectations (which refs point where) are checked.
 
 use crate::git::Git;
-use crate::util::{now_secs, shell_quote};
-use std::io::Write;
+use crate::util::{now_secs, random_hex, sha256_hex, shell_quote};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -62,6 +62,37 @@ pub struct Step {
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
     pub expects: Vec<Expect>,
+    /// Configured commands run with a cleared environment: the base variables
+    /// (`PATH`, `HOME`, `LANG`, `TMPDIR`) and what the channel declares, nothing else.
+    pub isolated: bool,
+    /// The program, resolved to an absolute path when the plan is made.
+    pub program: PathBuf,
+}
+
+/// The `PATH` configured commands get when `edition.toml` does not set `[run] path`.
+pub const DEFAULT_PATH: &str = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// Inherited variables an isolated command keeps, besides `PATH`.
+pub const BASE_VARS: &[&str] = &["HOME", "LANG", "TMPDIR"];
+
+/// Finds `program` the way a shell would: a path containing `/` is taken relative to
+/// `cwd`; a bare name is searched for in `path`.
+pub fn resolve_program(program: &str, cwd: &Path, path: &str) -> Result<PathBuf, String> {
+    let is_exec = |p: &Path| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+    };
+    if program.contains('/') {
+        let p = if Path::new(program).is_absolute() { PathBuf::from(program) } else { cwd.join(program) };
+        return if is_exec(&p) { Ok(p) } else { Err(format!("{} is not an executable file", p.display())) };
+    }
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
+        let p = Path::new(dir).join(program);
+        if is_exec(&p) {
+            return Ok(p);
+        }
+    }
+    Err(format!("{program} is not on the PATH commands run with ({path})"))
 }
 
 impl Step {
@@ -76,7 +107,28 @@ impl Step {
             env: Vec::new(),
             cwd: cwd.to_path_buf(),
             expects: Vec::new(),
+            isolated: false,
+            program: PathBuf::new(),
         }
+    }
+
+    /// The environment the command runs with (`None`: inherited, for Edition's own
+    /// git and gh steps).
+    pub fn run_env(&self, run_path: &str) -> Option<Vec<(String, String)>> {
+        if !self.isolated {
+            return None;
+        }
+        let mut env = vec![("PATH".to_string(), run_path.to_string())];
+        for k in BASE_VARS {
+            if let Ok(v) = std::env::var(k) {
+                env.push((k.to_string(), v));
+            }
+        }
+        for (k, v) in &self.env {
+            env.retain(|(n, _)| n != k);
+            env.push((k.clone(), v.clone()));
+        }
+        Some(env)
     }
 
     pub fn note(what: &str) -> Step {
@@ -121,11 +173,24 @@ pub struct Plan {
     /// Facts the plan was checked against: `name=value`.
     pub facts: Vec<String>,
     pub remote: String,
+    /// `PATH` for isolated commands.
+    pub run_path: String,
 }
 
 impl Plan {
     pub fn new(title: &str, remote: &str) -> Plan {
-        Plan { title: title.to_string(), remote: remote.to_string(), ..Plan::default() }
+        Plan { title: title.to_string(), remote: remote.to_string(), run_path: DEFAULT_PATH.into(), ..Plan::default() }
+    }
+
+    /// Resolves every step's program to an absolute path. Called once the steps are
+    /// final; the resolved paths are part of the plan hash.
+    pub fn resolve(&mut self) -> Result<(), String> {
+        let inherited = std::env::var("PATH").unwrap_or_default();
+        for s in self.steps.iter_mut().filter(|s| !s.argv.is_empty()) {
+            let path = if s.isolated { self.run_path.clone() } else { inherited.clone() };
+            s.program = resolve_program(&s.argv[0], &s.cwd, &path).map_err(|e| format!("{}: {e}", s.what))?;
+        }
+        Ok(())
     }
 
     pub fn fact(&mut self, k: &str, v: &str) {
@@ -147,14 +212,23 @@ impl Plan {
     /// Notes and timestamps are excluded; environment values are included (hashed,
     /// never printed) so a changed value invalidates the receipt.
     pub fn canonical(&self, config_digest: &str) -> String {
-        let mut t = String::from("edition-plan 1\n");
-        t.push_str(&format!("config {config_digest}\nremote {}\n", self.remote));
+        let mut t = String::from("edition-plan 2\n");
+        t.push_str(&format!("config {config_digest}\nremote {}\nrun-path {:?}\n", self.remote, self.run_path));
         for f in &self.facts {
             t.push_str(&format!("fact {f:?}\n"));
         }
         for s in self.steps.iter().filter(|s| s.kind != Kind::Note) {
             t.push_str(&format!("step {} {:?}\n", s.kind.label(), s.what));
             t.push_str(&format!("  cwd {:?}\n", s.cwd.display().to_string()));
+            t.push_str(&format!("  program {:?}\n", s.program.display().to_string()));
+            match s.run_env(&self.run_path) {
+                Some(env) => {
+                    for (k, v) in env {
+                        t.push_str(&format!("  isolated-env {k:?}={v:?}\n"));
+                    }
+                }
+                None => t.push_str("  inherited-env\n"),
+            }
             for a in &s.argv {
                 t.push_str(&format!("  arg {a:?}\n"));
             }
@@ -168,9 +242,9 @@ impl Plan {
         t
     }
 
-    pub fn receipt(&self, git: &Git, config_digest: &str) -> Result<String, String> {
-        let h = git.hash(&self.canonical(config_digest))?;
-        Ok(h.chars().take(16).collect())
+    /// SHA-256 of the canonical plan.
+    pub fn digest(&self, config_digest: &str) -> String {
+        sha256_hex(self.canonical(config_digest).as_bytes())
     }
 }
 
@@ -203,77 +277,121 @@ pub enum Ran {
     Ran { outcomes: Vec<Outcome>, receipt: Option<String>, stopped: Option<String> },
 }
 
-/// Receipt state, kept in `.edition/receipts` beside the configuration (never committed).
+/// Receipt state, in `.edition/receipts` beside the configuration (never committed).
+///
+/// A dry run issues a random 128-bit nonce and stores `issued <nonce> <plan sha256>
+/// <issued at> <expires at>`. Redemption holds one exclusive lock across reading the
+/// file, validating the nonce (issued, unexpired, unused, same plan hash) and appending
+/// `used <nonce> <time>`, and happens before the first step runs: a crash afterwards
+/// leaves the receipt spent, and the dry run must be repeated.
 pub struct Receipts {
-    path: PathBuf,
+    dir: PathBuf,
 }
 
-pub fn receipt_ttl() -> u64 {
-    std::env::var("EDITION_RECEIPT_TTL").ok().and_then(|v| v.parse().ok()).unwrap_or(1800)
+/// Default and maximum receipt lifetime, in minutes.
+pub const RECEIPT_TTL_DEFAULT: u64 = 30;
+pub const RECEIPT_TTL_MAX: u64 = 60;
+
+fn private(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o077 == 0
 }
 
 impl Receipts {
     pub fn at(root: &Path) -> Receipts {
-        Receipts { path: root.join(".edition").join("receipts") }
+        Receipts { dir: root.join(".edition") }
     }
 
-    fn lines(&self) -> Vec<(String, String, u64)> {
-        std::fs::read_to_string(&self.path)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| {
-                let mut it = l.split(' ');
-                Some((it.next()?.to_string(), it.next()?.to_string(), it.next()?.parse().ok()?))
-            })
-            .collect()
-    }
-
-    fn append(&self, kind: &str, receipt: &str) -> Result<(), String> {
-        let dir = self.path.parent().ok_or("no state directory")?;
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        let ignore = dir.join(".gitignore");
-        if !ignore.exists() {
-            let _ = std::fs::write(&ignore, "*\n");
+    /// Opens the state directory (mode 0700) and returns the locked receipts file
+    /// (mode 0600). Refuses either if group or others can access it.
+    fn open_locked(&self) -> Result<std::fs::File, String> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        if !self.dir.exists() {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&self.dir)
+                .map_err(|e| format!("cannot create {}: {e}", self.dir.display()))?;
+            let _ = std::fs::write(self.dir.join(".gitignore"), "*\n");
         }
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join("receipts.lock"))
-            .map_err(|e| e.to_string())?;
-        lock.lock().map_err(|e| format!("cannot lock receipts: {e}"))?;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|e| format!("cannot write {}: {e}", self.path.display()))?;
-        f.write_all(format!("{kind} {receipt} {}\n", now_secs()).as_bytes()).map_err(|e| e.to_string())?;
-        drop(lock);
-        Ok(())
-    }
-
-    pub fn issue(&self, receipt: &str) -> Result<(), String> {
-        self.append("issued", receipt)
-    }
-
-    /// Checks a receipt and marks it used. `used_elsewhere`: the ledger already has it.
-    pub fn redeem(&self, receipt: &str, used_elsewhere: bool) -> Result<(), String> {
-        let lines = self.lines();
-        if used_elsewhere || lines.iter().any(|(k, r, _)| k == "used" && r == receipt) {
-            return Err(format!("receipt {receipt} was already used; run the dry run again"));
-        }
-        let issued = lines.iter().filter(|(k, r, _)| k == "issued" && r == receipt).map(|(_, _, t)| *t).max();
-        let Some(at) = issued else {
-            return Err(format!("receipt {receipt} was not issued by a dry run of this plan here"));
-        };
-        let age = now_secs().saturating_sub(at);
-        if age > receipt_ttl() {
+        let meta = std::fs::symlink_metadata(&self.dir).map_err(|e| e.to_string())?;
+        if !meta.is_dir() || !private(&meta) {
             return Err(format!(
-                "receipt {receipt} expired ({age}s old, limit {}s); run the dry run again",
-                receipt_ttl()
+                "{} must be a private directory (mode 0700); refusing to use receipts kept there",
+                self.dir.display()
             ));
         }
-        self.append("used", receipt)
+        let path = self.dir.join("receipts");
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
+            return Err(format!("{} must be a regular file", path.display()));
+        }
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let fm = f.metadata().map_err(|e| e.to_string())?;
+        if !private(&fm) {
+            return Err(format!("{} must be private (mode 0600); refusing to use it", path.display()));
+        }
+        f.lock().map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+        Ok(f)
+    }
+
+    fn read_all(f: &mut std::fs::File) -> Result<String, String> {
+        let mut text = String::new();
+        f.rewind().map_err(|e| e.to_string())?;
+        f.read_to_string(&mut text).map_err(|e| e.to_string())?;
+        Ok(text)
+    }
+
+    /// Issues a receipt for a plan hash; returns the nonce the user passes back.
+    pub fn issue(&self, plan_hash: &str, ttl_minutes: u64) -> Result<String, String> {
+        let nonce = random_hex(16)?;
+        let now = now_secs();
+        let mut f = self.open_locked()?;
+        f.write_all(format!("issued {nonce} {plan_hash} {now} {}\n", now + ttl_minutes * 60).as_bytes())
+            .map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+        Ok(nonce)
+    }
+
+    /// Validates and spends a receipt under one lock. `used_elsewhere` reports whether
+    /// the ledger already records it.
+    pub fn redeem(&self, nonce: &str, plan_hash: &str, used_elsewhere: bool) -> Result<(), String> {
+        if nonce.len() != 32 || !nonce.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("a receipt is the 32-character value a dry run printed".into());
+        }
+        let mut f = self.open_locked()?;
+        let text = Self::read_all(&mut f)?;
+        let mut issued: Option<(String, u64)> = None;
+        let mut used = used_elsewhere;
+        for line in text.lines() {
+            let p: Vec<&str> = line.split(' ').collect();
+            match p.as_slice() {
+                ["issued", n, h, _, exp] if *n == nonce => issued = Some((h.to_string(), exp.parse().unwrap_or(0))),
+                ["used", n, _] if *n == nonce => used = true,
+                _ => {}
+            }
+        }
+        if used {
+            return Err(format!("receipt {nonce} was already used; run the dry run again"));
+        }
+        let Some((stored, expires)) = issued else {
+            return Err(format!("receipt {nonce} was not issued by a dry run here"));
+        };
+        if now_secs() > expires {
+            return Err(format!("receipt {nonce} expired; run the dry run again"));
+        }
+        if stored != plan_hash {
+            return Err(format!(
+                "receipt {nonce} does not match this plan (the refs, configuration, environment or remote state changed since the dry run); nothing was run"
+            ));
+        }
+        f.write_all(format!("used {nonce} {}\n", now_secs()).as_bytes()).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+        Ok(())
     }
 }
 
@@ -314,17 +432,18 @@ pub fn execute(
     git: &Git,
     root: &Path,
     config_digest: &str,
+    ttl_minutes: u64,
     used_in_ledger: &dyn Fn(&str) -> bool,
 ) -> Result<Ran, String> {
     plan.print();
     let outward = plan.has_outward();
     let receipts = Receipts::at(root);
+    let _ = git;
     if !mode.apply {
         println!();
         if outward {
-            let r = plan.receipt(git, config_digest)?;
-            receipts.issue(&r)?;
-            println!("Receipt: {r} (valid {} minutes, once)", receipt_ttl() / 60);
+            let r = receipts.issue(&plan.digest(config_digest), ttl_minutes)?;
+            println!("Receipt: {r} (valid {ttl_minutes} minutes, once)");
             println!("Dry run: nothing was run. To run exactly this plan: --apply --confirm {r}");
         } else {
             println!("Dry run: nothing was run. To run it: --apply");
@@ -333,20 +452,11 @@ pub fn execute(
     }
     let mut receipt = None;
     if outward {
-        let want = plan.receipt(git, config_digest)?;
-        match mode.confirm.as_deref() {
-            None => {
-                return Err("this plan has outward steps; run the dry run and pass its receipt with --confirm".into())
-            }
-            Some(c) if c != want => {
-                return Err(format!(
-                    "receipt {c} does not match this plan (the refs, configuration or remote state changed since the dry run, or it was issued for another plan); nothing was run"
-                ))
-            }
-            Some(_) => {}
-        }
-        receipts.redeem(&want, used_in_ledger(&want))?;
-        receipt = Some(want);
+        let Some(nonce) = mode.confirm.as_deref() else {
+            return Err("this plan has outward steps; run the dry run and pass its receipt with --confirm".into());
+        };
+        receipts.redeem(nonce, &plan.digest(config_digest), used_in_ledger(nonce))?;
+        receipt = Some(nonce.to_string());
     }
     let mut outcomes = Vec::new();
     let mut stopped = None;
@@ -362,14 +472,16 @@ pub fn execute(
             }
         }
         println!("> [{}] {}", s.kind.label(), s.what);
-        let mut program = PathBuf::from(&s.argv[0]);
-        if program.components().count() > 1 && program.is_relative() {
-            program = s.cwd.join(program);
-        }
-        let mut c = Command::new(&program);
+        let mut c = Command::new(&s.program);
         c.args(&s.argv[1..]).current_dir(&s.cwd);
-        for (k, v) in &s.env {
-            c.env(k, v);
+        match s.run_env(&plan.run_path) {
+            Some(env) => {
+                c.env_clear();
+                c.envs(env);
+            }
+            None => {
+                c.envs(s.env.iter().cloned());
+            }
         }
         let code = match c.status() {
             Ok(st) => st.code(),

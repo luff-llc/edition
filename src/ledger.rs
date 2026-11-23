@@ -65,7 +65,7 @@ struct File {
 
 pub const GENESIS: &str = "0000000000000000000000000000000000000000";
 
-pub const HEADER: &str = "# Edition ledger: what went where. Append-only; written by `edition`, never by hand.\n# A correction is a new entry. See https://github.com/luff-llc/edition docs/design.md.\n";
+pub const HEADER: &str = "# Edition ledger: what went where. Append-only; written by `edition`, never by hand.\n# A correction is a new entry; see Edition's docs/design.md.\n";
 
 pub fn parse(text: &str) -> Result<Vec<Entry>, String> {
     let f: File = toml::from_str(text).map_err(|e| e.to_string())?;
@@ -237,10 +237,10 @@ mod tests {
             at: "2026-11-23T10:00:00Z".into(),
             by: "agent \"sol\"".into(),
             action: "deploy".into(),
-            product: "colophon".into(),
+            product: "inkwell".into(),
             channel: Some("staging-home".into()),
             tier: Some("staging".into()),
-            target: Some("https://colophon.toolsperson.com".into()),
+            target: Some("https://staging.example.com".into()),
             ref_: "main".into(),
             commit: "abc".into(),
             tree: Some("def".into()),
@@ -251,7 +251,7 @@ mod tests {
             prev: GENESIS.into(),
             receipt: Some("0123456789abcdef".into()),
             approved_by: None,
-            command: vec!["colophon-home.sh".into(), "release".into(), "abc".into()],
+            command: vec!["deploy.sh".into(), "release".into(), "abc".into()],
             evidence: vec!["check rust: exit 0".into(), "line\nbreak\\".into()],
             pins: vec![],
             steps: vec!["deploy: exit 0".into()],
