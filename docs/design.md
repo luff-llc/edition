@@ -212,9 +212,11 @@ remote tip is enough.
   environment**: `PATH` (from `[run] path`, or `/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`),
   `HOME`, `LANG`, `TMPDIR`, and the variables the channel or check declares in `env`.
   Nothing else is inherited, so a script that needs a credential must declare the
-  variable (for example `env = { DEPLOY_TOKEN = "{var.deploy_token}" }`). The program is
-  resolved to an absolute path when the plan is made, and that path is part of the plan
-  hash.
+  variable (for example `env = { DEPLOY_TOKEN = "{var.deploy_token}" }`). A channel's
+  probe gets the channel's `env` too, so a probe can read a private registry with the
+  same credential; `probe_env` gives it its own instead (`probe_env = {}` for none). The
+  program is resolved to an absolute path when the plan is made, and that path is part of
+  the plan hash.
 
 ### Per-machine PATH
 
@@ -315,7 +317,13 @@ A deploy runs its checks before the channel's command and records their results.
 are three kinds of gate:
 
 - **Command checks** (`[checks.NAME] run = [...]`): a test suite, a release-candidate
-  gate script. The exit code is the evidence.
+  gate script. The exit code is the evidence. Checks run on the tree of the commit being
+  deployed, never on whatever this checkout holds: when HEAD has that tree they run here;
+  otherwise Edition checks the commit out, detached, at `.edition/check-tree` (afresh for
+  every plan, dry run included) and runs them there. The plan says which, in a note
+  before the checks and in each check's `cd`. A check that needs installed dependencies
+  (`node_modules`, a build cache) should install them itself, or run the deploy from a
+  branch at the tagged commit.
 - **The parity gate** (`kind = "parity"`): Edition asks Concordance
   (`concordance track --format json`) for the release that matches the version and
   refuses while any item the release carries is not ready on the platforms the release
@@ -329,9 +337,12 @@ are three kinds of gate:
 ### Platforms
 
 `[platforms.NAME]` lists what the product ships: `ios`, `android`, `home`, `js`. The
-version is shared; each platform may declare a build-number file and pattern. A channel
-names its platform; `status` shows, for each tier, the version and build each platform
-holds, side by side, from the ledger. When a Concordance catalog is configured, each
+version is shared; each platform may declare a build-number file and pattern. With a
+Concordance catalog configured, a staging or prod deploy of a platform needs a build label,
+from `--build` or the platform's build file. A library has no build number: a channel of
+`kind = "registry"` (Maven, npm, crates.io) takes the release version as its build when
+neither gives one, and the plan says so. A channel names its platform; `status` shows,
+for each tier, the version and build each platform holds, side by side, from the ledger. When a Concordance catalog is configured, each
 staging or prod deploy of a platform records the build with
 `concordance log uploaded <release> --platform <p> --build <b> --commit <sha>`, keyed by
 the ledger entry so a retry never records it twice.
@@ -504,7 +515,7 @@ offset. Edition never reads it back.
 | `[[version_files]] path`, `pattern`, `after` | where the version is stated |
 | `[platforms.P] build_file`, `build_pattern`, `concordance` | per-platform build number; the platform's name in Concordance |
 | `[checks.C] kind`, `run`, `env`, `note` | `command` or `parity` |
-| `[channels.C] tier`, `kind`, `target`, `platform`, `checks`, `requires`, `approval`, `allow_prerelease`, `run`, `env`, `probe`, `note` | a place a build can go |
+| `[channels.C] tier`, `kind`, `target`, `platform`, `checks`, `requires`, `approval`, `allow_prerelease`, `run`, `env`, `probe`, `probe_env`, `note` | a place a build can go; `kind = "registry"` publishes a library, whose build is its version |
 | `[repos.R] path`, `remote`, `final_tag` | another repository that pins point into |
 | `[[pins]] name`, `file`, `pattern`, `repo` | a pinned dependency |
 | `[remotes.R] public` | marks a remote for the content check |
@@ -517,7 +528,7 @@ offset. Edition never reads it back.
 | `[receipts] ttl_minutes` | receipt lifetime, 1 to 60 (default 30) |
 | `[verify] tags_since` | older tags are not checked against version files |
 
-Placeholders in `run`, `probe`, `env` and check commands, each a whole argument or value:
+Placeholders in `run`, `probe`, `env`, `probe_env` and check commands, each a whole argument or value:
 `{commit}` (the verified SHA), `{version}`, `{build}`, `{channel}`, `{target}`,
 `{var.NAME}`. Environment variables Edition reads: `EDITION_ACTOR`, `EDITION_EVENTS`,
 `EDITION_VAR_<NAME>`.

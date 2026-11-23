@@ -39,6 +39,10 @@ pattern = 'version = "{version}"'
 
 [platforms.home]
 
+# The JavaScript package. It has no build number: a registry channel records the
+# version as its build, so a deploy needs no --build.
+[platforms.js]
+
 # The repository is public: pushes are scanned for internal notes first.
 [remotes.origin]
 public = true
@@ -47,6 +51,9 @@ public = true
 # The home server's deploy script on this machine. Set EDITION_VAR_DEPLOY_SCRIPT;
 # it is printed by name and never recorded.
 deploy_script = ""
+# A token that can publish to, and read from, the package registry.
+# Set EDITION_VAR_NPM_TOKEN; printed by name, never recorded.
+npm_token = ""
 
 [checks.test]
 run = ["cargo", "test", "--workspace", "--locked"]
@@ -78,3 +85,16 @@ checks = ["test"]
 run = ["{var.deploy_script}", "release", "{commit}"]
 env = { HOME_SITE = "production" }
 probe = ["curl", "-fsS", "https://home.example.com/healthz"]
+
+# Publishes @inkwell/core from the release tag. The probe gets the channel's env, so it
+# can read the registry with the same token (`probe_env` would give it its own). The
+# checks run on the tagged commit's tree, even from a main checkout.
+[channels.npm]
+tier = "prod"
+kind = "registry"
+target = "https://registry.npmjs.org"
+platform = "js"
+checks = ["test"]
+run = ["scripts/publish.sh", "npm", "{commit}"]
+env = { NPM_TOKEN = "{var.npm_token}" }
+probe = ["scripts/publish.sh", "npm", "{commit}", "--verify"]

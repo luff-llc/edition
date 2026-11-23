@@ -156,6 +156,10 @@ pub struct Channel {
     /// A read-only command run after a successful deploy (health check).
     #[serde(default)]
     pub probe: Vec<String>,
+    /// The probe's environment. When absent the probe gets the channel's `env`, so a
+    /// probe can read a private registry with the same credential; `probe_env = {}`
+    /// runs it with none.
+    pub probe_env: Option<BTreeMap<String, String>>,
     /// Prod tier only: a pre-release tag (`-rc.N`) is acceptable here (store review builds).
     #[serde(default)]
     pub allow_prerelease: bool,
@@ -166,6 +170,22 @@ pub struct Channel {
     #[serde(default)]
     pub requires: Vec<String>,
     pub note: Option<String>,
+}
+
+/// Channel kinds that publish a library package to a registry (Maven, npm, crates.io).
+/// A library has no build number of its own, so a deploy to one of these records its
+/// version as the build unless `--build` or a platform `build_file` says otherwise.
+pub const REGISTRY_KINDS: &[&str] = &["registry"];
+
+impl Channel {
+    /// The environment the probe runs with: `probe_env` when declared, else `env`.
+    pub fn probe_env(&self) -> &BTreeMap<String, String> {
+        self.probe_env.as_ref().unwrap_or(&self.env)
+    }
+
+    pub fn is_registry(&self) -> bool {
+        REGISTRY_KINDS.contains(&self.kind.as_str())
+    }
 }
 
 /// A git remote of this repository.
@@ -787,7 +807,7 @@ impl Loaded {
                 errs.push(format!("channel `{name}`: names use lowercase letters, digits and hyphens"));
             }
             check_cmd(&format!("channel {name} run"), &ch.run, &ch.env, &mut errs);
-            check_cmd(&format!("channel {name} probe"), &ch.probe, &BTreeMap::new(), &mut errs);
+            check_cmd(&format!("channel {name} probe"), &ch.probe, ch.probe_env(), &mut errs);
             if ch.allow_prerelease && !REVIEW_KINDS.contains(&ch.kind.as_str()) {
                 errs.push(format!(
                     "channel {name}: allow_prerelease is only for review or testing kinds ({}), not `{}`",

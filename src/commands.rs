@@ -1198,6 +1198,45 @@ fn cmd_step(
         dest: None,
     })
 }
+/// Where a deploy's checks run, and how the plan names that place. When HEAD has the
+/// deployed commit's tree, that is this checkout; otherwise a detached checkout of the
+/// commit at `.edition/check-tree`, made afresh for every plan so nothing a previous
+/// check left there carries over. Its path is fixed, so the dry run and the apply hash
+/// to the same plan.
+fn check_tree(c: &Ctx, commit: &str) -> Result<(std::path::PathBuf, String), String> {
+    let root = &c.l.root;
+    let want = c.git.tree(commit).ok_or_else(|| format!("cannot read the tree of {}", short(commit)))?;
+    let head = c.git.resolve("HEAD");
+    if head.as_deref().and_then(|h| c.git.tree(h)).as_deref() == Some(want.as_str()) {
+        let at = head.as_deref().map(short).unwrap_or_default();
+        return Ok((root.clone(), format!("this checkout (HEAD {at} has the tree of {})", short(commit))));
+    }
+    let state = root.join(".edition");
+    crate::steps::ensure_private_dir(&state)?;
+    let ignore = state.join(".gitignore");
+    if std::fs::symlink_metadata(&ignore).is_err() {
+        let _ = std::fs::write(&ignore, "*\n");
+    }
+    let dir = state.join("check-tree");
+    let path = dir.to_str().ok_or("the repository path is not UTF-8")?;
+    if std::fs::symlink_metadata(&dir).is_ok() {
+        c.git.run(&["worktree", "remove", "--force", "--force", path]).map_err(|e| {
+            format!("{} is in the way and is not Edition's check checkout ({e}); remove it", dir.display())
+        })?;
+    }
+    let _ = c.git.run(&["worktree", "prune"]);
+    c.git.run(&["worktree", "add", "--quiet", "--detach", "--force", path, commit])?;
+    let at = head.as_deref().map(short).unwrap_or("no commit");
+    Ok((
+        dir.clone(),
+        format!(
+            "a checkout of {} at {}, not this checkout (HEAD {at} has a different tree)",
+            short(commit),
+            dir.strip_prefix(root).unwrap_or(&dir).display()
+        ),
+    ))
+}
+
 /// A platform's build number at a commit, from its configured build file.
 fn platform_build(l: &Loaded, git: &Git, platform: &str, commit: &str) -> Option<String> {
     let p = l.cfg.platforms.get(platform)?;
@@ -1272,16 +1311,26 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
             if ch.approval == Approval::Touch { " (the command will also ask for a hardware key touch)" } else { "" }
         ));
     }
-    let build = c.build.clone().or_else(|| ch.platform.as_deref().and_then(|p| platform_build(l, &c.git, p, &commit)));
+    let mut build =
+        c.build.clone().or_else(|| ch.platform.as_deref().and_then(|p| platform_build(l, &c.git, p, &commit)));
     if let Some(b) = &build {
         if !valid_build(b) {
             problems.push(format!("build label {b:?} read from the build file may use only letters, digits and dots"));
         }
     }
+    // A library published to a registry has no build number of its own: its version is
+    // the build, unless --build or a build file says otherwise.
+    if build.is_none() && ch.is_registry() && !dev {
+        if let Some(v) = verdict.version.clone().filter(|v| valid_build(v)) {
+            verdict.notes.push(format!("build: {v} (a registry channel's build is its version)"));
+            build = Some(v);
+        }
+    }
     if ch.platform.is_some() && l.cfg.concordance.is_some() && !dev && build.is_none() {
         problems.push(format!(
-            "channel {channel} ships the {} platform: pass --build <label> (or configure its build_file)",
-            ch.platform.clone().unwrap_or_default()
+            "channel {channel} ships the {} platform: pass --build <label> (or configure its build_file{})",
+            ch.platform.clone().unwrap_or_default(),
+            if ch.is_registry() { "; a registry channel uses the version only when it is a final one" } else { "" }
         ));
     }
     // Readiness gate: channels that must already hold this commit, per the ledger.
@@ -1365,11 +1414,31 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
     for p in &pins {
         plan.fact("pin", &format!("{}={}", p.name, p.commit.clone().unwrap_or_default()));
     }
+    // Checks run on the deployed commit's tree: in this checkout when it has that tree,
+    // else in a detached checkout of the commit that Edition makes for them.
+    let has_command_checks = ch.checks.iter().any(|n| l.cfg.checks.get(n).is_some_and(|ck| ck.kind == "command"));
+    let (check_dir, check_place) = if has_command_checks {
+        match check_tree(c, &commit) {
+            Ok((dir, place)) => {
+                plan.fact("checks-tree", &c.git.tree(&commit).unwrap_or_default());
+                plan.fact("checks-cwd", &dir.display().to_string());
+                (dir, Some(place))
+            }
+            Err(e) => return refuse(&[format!("channel {channel}: {e}")]),
+        }
+    } else {
+        (l.root.clone(), None)
+    };
     let built: Result<Vec<Step>, String> = (|| {
         let mut steps = Vec::new();
+        if let Some(place) = &check_place {
+            steps.push(Step::note(&format!("the checks run on the tree of {} in {place}", short(&commit))));
+        }
         for name in &ch.checks {
             if let Some(ck) = l.cfg.checks.get(name).filter(|ck| ck.kind == "command") {
-                steps.push(cmd_step(c, Kind::Check, &format!("check {name}"), &ck.run, &ck.env, &vals)?);
+                let mut s = cmd_step(c, Kind::Check, &format!("check {name}"), &ck.run, &ck.env, &vals)?;
+                s.cwd = check_dir.clone();
+                steps.push(s);
             }
         }
         let kind = if dev { Kind::Local } else { Kind::Outward };
@@ -1394,7 +1463,7 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
         }
         steps.push(run);
         if !ch.probe.is_empty() {
-            steps.push(cmd_step(c, Kind::After, "probe", &ch.probe, &std::collections::BTreeMap::new(), &vals)?);
+            steps.push(cmd_step(c, Kind::After, "probe", &ch.probe, ch.probe_env(), &vals)?);
         }
         Ok(steps)
     })();
