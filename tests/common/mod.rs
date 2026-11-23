@@ -229,7 +229,7 @@ pub fn fake_gh(root: &Path) -> String {
     executable(
         &bin,
         "gh",
-        "#!/bin/sh\nprintf 'GH_HOST=%s %s\\n' \"$GH_HOST\" \"$*\" >> \"$(dirname \"$0\")/gh-calls.log\"\n",
+        "#!/bin/sh\nprintf 'GH_HOST=%s TOKEN=%s %s\\n' \"$GH_HOST\" \"$GH_ENTERPRISE_TOKEN\" \"$*\" >> \"$(dirname \"$0\")/gh-calls.log\"\n",
     );
     format!("\n[run]\npath = \"{}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin\"\n", bin.display())
 }

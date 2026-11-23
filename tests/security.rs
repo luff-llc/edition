@@ -714,3 +714,98 @@ fn the_receipt_file_must_not_be_a_link() {
     assert_eq!(out.code, 2, "{}", out.all());
     assert!(out.stderr.contains("not a link"), "{}", out.stderr);
 }
+
+fn assert_no_secret(work: &Path, outs: &[&Out], events: &Path) {
+    for o in outs {
+        assert!(!o.all().contains("SECRET"), "{}", o.all());
+    }
+    if let Ok(l) = std::fs::read_to_string(work.join("releases/ledger.toml")) {
+        assert!(!l.contains("SECRET"), "{l}");
+    }
+    if let Ok(e) = std::fs::read_to_string(events) {
+        assert!(!e.contains("SECRET"), "{e}");
+    }
+}
+
+#[test]
+fn credentials_in_remote_urls_are_never_shown_or_recorded() {
+    let (root, work, _mirror) = tag_ready("creds");
+    let origin = root.join("origin.git").display().to_string();
+    let events = root.join("events.jsonl");
+    let ev = events.to_str().expect("utf8").to_string();
+    let env = [("EDITION_EVENTS", ev.as_str())];
+
+    // Success: a credentialed URL that works.
+    git(&work, &["config", "remote.origin.url", &format!("file://user:SECRET@localhost{origin}")]);
+    let dry = edition_env(&work, &["tag", "0.6.0"], &env);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    assert!(dry.stdout.contains(&format!("destination: file://localhost{origin}")), "{}", dry.stdout);
+    let ok = edition_env(&work, &["tag", "0.6.0", "--apply", "--confirm", &dry.receipt()], &env);
+    assert_eq!(ok.code, 0, "{}", ok.all());
+    assert!(git(&work, &["ls-remote", "--tags", &origin]).contains("refs/tags/v0.6.0"));
+    let deploy = apply_env(&work, &["deploy", "staging-home", "main"], &env);
+    assert_eq!(deploy.code, 0, "{}", deploy.all());
+
+    // Failure while pushing: the push URL is credentialed and wrong.
+    git(&work, &["checkout", "-q", "release/0.6"]);
+    set_version(&work, "0.6.1");
+    commit_all(&work, "0.6.1");
+    git(&work, &["push", "-q", &origin, "release/0.6"]);
+    git(&work, &["checkout", "-q", "main"]);
+    git(&work, &["config", "remote.origin.pushurl", "file://user:SECRET@localhost/nonexistent/repo.git"]);
+    let dry2 = edition_env(&work, &["tag", "0.6.1"], &env);
+    assert_eq!(dry2.code, 0, "{}", dry2.all());
+    let failed = edition_env(&work, &["tag", "0.6.1", "--apply", "--confirm", &dry2.receipt()], &env);
+    assert_ne!(failed.code, 0, "{}", failed.all());
+
+    // Failure before planning: the fetch URL is credentialed and unreachable.
+    git(&work, &["config", "--unset", "remote.origin.pushurl"]);
+    git(&work, &["config", "remote.origin.url", "file://user:SECRET@localhost/nonexistent/repo.git"]);
+    let refused = edition_env(&work, &["tag", "0.6.1"], &env);
+    assert_ne!(refused.code, 0, "{}", refused.all());
+    let verify = edition_env(&work, &["verify", "--online"], &env);
+
+    assert_no_secret(&work, &[&dry, &ok, &deploy, &dry2, &failed, &refused, &verify], &events);
+    let ledger = std::fs::read_to_string(work.join("releases/ledger.toml")).expect("ledger");
+    assert!(ledger.contains("result = \"failed\""), "{ledger}");
+}
+
+#[test]
+fn the_receipt_directory_must_not_be_a_link() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, work) = project("dir-link", BASE_CONFIG, "0.6.0-dev");
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("mkdir");
+    std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    std::os::unix::fs::symlink(&elsewhere, work.join(".edition")).expect("symlink");
+    let out = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.stderr.contains("not a link"), "{}", out.stderr);
+}
+
+#[test]
+fn declared_enterprise_tokens_reach_gh_but_the_host_comes_from_the_url() {
+    let (root, work) = project("ghe", BASE_CONFIG, "0.6.0-dev");
+    forge_alias(&root, &work);
+    let cfg = format!("{BASE_CONFIG}{}tool_env = [\"GH_ENTERPRISE_TOKEN\"]\n", fake_gh(&root));
+    write(&work, "edition.toml", &cfg);
+    commit_all(&work, "Fake gh with an enterprise token");
+    git(&work, &["push", "-q", "origin", "main"]);
+    line_with_version(&work, "0.5", "0.5.2");
+    git(&work, &["checkout", "-q", "release/0.5"]);
+    write(&work, "fix.md", "fix");
+    commit_all(&work, "Fix");
+    git(&work, &["push", "-q", "origin", "release/0.5"]);
+    git(&work, &["checkout", "-q", "main"]);
+    let env = [("GH_ENTERPRISE_TOKEN", "t-123"), ("GH_HOST", "attacker.example"), ("GH_REPO", "evil/repo")];
+    let out = apply_env(&work, &["forward"], &env);
+    assert_eq!(out.code, 0, "{}", out.all());
+    let calls = std::fs::read_to_string(root.join("bin/gh-calls.log")).expect("gh ran");
+    assert!(calls.contains("GH_HOST=github.com TOKEN=t-123 pr create --repo github.com/example/lib"), "{calls}");
+
+    let bad = format!("{BASE_CONFIG}\n[run]\ntool_env = [\"GH_HOST\"]\n");
+    write(&work, "edition.toml", &bad);
+    let refused = edition(&work, &["status"]);
+    assert_eq!(refused.code, 2);
+    assert!(refused.stderr.contains("GH_HOST may not be passed"), "{}", refused.stderr);
+}

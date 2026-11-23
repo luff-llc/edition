@@ -132,6 +132,18 @@ app: [examples/library](examples/library/edition.toml) and
 [examples/app](examples/app/edition.toml). Every key is described in
 [docs/design.md](docs/design.md#configuration).
 
+## Residual risks
+
+- Same-UID access to receipt state: any process running as you can read and write
+  `.edition/`, as it can the repository.
+- Trust in your global git, ssh and credential-helper configuration, which Edition uses
+  as it is.
+- Pull-request heads are mutable: Edition records the head SHA it checked, but the branch
+  can move after the pull request is opened.
+- Ledger anchoring depends on a protected remote default branch.
+- Locking is POSIX advisory locking, which some network filesystems do not honour.
+- Signed-tag setups may need `GPG_TTY` or `GNUPGHOME` declared in `run.tool_env`.
+
 ## Development
 
 ```sh
@@ -141,7 +153,9 @@ cargo clippy --all-targets
 
 The scenario tests create bare repositories as remotes and never touch the network.
 Dependencies are kept to `serde`, `serde_json` and `toml`, at exact versions with default
-features off.
+features off. There is no `libc` dependency: the two `open(2)` flags Edition needs come
+from a per-target table (macOS; Linux x86_64, aarch64 and arm), and other targets fail to
+compile.
 
 ## License
 

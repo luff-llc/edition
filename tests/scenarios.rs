@@ -243,7 +243,9 @@ fn hotfix_start_then_finish_tags_and_opens_the_forward_merge_in_one_plan() {
     assert!(git(&work, &["ls-remote", "--tags", "origin"]).contains("refs/tags/v0.5.3"));
     let calls = std::fs::read_to_string(root.join("bin/gh-calls.log")).expect("gh ran");
     assert!(
-        calls.contains("GH_HOST=github.com pr create --repo github.com/example/lib --base main --head release/0.5"),
+        calls.contains(
+            "GH_HOST=github.com TOKEN= pr create --repo github.com/example/lib --base main --head release/0.5"
+        ),
         "{calls}"
     );
     let ledger = std::fs::read_to_string(work.join("releases/ledger.toml")).expect("ledger");

@@ -191,6 +191,17 @@ impl Ctx {
     }
 
     fn record(&self, e: &Entry) -> Result<Entry, String> {
+        // Nothing that reaches the ledger may carry credentials from a URL.
+        let r = crate::util::redact;
+        let mut e = e.clone();
+        for v in [&mut e.command, &mut e.evidence, &mut e.steps, &mut e.pins, &mut e.overrides] {
+            for x in v.iter_mut() {
+                *x = r(x);
+            }
+        }
+        e.target = e.target.as_deref().map(r);
+        e.note = e.note.as_deref().map(r);
+        let e = &e;
         let written = ledger::append(&self.git, &self.l.ledger_path(), e)?;
         let kind = if e.action == "deploy" { "channel-updated" } else { "ref-published" };
         crate::util::emit_event(
@@ -259,7 +270,8 @@ impl Ctx {
 }
 
 fn refuse(problems: &[String]) -> Res {
-    for p in problems {
+    let problems: Vec<String> = problems.iter().map(|p| crate::util::redact(p)).collect();
+    for p in &problems {
         eprintln!("refused: {p}");
     }
     crate::util::emit_event("refused", &[("reason", &problems.join("; "))]);
@@ -786,10 +798,14 @@ pub fn hotfix_finish(c: &Ctx, version: &str) -> Res {
 /// that host, explicitly (`--repo host/owner/name`, `GH_HOST`).
 fn forward_step(c: &Ctx, view: &RemoteView, branch: &str, tip: &str, main_tip: &str) -> Result<Step, String> {
     let l = &c.l;
-    let Some((host, repo)) = crate::git::forge_repo(&view.raw_url) else {
+    // The effective URL first (it is where pushes go); the configured URL covers a
+    // remote that git rewrites to a local path.
+    let Some((host, repo)) = crate::git::forge_repo(&view.fetch_url).or_else(|| crate::git::forge_repo(&view.raw_url))
+    else {
         return Err(format!(
             "cannot tell which repository gh should open the pull request in from {}'s URL ({})",
-            view.remote, view.raw_url
+            view.remote,
+            crate::util::redact(&view.fetch_url)
         ));
     };
     let title = format!("Merge {branch} forward into {}", l.cfg.main);

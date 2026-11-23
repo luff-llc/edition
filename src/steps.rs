@@ -100,11 +100,12 @@ pub fn resolve_program(program: &str, cwd: &Path, path: &str) -> Result<PathBuf,
 impl Step {
     /// A step whose arguments are all safe to print and record (git, gh).
     pub fn plain(kind: Kind, what: &str, argv: Vec<String>, cwd: &Path) -> Step {
+        let shown: Vec<String> = argv.iter().map(|a| crate::util::redact(a)).collect();
         Step {
             kind,
-            what: what.to_string(),
-            shown: argv.clone(),
-            template: argv.clone(),
+            what: crate::util::redact(what),
+            template: shown.clone(),
+            shown,
             argv,
             env: Vec::new(),
             cwd: cwd.to_path_buf(),
@@ -165,7 +166,7 @@ impl Step {
             }
         }
         if let Some(d) = &self.dest {
-            s.push_str(&format!("\n      destination: {d}"));
+            s.push_str(&format!("\n      destination: {}", crate::util::redact(d)));
         }
         for e in &self.expects {
             s.push_str(&format!(
@@ -303,18 +304,25 @@ pub struct Receipts {
 pub const RECEIPT_TTL_DEFAULT: u64 = 30;
 pub const RECEIPT_TTL_MAX: u64 = 60;
 
+// open(2) flags, per target, so no libc dependency is needed. Values from each
+// platform's <fcntl.h>; any other target fails to compile rather than guess.
 #[cfg(target_os = "macos")]
 const O_NOFOLLOW: i32 = 0x0100;
 #[cfg(target_os = "macos")]
 const O_DIRECTORY: i32 = 0x0010_0000;
-#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
-const O_NOFOLLOW: i32 = 0o100_000;
-#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
-const O_DIRECTORY: i32 = 0o40_000;
-#[cfg(all(not(target_os = "macos"), not(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))))]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const O_NOFOLLOW: i32 = 0o400_000;
-#[cfg(all(not(target_os = "macos"), not(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))))]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const O_DIRECTORY: i32 = 0o200_000;
+#[cfg(all(target_os = "linux", target_arch = "arm"))]
+const O_NOFOLLOW: i32 = 0o100_000;
+#[cfg(all(target_os = "linux", target_arch = "arm"))]
+const O_DIRECTORY: i32 = 0o40_000;
+#[cfg(not(any(
+    target_os = "macos",
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm"))
+)))]
+compile_error!("Edition knows O_NOFOLLOW and O_DIRECTORY for macOS and Linux x86_64, aarch64 and arm only");
 
 fn private(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -439,7 +447,7 @@ pub fn check_expects(git: &Git, remote: &str, expects: &[Expect]) -> Option<Stri
     }
     let (heads, tags) = match git.ls_remote(remote) {
         Ok(x) => x,
-        Err(e) => return Some(format!("cannot read {remote}: {e}")),
+        Err(e) => return Some(crate::util::redact(&format!("cannot read {remote}: {e}"))),
     };
     for e in expects {
         let actual = if let Some(h) = e.refname.strip_prefix("refs/heads/") {
@@ -513,11 +521,27 @@ pub fn execute(
         c.args(&s.argv[1..]).current_dir(&s.cwd);
         c.env_clear();
         c.envs(s.run_env(&plan.run_path, &plan.tool_env));
-        let code = match c.status() {
-            Ok(st) => st.code(),
-            Err(e) => {
-                eprintln!("edition: cannot run {}: {e}", s.shown.first().cloned().unwrap_or_default());
-                None
+        // Edition's own git and gh output can name the remote URL: capture it and print it
+        // redacted. Configured commands write straight to the terminal.
+        let code = if s.isolated {
+            match c.status() {
+                Ok(st) => st.code(),
+                Err(e) => {
+                    eprintln!("edition: cannot run {}: {e}", s.shown.first().cloned().unwrap_or_default());
+                    None
+                }
+            }
+        } else {
+            match c.output() {
+                Ok(out) => {
+                    print!("{}", crate::util::redact(&String::from_utf8_lossy(&out.stdout)));
+                    eprint!("{}", crate::util::redact(&String::from_utf8_lossy(&out.stderr)));
+                    out.status.code()
+                }
+                Err(e) => {
+                    eprintln!("edition: cannot run {}: {e}", s.shown.first().cloned().unwrap_or_default());
+                    None
+                }
             }
         };
         let o = Outcome { index: i, kind: s.kind, what: s.what.clone(), code };

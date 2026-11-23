@@ -142,6 +142,33 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Removes credentials from any URL in `text`: userinfo (`user:token@`) after `://` and
+/// query strings or fragments. Used for everything Edition prints, records or emits;
+/// the full value is kept only for hashing and execution.
+pub fn redact(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        out.push_str(&rest[..i + 3]);
+        let after = &rest[i + 3..];
+        let end =
+            after.find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ')' | '>' | ',')).unwrap_or(after.len());
+        let token = &after[..end];
+        let auth_end = token.find('/').unwrap_or(token.len());
+        let mut t = match token[..auth_end].rfind('@') {
+            Some(at) => token[at + 1..].to_string(),
+            None => token.to_string(),
+        };
+        if let Some(q) = t.find(['?', '#']) {
+            t.truncate(q);
+        }
+        out.push_str(&t);
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Quotes an argument for display so a printed command can be pasted into a shell.
 pub fn shell_quote(s: &str) -> String {
     if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:@%+,^{}~".contains(c)) {
@@ -182,7 +209,7 @@ pub fn emit_event(kind: &str, fields: &[(&str, &str)]) {
     m.insert("at".into(), serde_json::Value::String(now_utc()));
     for (k, v) in fields {
         if !v.is_empty() {
-            m.insert((*k).into(), serde_json::Value::String((*v).into()));
+            m.insert((*k).into(), serde_json::Value::String(redact(v)));
         }
     }
     let line = format!("{}\n", serde_json::Value::Object(m));
@@ -223,6 +250,16 @@ mod tests {
         let r = random_hex(16).expect("random");
         assert_eq!(r.len(), 32);
         assert_ne!(r, random_hex(16).expect("random"));
+    }
+
+    #[test]
+    fn redaction() {
+        assert_eq!(redact("https://user:tok@host/o/n.git"), "https://host/o/n.git");
+        assert_eq!(redact("to https://tok@host/x?access_token=abc done"), "to https://host/x done");
+        assert_eq!(redact("file://u:p@localhost/srv/r.git"), "file://localhost/srv/r.git");
+        assert_eq!(redact("git@host:o/n.git"), "git@host:o/n.git");
+        assert_eq!(redact("'https://a:b@h/p' and https://c@d/e"), "'https://h/p' and https://d/e");
+        assert_eq!(redact("no urls here"), "no urls here");
     }
 
     #[test]

@@ -30,11 +30,7 @@ pub const SAFE_CONFIG: &[&str] =
 
 /// Names that may never be passed through to git or gh, even when declared.
 pub fn forbidden_tool_var(name: &str) -> bool {
-    name.starts_with("GIT_")
-        || matches!(
-            name,
-            "GH_HOST" | "GH_REPO" | "GH_ENTERPRISE_TOKEN" | "GITHUB_ENTERPRISE_TOKEN" | "GH_CONFIG_DIR" | "PATH"
-        )
+    name.starts_with("GIT_") || matches!(name, "GH_HOST" | "GH_REPO" | "GH_CONFIG_DIR" | "PATH")
 }
 
 /// The environment git and gh run with: `PATH`, the allowlist, the declared token
@@ -58,7 +54,8 @@ pub fn tool_env(path: &str, declared: &[String]) -> Vec<(String, String)> {
 /// and `ssh://[user@]host[:port]/owner/name(.git)`.
 pub fn forge_repo(url: &str) -> Option<(String, String)> {
     let (host, path) = if let Some(rest) = url.strip_prefix("https://") {
-        rest.split_once('/')?
+        let (h, p) = rest.split_once('/')?;
+        (h.rsplit('@').next()?, p)
     } else if let Some(rest) = url.strip_prefix("ssh://") {
         let (h, p) = rest.split_once('/')?;
         (h.rsplit('@').next()?.split(':').next()?, p)
@@ -129,7 +126,7 @@ impl Git {
         let push = self.run(&["remote", "get-url", "--push", "--", remote])?;
         let raw = self.run(&["config", "--get", &format!("remote.{remote}.url")]).unwrap_or_else(|_| fetch.clone());
         if [&fetch, &push, &raw].iter().any(|u| u.is_empty() || u.starts_with('-') || u.chars().any(char::is_control)) {
-            return Err(format!("remote {remote} has an unusable URL"));
+            return Err(format!("remote {remote} has an unusable URL ({})", crate::util::redact(&fetch)));
         }
         Ok((fetch, push, raw))
     }
@@ -139,12 +136,12 @@ impl Git {
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
         } else {
-            Err(format!(
+            Err(crate::util::redact(&format!(
                 "git {} failed in {}: {}",
                 args.join(" "),
                 self.dir.display(),
                 String::from_utf8_lossy(&out.stderr).trim()
-            ))
+            )))
         }
     }
 
@@ -291,5 +288,32 @@ impl Git {
 
     pub fn is_tracked(&self, path: &str) -> bool {
         self.ok(&["ls-files", "--error-unmatch", "--", path])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forge_urls() {
+        let gh = Some(("github.com".to_string(), "o/n".to_string()));
+        assert_eq!(forge_repo("https://github.com/o/n.git"), gh);
+        assert_eq!(forge_repo("https://user:tok@github.com/o/n"), gh);
+        assert_eq!(forge_repo("git@github.com:o/n.git"), gh);
+        assert_eq!(forge_repo("ssh://git@github.com:22/o/n.git"), gh);
+        assert_eq!(forge_repo("/srv/git/n.git"), None);
+        assert_eq!(forge_repo("gh:o/n"), None);
+        assert_eq!(forge_repo("https://github.com/o/n/extra"), None);
+    }
+
+    #[test]
+    fn tool_variables() {
+        assert!(forbidden_tool_var("GIT_DIR"));
+        assert!(forbidden_tool_var("GH_HOST"));
+        assert!(forbidden_tool_var("GH_REPO"));
+        assert!(!forbidden_tool_var("GH_ENTERPRISE_TOKEN"));
+        assert!(!forbidden_tool_var("GH_TOKEN"));
+        assert!(!forbidden_tool_var("GNUPGHOME"));
     }
 }

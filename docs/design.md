@@ -127,6 +127,8 @@ after that leaves the receipt spent: run the dry run again.
 
 - The lifetime is 30 minutes, configurable as `[receipts] ttl_minutes` up to 60. There is
   no clock or lifetime override in the environment.
+- `O_NOFOLLOW` and `O_DIRECTORY` come from a per-target table (macOS; Linux x86_64,
+  aarch64 and arm) so no `libc` dependency is needed; any other target fails to compile.
 - The directory is opened once without following links and checked through the handle
   (a directory, mode 0700); the file is opened relative to that path with `O_NOFOLLOW` and
   checked through its handle (a regular file, mode 0600, same owner as the directory);
@@ -190,8 +192,9 @@ Edition's own git and gh calls, read-only or outward, are bound the same way:
 
 - They run with a cleared environment: `PATH` (from `[run] path` or the default), `HOME`,
   `LANG`, `TMPDIR`, `SSH_AUTH_SOCK`, the git author and committer identity variables, and
-  only those token variables listed in `[run] tool_env` (such as `GH_TOKEN`). `GIT_*`
-  variables, `GH_HOST`, `GH_REPO` and enterprise tokens can never be passed through, so
+  only those variables listed in `[run] tool_env` (such as `GH_TOKEN`,
+  `GH_ENTERPRISE_TOKEN`, `GPG_TTY` or `GNUPGHOME`). `GIT_*` variables, `GH_HOST`,
+  `GH_REPO` and `GH_CONFIG_DIR` can never be passed through, so
   `GIT_DIR`, `GIT_CONFIG_*`, `GIT_SSH_COMMAND` and the like in the caller's environment
   have no effect. `GIT_CONFIG_NOSYSTEM=1` is set.
 - Every git call forces `core.hooksPath=/dev/null`, `core.fsmonitor=false` and
@@ -202,8 +205,12 @@ Edition's own git and gh calls, read-only or outward, are bound the same way:
   that would redirect the remote, even to a mirror with identical refs, changes the plan
   recomputed at apply time and the receipt is refused.
 - gh is called with `--repo <host>/<owner>/<name>` and `GH_HOST` derived from the remote's
-  configured URL; a plan whose URL does not name a forge repository is refused.
+  effective URL (or, when git rewrites it to a local path, its configured URL); a plan
+  whose URL does not name a forge repository is refused.
 - The plan shows the destination of every outward step.
+- URLs are kept verbatim only for hashing and execution. Everything Edition prints,
+  records or emits (plans, errors, git's own output from Edition's steps, the ledger, the
+  event stream) has userinfo (`user:token@`) and query strings removed.
 
 The trusted base is the user's global git configuration and what it names: credential
 helpers, ssh configuration and `includeIf` files. Edition does not and cannot vet those.
@@ -354,7 +361,7 @@ offset. Edition never reads it back.
 | `[concordance] catalog`, `release`, `bin` | the Concordance catalog; the release id template (`{version}`) |
 | `[vars] NAME` | values for `{var.NAME}`; an empty value must come from `EDITION_VAR_NAME` on the machine and is treated as secret |
 | `[run] path` | `PATH` for every command Edition runs, including git and gh (absolute directories) |
-| `[run] tool_env` | token variables git and gh may inherit, such as `GH_TOKEN` |
+| `[run] tool_env` | variables git and gh may inherit, such as `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GPG_TTY`, `GNUPGHOME` |
 | `[receipts] ttl_minutes` | receipt lifetime, 1 to 60 (default 30) |
 | `[verify] tags_since` | older tags are not checked against version files |
 

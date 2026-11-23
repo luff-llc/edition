@@ -103,7 +103,7 @@ pub fn run(args: &[String]) -> i32 {
     match dispatch(o) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("edition: {e}");
+            eprintln!("edition: {}", crate::util::redact(&e));
             2
         }
     }
