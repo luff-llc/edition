@@ -233,6 +233,8 @@ impl Ctx {
         let mut plan = plan.clone();
         plan.run_path = self.l.run_path();
         plan.tool_env = self.git.env.clone();
+        plan.trusted_dirs = self.l.trusted_dirs.clone();
+        plan.skipped_dirs = self.l.skipped_dirs.clone();
         if let Err(e) = plan.resolve() {
             return refuse(&[e]);
         }
@@ -381,6 +383,9 @@ pub fn plan(c: &Ctx, version: &str) -> Res {
     let line = v.line();
     let branch = l.line_branch_name(&line);
     crate::say!("Release {} {v}", l.cfg.product);
+    if !l.trusted_dirs.is_empty() {
+        crate::say!("  trusting group-writable PATH directories: {}", l.trusted_dirs.join(", "));
+    }
     let tip = view.branch(&branch).map(str::to_string);
     match &tip {
         Some(t) => {

@@ -145,6 +145,8 @@ app: [examples/library](examples/library/edition.toml) and
 - Signed-tag setups may need `GPG_TTY` or `GNUPGHOME` declared in `run.tool_env`.
 - Output printed by configured channel commands is passed through to the terminal as-is;
   Edition does not redact it.
+- Trusting a group-writable directory (`[run] trust_group_writable`) lets any member of
+  that group replace the tools Edition runs.
 
 ## Development
 

@@ -195,6 +195,11 @@ pub struct Plan {
     pub run_path: String,
     /// The environment for Edition's own git and gh steps.
     pub tool_env: Vec<(String, String)>,
+    /// Group-writable `PATH` directories trusted by configuration (printed and hashed).
+    pub trusted_dirs: Vec<String>,
+    /// Default `PATH` directories skipped for being group-writable (named when a program
+    /// is not found).
+    pub skipped_dirs: Vec<String>,
 }
 
 impl Plan {
@@ -207,7 +212,17 @@ impl Plan {
     pub fn resolve(&mut self) -> Result<(), String> {
         for s in self.steps.iter_mut().filter(|s| !s.argv.is_empty()) {
             let path = self.run_path.clone();
-            s.program = resolve_program(&s.argv[0], &s.cwd, &path).map_err(|e| format!("{}: {e}", s.what))?;
+            s.program = resolve_program(&s.argv[0], &s.cwd, &path).map_err(|e| {
+                let hint = if self.skipped_dirs.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; skipped for being group-writable: {} (list a directory in [run] trust_group_writable to use it)",
+                        self.skipped_dirs.join(", ")
+                    )
+                };
+                format!("{}: {e}{hint}", s.what)
+            })?;
         }
         Ok(())
     }
@@ -222,6 +237,9 @@ impl Plan {
 
     pub fn print(&self) {
         crate::say!("{}", self.title);
+        if !self.trusted_dirs.is_empty() {
+            crate::say!("  trusting group-writable PATH directories: {}", self.trusted_dirs.join(", "));
+        }
         for s in &self.steps {
             crate::say!("{}", s.display());
         }
@@ -233,6 +251,9 @@ impl Plan {
     pub fn canonical(&self, config_digest: &str) -> String {
         let mut t = String::from("edition-plan 2\n");
         t.push_str(&format!("config {config_digest}\nremote {}\nrun-path {:?}\n", self.remote, self.run_path));
+        for d in &self.trusted_dirs {
+            t.push_str(&format!("trusted-group-writable {d:?}\n"));
+        }
         for f in &self.facts {
             t.push_str(&format!("fact {f:?}\n"));
         }

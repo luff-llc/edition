@@ -871,7 +871,7 @@ fn run_path_refuses_an_untrustworthy_home_or_directory() {
     write(&work, "edition.toml", &home_config(&format!("{}:/usr/bin:/bin", open.display())));
     let writable = edition(&work, &["status"]);
     assert_eq!(writable.code, 2, "{}", writable.all());
-    assert!(writable.stderr.contains("writable by its group or others"), "{}", writable.stderr);
+    assert!(writable.stderr.contains("writable by others"), "{}", writable.stderr);
     write(&work, "edition.toml", &home_config("bin:/usr/bin"));
     assert_eq!(edition(&work, &["status"]).code, 2);
 }
@@ -922,4 +922,55 @@ fn run_path_refuses_group_writable_foreign_or_exposed_directories() {
         }
         None => eprintln!("skipped: no directory owned by another non-root user is visible on this system"),
     }
+}
+
+#[test]
+fn a_group_writable_directory_is_trusted_only_when_listed() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, work) = project("trust-group", BASE_CONFIG, "0.6.0-dev");
+    let group = root.join("group-bin");
+    std::fs::create_dir(&group).expect("mkdir");
+    std::fs::set_permissions(&group, std::fs::Permissions::from_mode(0o775)).expect("chmod");
+    let dir = group.display().to_string();
+    write(&work, "edition.toml", &home_config(&format!("{dir}:/usr/bin:/bin")));
+    let refused = edition(&work, &["status"]);
+    assert_eq!(refused.code, 2, "{}", refused.all());
+    assert!(refused.stderr.contains("trust_group_writable"), "{}", refused.stderr);
+
+    let cfg = format!("{BASE_CONFIG}\n[run]\npath = \"{dir}:/usr/bin:/bin\"\ntrust_group_writable = [\"{dir}\"]\n");
+    write(&work, "edition.toml", &cfg);
+    commit_all(&work, "Trust the group directory");
+    git(&work, &["push", "-q", "origin", "main"]);
+    let dry = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    assert!(dry.stdout.contains(&format!("trusting group-writable PATH directories: {dir}")), "{}", dry.stdout);
+
+    // A path that is not canonical is rejected rather than matched loosely.
+    let loose = format!("{BASE_CONFIG}\n[run]\npath = \"{dir}:/usr/bin:/bin\"\ntrust_group_writable = [\"{dir}/\"]\n");
+    write(&work, "edition.toml", &loose);
+    assert_eq!(edition(&work, &["status"]).code, 2);
+}
+
+#[test]
+fn a_missing_program_names_the_default_directories_skipped_as_group_writable() {
+    use std::os::unix::fs::PermissionsExt;
+    let skipped: Vec<&str> = edition::steps::DEFAULT_PATH
+        .split(':')
+        .filter(|d| std::fs::metadata(d).is_ok_and(|m| m.is_dir() && m.permissions().mode() & 0o020 != 0))
+        .collect();
+    let Some(dir) = skipped.first() else {
+        eprintln!("skipped: no directory in the default PATH is group-writable on this system");
+        return;
+    };
+    let cfg = BASE_CONFIG.replace(
+        "run = [\"scripts/record.sh\", \"staging-deploys.txt\", \"{commit}\"]",
+        "run = [\"no-such-edition-tool\", \"{commit}\"]",
+    );
+    let (_root, work) = project("missing-tool", &cfg, "0.6.0-dev");
+    let out = edition(&work, &["deploy", "staging-home", "main"]);
+    assert_eq!(out.code, 1, "{}", out.all());
+    assert!(out.stderr.contains("skipped for being group-writable"), "{}", out.stderr);
+    let canon = std::fs::canonicalize(dir).expect("canon").display().to_string();
+    assert!(out.stderr.contains(&canon), "{}", out.stderr);
+    assert!(out.stderr.contains("trust_group_writable"), "{}", out.stderr);
 }

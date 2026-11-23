@@ -230,6 +230,10 @@ pub struct RunCfg {
     /// `GH_HOST`, `GH_REPO` or enterprise tokens.
     #[serde(default)]
     pub tool_env: Vec<String>,
+    /// Group-writable directories to trust in `path` (exact canonical paths). Any member
+    /// of the group can replace the programs in them.
+    #[serde(default)]
+    pub trust_group_writable: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -343,6 +347,10 @@ pub struct Loaded {
     pub raw: String,
     /// The checked `PATH` for every command Edition runs.
     pub run_path: String,
+    /// Group-writable directories trusted by `[run] trust_group_writable` and in use.
+    pub trusted_dirs: Vec<String>,
+    /// Default directories skipped for being group-writable.
+    pub skipped_dirs: Vec<String>,
 }
 
 /// The effective user id, without libc: the owner of a file this process just created.
@@ -360,28 +368,64 @@ fn current_uid() -> Result<u32, String> {
     .clone()
 }
 
-/// The `run.path` trust rule. An entry must be owned by root or the current user and
-/// writable by neither its group nor others. Each ancestor up to `/` must be owned by
-/// root or the current user, and may be group- or other-writable only if it is sticky
-/// (as `/tmp` is), because a sticky directory does not let others rename or replace an
-/// entry they do not own.
-fn trusted_dir(path: &std::path::Path, meta: &std::fs::Metadata, entry: bool) -> Result<(), String> {
+/// Why a directory failed the `run.path` rule.
+#[derive(Debug)]
+enum Untrusted {
+    /// Group-writable, owned by root or the user, and not listed in `trust_group_writable`.
+    Group(String),
+    Other(String),
+}
+
+/// The `run.path` trust rule, for an entry and each of its ancestors up to `/`:
+/// - owned by root or the current user, always;
+/// - never writable by others, except an ancestor with the sticky bit (as `/tmp` is);
+/// - not group-writable unless its exact canonical path is in `trust_group_writable`.
+fn trusted_dir(
+    path: &std::path::Path,
+    meta: &std::fs::Metadata,
+    entry: bool,
+    trusted: &[String],
+    used: &mut Vec<String>,
+) -> Result<(), Untrusted> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let uid = current_uid().map_err(|e| format!("cannot tell the current user: {e}"))?;
+    let uid = current_uid().map_err(|e| Untrusted::Other(format!("cannot tell the current user: {e}")))?;
     let what = if entry { "run.path entry" } else { "run.path ancestor" };
     if meta.uid() != 0 && meta.uid() != uid {
-        return Err(format!("{what} {} is owned by another user; refusing to run commands from it", path.display()));
+        return Err(Untrusted::Other(format!(
+            "{what} {} is owned by another user; refusing to run commands from it",
+            path.display()
+        )));
     }
     let mode = meta.permissions().mode();
-    let writable = mode & 0o022 != 0;
     let sticky = mode & 0o1000 != 0;
-    if writable && (entry || !sticky) {
-        return Err(format!(
-            "{what} {} is writable by its group or others; refusing to run commands from it",
+    if mode & 0o002 != 0 && (entry || !sticky) {
+        return Err(Untrusted::Other(format!(
+            "{what} {} is writable by others; refusing to run commands from it",
             path.display()
-        ));
+        )));
+    }
+    if mode & 0o020 != 0 && (entry || !sticky) {
+        let p = path.display().to_string();
+        if trusted.contains(&p) {
+            if !used.contains(&p) {
+                used.push(p);
+            }
+        } else {
+            return Err(Untrusted::Group(format!(
+                "{what} {p} is writable by its group; list it in [run] trust_group_writable to trust it"
+            )));
+        }
     }
     Ok(())
+}
+
+/// The checked `PATH`, the group-writable directories it trusts, and the default
+/// directories it skipped for being group-writable.
+#[derive(Clone, Debug, Default)]
+pub struct RunPath {
+    pub path: String,
+    pub trusted: Vec<String>,
+    pub skipped_group: Vec<String>,
 }
 
 /// Resolves `[run] path` (or the default) into the `PATH` every command runs with.
@@ -389,9 +433,10 @@ fn trusted_dir(path: &std::path::Path, meta: &std::fs::Metadata, entry: bool) ->
 /// absolute, without `:`, canonical, and not writable by others; entries that do not
 /// exist are dropped. Planning runs git before any receipt exists, so this is checked
 /// before anything runs.
-pub fn checked_run_path(configured: Option<&str>) -> Result<String, String> {
+pub fn checked_run_path(configured: Option<&str>, trust: &[String]) -> Result<RunPath, String> {
     let p = configured.unwrap_or(crate::steps::DEFAULT_PATH);
-    let mut out: Vec<String> = Vec::new();
+    let mut out = RunPath::default();
+    let mut dirs: Vec<String> = Vec::new();
     for d in p.split(':').filter(|d| !d.is_empty()) {
         let expanded = match d.strip_prefix("~/") {
             Some(rest) => {
@@ -414,32 +459,44 @@ pub fn checked_run_path(configured: Option<&str>) -> Result<String, String> {
         if !meta.is_dir() {
             continue;
         }
-        let check = || -> Result<(), String> {
-            trusted_dir(&canon, &meta, true)?;
+        let mut used = Vec::new();
+        let mut check = || -> Result<(), Untrusted> {
+            trusted_dir(&canon, &meta, true, trust, &mut used)?;
             let mut up = canon.parent();
             while let Some(a) = up {
-                let am = std::fs::metadata(a).map_err(|e| format!("run.path ancestor {}: {e}", a.display()))?;
-                trusted_dir(a, &am, false)?;
+                let am = std::fs::metadata(a)
+                    .map_err(|e| Untrusted::Other(format!("run.path ancestor {}: {e}", a.display())))?;
+                trusted_dir(a, &am, false, trust, &mut used)?;
                 up = a.parent();
             }
             Ok(())
         };
         match check() {
             Ok(()) => {}
-            // The built-in default skips directories that fail the rule (Homebrew's bin
-            // is group-writable by design); a configured entry that fails is an error.
+            // The built-in default skips directories that fail the rule; a configured
+            // entry that fails is an error.
+            Err(Untrusted::Group(_)) if configured.is_none() => {
+                out.skipped_group.push(canon.display().to_string());
+                continue;
+            }
             Err(_) if configured.is_none() => continue,
-            Err(e) => return Err(e),
+            Err(Untrusted::Group(e)) | Err(Untrusted::Other(e)) => return Err(e),
+        }
+        for u in used {
+            if !out.trusted.contains(&u) {
+                out.trusted.push(u);
+            }
         }
         let c = canon.display().to_string();
         if c.contains(':') {
             return Err(format!("run.path entry {c:?} contains `:`"));
         }
-        if !out.contains(&c) {
-            out.push(c);
+        if !dirs.contains(&c) {
+            dirs.push(c);
         }
     }
-    Ok(out.join(":"))
+    out.path = dirs.join(":");
+    Ok(out)
 }
 
 /// Channel kinds that are review or testing tracks, where a release candidate may go.
@@ -486,10 +543,15 @@ impl Loaded {
             todos,
             raw: text.clone(),
             run_path: String::new(),
+            trusted_dirs: Vec::new(),
+            skipped_dirs: Vec::new(),
         };
         loaded.validate()?;
-        loaded.run_path =
-            checked_run_path(loaded.cfg.run.path.as_deref()).map_err(|e| format!("{}: {e}", path.display()))?;
+        let rp = checked_run_path(loaded.cfg.run.path.as_deref(), &loaded.cfg.run.trust_group_writable)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        loaded.run_path = rp.path;
+        loaded.trusted_dirs = rp.trusted;
+        loaded.skipped_dirs = rp.skipped_group;
         Ok(loaded)
     }
 
@@ -638,6 +700,15 @@ impl Loaded {
         if let Some(t) = c.receipts.ttl_minutes {
             if t == 0 || t > crate::steps::RECEIPT_TTL_MAX {
                 errs.push(format!("receipts.ttl_minutes must be between 1 and {}", crate::steps::RECEIPT_TTL_MAX));
+            }
+        }
+        for d in &c.run.trust_group_writable {
+            let canonical = std::fs::canonicalize(d).map(|p| p.display().to_string()).ok();
+            if !d.starts_with('/') || d.contains(['*', '?', '[']) || canonical.as_deref() != Some(d.as_str()) {
+                errs.push(format!(
+                    "run.trust_group_writable: {d:?} must be an existing directory's exact canonical path{}",
+                    canonical.map(|c| format!(" (did you mean {c:?}?)")).unwrap_or_default()
+                ));
             }
         }
         for v in &c.run.tool_env {
