@@ -212,9 +212,13 @@ remote tip is enough.
   environment**: `PATH` (from `[run] path`, or `/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`),
   `HOME`, `LANG`, `TMPDIR`, and the variables the channel or check declares in `env`.
   Nothing else is inherited, so a script that needs a credential must declare the
-  variable (for example `env = { DEPLOY_TOKEN = "{var.deploy_token}" }`). The program is
-  resolved to an absolute path when the plan is made, and that path is part of the plan
-  hash.
+  variable (for example `env = { DEPLOY_TOKEN = "{var.deploy_token}" }`). A probe
+  gets no declared variables unless the channel says so: `probe_env = { NAME = "..." }`
+  gives it its own, and `probe_env = "channel"` gives it the channel's `env` (for a probe
+  that reads a private registry with the deploy credential; the plan marks such a probe
+  `probe (with the channel's env)`). The
+  program is resolved to an absolute path when the plan is made, and that path is part of
+  the plan hash.
 
 ### Per-machine PATH
 
@@ -315,7 +319,51 @@ A deploy runs its checks before the channel's command and records their results.
 are three kinds of gate:
 
 - **Command checks** (`[checks.NAME] run = [...]`): a test suite, a release-candidate
-  gate script. The exit code is the evidence.
+  gate script. The exit code is the evidence. Checks run on the tree of the commit being
+  deployed and nothing else: never in this checkout, even when HEAD has that tree, so
+  untracked and ignored files cannot change the result. The plan binds the commit, the
+  tree, the method that writes it, the directory and the limits.
+  - **When and how.** Only under `--apply`, once the receipt is spent; a dry run writes
+    nothing. Edition writes the files itself from `git ls-tree -r -l` and the raw blobs of
+    `git cat-file --batch`, streamed and with `GIT_NO_LAZY_FETCH=1`. So no checkout
+    happens, and no filter, `.gitattributes` conversion, hook, submodule, LFS download or
+    lazy fetch runs (`git archive` and `git worktree add` both run smudge filters).
+  - **A fresh tree per check.** Every check gets its own copy, compared file by file
+    with the bound tree (exactly: nothing missing, changed or extra) right before it runs,
+    and removed when it ends. Nothing one check writes reaches the next.
+  - **What a tree may hold.** A path component git treats as `.git` (in any case, with
+    trailing dots or spaces, an NTFS stream suffix, as `git~1`, or with the code points
+    HFS+ ignores), a link that is absolute or contains `..`, or two paths that are the same
+    on this file system (by case or Unicode normalisation) refuse the run. A submodule's
+    place is an empty directory. `[check_tree] max_entries` (default 100 000),
+    `max_file_bytes` (256 MiB), `max_total_bytes` (2 GiB) and `max_listing_bytes` (32 MiB,
+    the paths and their metadata; no path may exceed 4096 bytes) refuse a larger tree when
+    the plan is made. The listing is read record by record and stopped at the first excess,
+    so a hostile tree cannot exhaust memory before a limit applies.
+  - **Where.** Outside every repository, in `$XDG_CACHE_HOME/edition/checks` (else
+    `~/.cache/edition/checks`), whose ancestors must belong to you or root and not be
+    writable by others unless sticky, and whose `edition` and `checks` directories are
+    private. A check runs in `<that>/<receipt>-<n>/tree` with `GIT_CEILING_DIRECTORIES`
+    set to the tree's parent, and may not declare `GIT_DIR`, `GIT_WORK_TREE` or any other
+    variable that points git at a repository or configuration. The tree has no `.git`,
+    so `git` in a check finds no repository at all: a check cannot read history, tags or
+    other commits, and one that needs them cannot be an Edition check (run it in CI on
+    the tag instead).
+  - **Ownership.** One lock, `<that>/.lock`, is held while a tree's directory is created
+    and while stale ones are swept. The directory is made with `mkdir`, which fails if
+    anything is there: a link, a leftover worktree or any other directory refuses the run
+    and is left alone. Only then is an ownership marker naming the directory written in
+    it, and locked while the check runs. A run that was killed leaves its directory; the
+    next run removes it only if its marker names it and is not locked. A directory with no
+    valid marker is never removed. These are advisory locks, which are unreliable on NFS
+    and some other network file systems: keep the cache directory on a local file system.
+
+  Every check starts in a fresh directory, every time. A check that needs installed
+  dependencies (`node_modules`, a build cache) must set them up itself, and a build tool
+  that keys its cache on the source path (cargo's `target/`, SwiftPM's `.build`, Gradle's
+  project cache) rebuilds the project's own code on every run. Pointing it at a cache
+  outside the tree (`CARGO_TARGET_DIR`, `GRADLE_USER_HOME`, an npm cache) in the check's
+  `env` still saves the dependencies.
 - **The parity gate** (`kind = "parity"`): Edition asks Concordance
   (`concordance track --format json`) for the release that matches the version and
   refuses while any item the release carries is not ready on the platforms the release
@@ -329,9 +377,12 @@ are three kinds of gate:
 ### Platforms
 
 `[platforms.NAME]` lists what the product ships: `ios`, `android`, `home`, `js`. The
-version is shared; each platform may declare a build-number file and pattern. A channel
-names its platform; `status` shows, for each tier, the version and build each platform
-holds, side by side, from the ledger. When a Concordance catalog is configured, each
+version is shared; each platform may declare a build-number file and pattern. With a
+Concordance catalog configured, a staging or prod deploy of a platform needs a build label,
+from `--build` or the platform's build file. A library has no build number: a channel of
+`kind = "registry"` (Maven, npm, crates.io) takes the release version as its build when
+neither gives one, and the plan says so. A channel names its platform; `status` shows,
+for each tier, the version and build each platform holds, side by side, from the ledger. When a Concordance catalog is configured, each
 staging or prod deploy of a platform records the build with
 `concordance log uploaded <release> --platform <p> --build <b> --commit <sha>`, keyed by
 the ledger entry so a retry never records it twice.
@@ -504,7 +555,7 @@ offset. Edition never reads it back.
 | `[[version_files]] path`, `pattern`, `after` | where the version is stated |
 | `[platforms.P] build_file`, `build_pattern`, `concordance` | per-platform build number; the platform's name in Concordance |
 | `[checks.C] kind`, `run`, `env`, `note` | `command` or `parity` |
-| `[channels.C] tier`, `kind`, `target`, `platform`, `checks`, `requires`, `approval`, `allow_prerelease`, `run`, `env`, `probe`, `note` | a place a build can go |
+| `[channels.C] tier`, `kind`, `target`, `platform`, `checks`, `requires`, `approval`, `allow_prerelease`, `run`, `env`, `probe`, `probe_env`, `note` | a place a build can go; `kind = "registry"` publishes a library, whose build is its version |
 | `[repos.R] path`, `remote`, `final_tag` | another repository that pins point into |
 | `[[pins]] name`, `file`, `pattern`, `repo` | a pinned dependency |
 | `[remotes.R] public` | marks a remote for the content check |
@@ -515,12 +566,13 @@ offset. Edition never reads it back.
 | `[run] trust_group_writable` | exact canonical paths of group-writable directories to allow in `path` (for example `/opt/homebrew/bin`); each one in use is printed with the plan and part of its hash |
 | `[run] tool_env` | variables git and gh may inherit, such as `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GPG_TTY`, `GNUPGHOME` |
 | `[receipts] ttl_minutes` | receipt lifetime, 1 to 60 (default 30) |
+| `[check_tree] max_entries`, `max_file_bytes`, `max_total_bytes`, `max_listing_bytes` | limits on the tree checks run on (defaults 100 000 entries, 256 MiB, 2 GiB, 32 MiB of listing) |
 | `[verify] tags_since` | older tags are not checked against version files |
 
-Placeholders in `run`, `probe`, `env` and check commands, each a whole argument or value:
+Placeholders in `run`, `probe`, `env`, `probe_env` and check commands, each a whole argument or value:
 `{commit}` (the verified SHA), `{version}`, `{build}`, `{channel}`, `{target}`,
 `{var.NAME}`. Environment variables Edition reads: `EDITION_ACTOR`, `EDITION_EVENTS`,
-`EDITION_VAR_<NAME>`.
+`EDITION_VAR_<NAME>`, `XDG_CACHE_HOME` and `HOME` (where check trees go).
 
 ## Roadmap
 

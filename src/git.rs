@@ -9,6 +9,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Receives each blob from `Git::cat_blobs`: `(object id, size, a reader of exactly its
+/// raw bytes)`, so a blob is never held whole.
+pub type BlobSink<'a> = dyn FnMut(&str, u64, &mut dyn std::io::Read) -> Result<(), String> + 'a;
+
 /// `(name, commit)` pairs.
 pub type Refs = Vec<(String, String)>;
 
@@ -169,6 +173,123 @@ impl Git {
                 String::from_utf8_lossy(&out.stderr).trim()
             )))
         }
+    }
+
+    /// Runs a read-only command and hands each NUL-terminated record of its output to
+    /// `each` as it arrives, never holding more than one record. A record longer than
+    /// `max_record` bytes, more than `max_total` bytes in all, or an error from `each`
+    /// kills the command and fails. Never fetches a missing object.
+    pub fn stream_nul(
+        &self,
+        args: &[&str],
+        max_record: usize,
+        max_total: u64,
+        each: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        let mut child = self
+            .command(args)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("cannot run git: {e}"))?;
+        let mut out = std::io::BufReader::with_capacity(64 * 1024, child.stdout.take().ok_or("no stdout for git")?);
+        let mut record: Vec<u8> = Vec::new();
+        let mut total: u64 = 0;
+        let result = (|| -> Result<(), String> {
+            loop {
+                let buf = out.fill_buf().map_err(|e| e.to_string())?;
+                if buf.is_empty() {
+                    if !record.is_empty() {
+                        each(&record)?;
+                    }
+                    return Ok(());
+                }
+                let (take, done) = match buf.iter().position(|b| *b == 0) {
+                    Some(i) => (i, true),
+                    None => (buf.len(), false),
+                };
+                total += (take + usize::from(done)) as u64;
+                if total > max_total {
+                    return Err(format!("git {} wrote more than {max_total} bytes", args.first().unwrap_or(&"")));
+                }
+                if record.len() + take > max_record {
+                    return Err(format!("git {} wrote a record over {max_record} bytes", args.first().unwrap_or(&"")));
+                }
+                record.extend_from_slice(&buf[..take]);
+                out.consume(take + usize::from(done));
+                if done {
+                    each(&record)?;
+                    record.clear();
+                }
+            }
+        })();
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        drop(out);
+        let status = child.wait().map_err(|e| e.to_string())?;
+        result?;
+        if !status.success() {
+            return Err(format!("git {} failed", args.join(" ")));
+        }
+        Ok(())
+    }
+
+    /// Streams the raw bytes of each blob, in order, through `each(oid, size, reader)`, with
+    /// `git cat-file --batch`: no filters or conversions, and never a lazy fetch.
+    pub fn cat_blobs(&self, oids: &[String], each: &mut BlobSink<'_>) -> Result<(), String> {
+        use std::io::{BufRead, Read, Write};
+        use std::process::Stdio;
+        if oids.is_empty() {
+            return Ok(());
+        }
+        if let Some(bad) = oids.iter().find(|o| !crate::util::valid_commit(o)) {
+            return Err(format!("{bad:?} is not an object id"));
+        }
+        let mut child = self
+            .command(&["cat-file", "--batch"])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot run git: {e}"))?;
+        let mut stdin = child.stdin.take().ok_or("no stdin for git cat-file")?;
+        let input: String = oids.iter().map(|o| format!("{o}\n")).collect();
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let mut out = std::io::BufReader::new(child.stdout.take().ok_or("no stdout for git cat-file")?);
+        let mut result = Ok(());
+        for want in oids {
+            let mut header = String::new();
+            if out.read_line(&mut header).map_err(|e| e.to_string())? == 0 {
+                result = Err("git cat-file ended early".to_string());
+                break;
+            }
+            let parts: Vec<&str> = header.trim_end().split(' ').collect();
+            let [oid, "blob", size] = parts.as_slice() else {
+                result = Err(format!("object {want} is not a blob here ({})", header.trim_end()));
+                break;
+            };
+            let size: u64 = size.parse().map_err(|_| "unexpected git cat-file output".to_string())?;
+            let mut body = (&mut out).take(size);
+            let r = each(oid, size, &mut body);
+            // Whatever the sink did not read is skipped, never buffered.
+            std::io::copy(&mut body, &mut std::io::sink()).map_err(|e| e.to_string())?;
+            if let Err(e) = r {
+                result = Err(e);
+                break;
+            }
+            let mut nl = [0u8; 1];
+            out.read_exact(&mut nl).map_err(|e| e.to_string())?;
+        }
+        drop(out);
+        let _ = writer.join();
+        let _ = child.wait();
+        result
     }
 
     pub fn ok(&self, args: &[&str]) -> bool {

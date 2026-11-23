@@ -61,42 +61,37 @@ pub fn valid_receipt(s: &str) -> bool {
 
 /// SHA-1 of `data`, hex-encoded (FIPS 180-4). Used only to compute git blob ids.
 pub fn sha1_hex(data: &[u8]) -> String {
-    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
-    let mut msg = data.to_vec();
-    let bits = (data.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+    let mut h = StreamHash::new(false);
+    h.update(data);
+    h.finish()
+}
+
+fn sha1_block(h: &mut [u32; 8], chunk: &[u8]) {
+    let mut w = [0u32; 80];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
     }
-    msg.extend_from_slice(&bits.to_be_bytes());
-    for chunk in msg.chunks(64) {
-        let mut w = [0u32; 80];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e] = h;
-        for (i, wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | (!b & d), 0x5A827999),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
-                _ => (b ^ c ^ d, 0xCA62C1D6),
-            };
-            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = t;
-        }
-        for (x, y) in h.iter_mut().zip([a, b, c, d, e]) {
-            *x = x.wrapping_add(y);
-        }
+    for i in 16..80 {
+        w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
     }
-    h.iter().map(|x| format!("{x:08x}")).collect()
+    let [mut a, mut b, mut c, mut d, mut e] = [h[0], h[1], h[2], h[3], h[4]];
+    for (i, wi) in w.iter().enumerate() {
+        let (f, k) = match i {
+            0..=19 => ((b & c) | (!b & d), 0x5A827999),
+            20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+            40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+            _ => (b ^ c ^ d, 0xCA62C1D6),
+        };
+        let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
+        e = d;
+        d = c;
+        c = b.rotate_left(30);
+        b = a;
+        a = t;
+    }
+    for (x, y) in h.iter_mut().zip([a, b, c, d, e]) {
+        *x = x.wrapping_add(y);
+    }
 }
 
 /// Git's blob id for `text` (what `git hash-object --stdin` prints in a SHA-1 repository).
@@ -108,50 +103,106 @@ pub fn git_blob_id(text: &str) -> String {
 
 /// SHA-256 of `data`, hex-encoded (FIPS 180-4).
 pub fn sha256_hex(data: &[u8]) -> String {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98,
-        0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8,
-        0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819,
-        0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut h: [u32; 8] =
-        [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-    let mut msg = data.to_vec();
-    let bits = (data.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+    let mut h = StreamHash::new(true);
+    h.update(data);
+    h.finish()
+}
+
+const K256: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98,
+    0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+    0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8,
+    0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819,
+    0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+    0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+    0xc67178f2,
+];
+
+fn sha256_block(h: &mut [u32; 8], chunk: &[u8]) {
+    let mut w = [0u32; 64];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
     }
-    msg.extend_from_slice(&bits.to_be_bytes());
-    for chunk in msg.chunks(64) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let mut v = h;
-        for i in 0..64 {
-            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
-            let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
-            let t1 = v[7].wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
-            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
-            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
-            let t2 = s0.wrapping_add(maj);
-            v = [t1.wrapping_add(t2), v[0], v[1], v[2], v[3].wrapping_add(t1), v[4], v[5], v[6]];
-        }
-        for (a, b) in h.iter_mut().zip(v) {
-            *a = a.wrapping_add(b);
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+    }
+    let mut v = *h;
+    for i in 0..64 {
+        let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+        let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
+        let t1 = v[7].wrapping_add(s1).wrapping_add(ch).wrapping_add(K256[i]).wrapping_add(w[i]);
+        let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+        let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+        let t2 = s0.wrapping_add(maj);
+        v = [t1.wrapping_add(t2), v[0], v[1], v[2], v[3].wrapping_add(t1), v[4], v[5], v[6]];
+    }
+    for (a, b) in h.iter_mut().zip(v) {
+        *a = a.wrapping_add(b);
+    }
+}
+
+/// An incremental SHA-1 or SHA-256, so large inputs are hashed without being held.
+pub struct StreamHash {
+    sha256: bool,
+    h: [u32; 8],
+    buf: Vec<u8>,
+    len: u64,
+}
+
+impl StreamHash {
+    pub fn new(sha256: bool) -> StreamHash {
+        let h = if sha256 {
+            [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+        } else {
+            [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0, 0, 0, 0]
+        };
+        StreamHash { sha256, h, buf: Vec::with_capacity(64), len: 0 }
+    }
+
+    fn block(&mut self, chunk: &[u8]) {
+        if self.sha256 {
+            sha256_block(&mut self.h, chunk)
+        } else {
+            sha1_block(&mut self.h, chunk)
         }
     }
-    h.iter().map(|x| format!("{x:08x}")).collect()
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.len = self.len.wrapping_add(data.len() as u64);
+        if !self.buf.is_empty() {
+            let take = (64 - self.buf.len()).min(data.len());
+            self.buf.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.buf.len() < 64 {
+                return;
+            }
+            let full = std::mem::take(&mut self.buf);
+            self.block(&full);
+        }
+        let (blocks, rest) = data.as_chunks::<64>();
+        for c in blocks {
+            self.block(c);
+        }
+        self.buf.extend_from_slice(rest);
+    }
+
+    pub fn finish(mut self) -> String {
+        let bits = self.len.wrapping_mul(8);
+        let mut tail = std::mem::take(&mut self.buf);
+        tail.push(0x80);
+        while tail.len() % 64 != 56 {
+            tail.push(0);
+        }
+        tail.extend_from_slice(&bits.to_be_bytes());
+        for c in tail.chunks(64) {
+            self.block(c);
+        }
+        let n = if self.sha256 { 8 } else { 5 };
+        self.h[..n].iter().map(|x| format!("{x:08x}")).collect()
+    }
 }
 
 pub fn format_utc(secs: u64) -> String {
@@ -350,6 +401,7 @@ mod tests {
     fn sha256_vectors() {
         assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
         let long = vec![b'a'; 1000];
         assert_eq!(sha256_hex(&long), "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3");
         let r = random_hex(16).expect("random");
@@ -388,5 +440,121 @@ mod tests {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    /// Known answers from tools independent of this code: `shasum -a 1`, `shasum -a 256`
+    /// and `openssl dgst -sha256` (which agree), over `n` bytes of `a`. The 1 000 000-byte
+    /// vectors are also the published FIPS 180 ones.
+    const A_VECTORS: &[(usize, &str, &str)] = &[
+        (
+            0,
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            55,
+            "c1c8bbdc22796e28c0e15163d20899b65621d65a",
+            "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+        ),
+        (
+            56,
+            "c2db330f6083854c99d4b5bfb6e8f29f201be699",
+            "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+        ),
+        (
+            63,
+            "03f09f5b158a7a8cdad920bddc29b81c18a551f5",
+            "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34",
+        ),
+        (
+            64,
+            "0098ba824b5c16427bd7a1122a5a442a25ec644d",
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+        ),
+        (
+            65,
+            "11655326c708d70319be2610e8a57d9a5b959d3b",
+            "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0",
+        ),
+        (
+            119,
+            "ee971065aaa017e0632a8ca6c77bb3bf8b1dfc56",
+            "31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb",
+        ),
+        (
+            120,
+            "f34c1488385346a55709ba056ddd08280dd4c6d6",
+            "2f3d335432c70b580af0e8e1b3674a7c020d683aa5f73aaaedfdc55af904c21c",
+        ),
+        (
+            1_000_000,
+            "34aa973cd4c4daa4f61eeb2bdbad27316534016f",
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+        ),
+    ];
+
+    #[test]
+    fn sha_known_answers_at_the_padding_boundaries() {
+        for (n, sha1, sha256) in A_VECTORS {
+            let data = vec![b'a'; *n];
+            assert_eq!(sha1_hex(&data), *sha1, "sha1 of {n} bytes");
+            assert_eq!(sha256_hex(&data), *sha256, "sha256 of {n} bytes");
+        }
+    }
+
+    #[test]
+    fn sha_known_answers_for_a_multi_megabyte_input() {
+        // (i * 7 + 3) mod 256 for 3 MiB + 17 bytes; digests from shasum.
+        let data: Vec<u8> = (0..(3 * 1024 * 1024 + 17)).map(|i: usize| ((i * 7 + 3) % 256) as u8).collect();
+        assert_eq!(sha1_hex(&data), "61889c7cfef045a8caf53e696db34a5054f2f168");
+        assert_eq!(sha256_hex(&data), "af0420698203db612d2363019e5daab6c288a059aad9a9ee0270be2cd0f5bd4d");
+        for sha256 in [false, true] {
+            let mut h = StreamHash::new(sha256);
+            for c in data.chunks(65_537) {
+                h.update(c);
+            }
+            let want = if sha256 {
+                "af0420698203db612d2363019e5daab6c288a059aad9a9ee0270be2cd0f5bd4d"
+            } else {
+                "61889c7cfef045a8caf53e696db34a5054f2f168"
+            };
+            assert_eq!(h.finish(), want);
+        }
+    }
+
+    #[test]
+    fn sha_updates_split_at_every_offset_around_the_block_boundaries() {
+        // (i * 31 + 5) mod 256 for 200 bytes; digests from shasum.
+        let data: Vec<u8> = (0..200usize).map(|i| ((i * 31 + 5) % 256) as u8).collect();
+        let want = [
+            (false, "4f346e1d048d0b60e1bff62d7a8a608bbf9a26fe"),
+            (true, "650ff77e1121cdbf6069827a5da6a7a1d80ab96bdeb01b64da8a5b22a3be900a"),
+        ];
+        for (sha256, digest) in want {
+            for i in 0..=data.len() {
+                let mut h = StreamHash::new(sha256);
+                h.update(&data[..i]);
+                h.update(&data[i..]);
+                assert_eq!(h.finish(), digest, "split at {i}");
+            }
+            // Three pieces with both cuts near the first two block boundaries.
+            for i in 50..=70 {
+                for j in i..=135.min(data.len()) {
+                    if j < 115 && j != i {
+                        continue;
+                    }
+                    let mut h = StreamHash::new(sha256);
+                    h.update(&data[..i]);
+                    h.update(&data[i..j]);
+                    h.update(&data[j..]);
+                    assert_eq!(h.finish(), digest, "split at {i} and {j}");
+                }
+            }
+            let mut h = StreamHash::new(sha256);
+            for b in &data {
+                h.update(std::slice::from_ref(b));
+            }
+            assert_eq!(h.finish(), digest, "byte by byte");
+        }
     }
 }

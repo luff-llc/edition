@@ -4,6 +4,7 @@
 //! itself; it decides whether a ref may go to a channel, prints the exact commands,
 //! runs them only when asked, and records what happened.
 
+pub mod checktree;
 pub mod cli;
 pub mod commands;
 pub mod concordance;

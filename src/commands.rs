@@ -1196,8 +1196,17 @@ fn cmd_step(
         isolated: true,
         program: std::path::PathBuf::new(),
         dest: None,
+        in_tree: false,
     })
 }
+/// The build label a registry channel takes from its version: only a well-formed final
+/// version (`1.4.0`, never `abc`, `01.2.3`, `1.2.3.4` or `1.4.0-rc.1`) qualifies.
+pub fn registry_build(version: &str) -> Option<String> {
+    let v = Version::parse(version).ok().filter(Version::is_final)?;
+    let label = v.to_string();
+    (label == version && valid_build(&label)).then_some(label)
+}
+
 /// A platform's build number at a commit, from its configured build file.
 fn platform_build(l: &Loaded, git: &Git, platform: &str, commit: &str) -> Option<String> {
     let p = l.cfg.platforms.get(platform)?;
@@ -1272,16 +1281,26 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
             if ch.approval == Approval::Touch { " (the command will also ask for a hardware key touch)" } else { "" }
         ));
     }
-    let build = c.build.clone().or_else(|| ch.platform.as_deref().and_then(|p| platform_build(l, &c.git, p, &commit)));
+    let mut build =
+        c.build.clone().or_else(|| ch.platform.as_deref().and_then(|p| platform_build(l, &c.git, p, &commit)));
     if let Some(b) = &build {
         if !valid_build(b) {
             problems.push(format!("build label {b:?} read from the build file may use only letters, digits and dots"));
         }
     }
+    // A library published to a registry has no build number of its own: its version is
+    // the build, unless --build or a build file says otherwise.
+    if build.is_none() && ch.is_registry() && !dev {
+        if let Some(v) = verdict.version.as_deref().and_then(registry_build) {
+            verdict.notes.push(format!("build: {v} (a registry channel's build is its version)"));
+            build = Some(v);
+        }
+    }
     if ch.platform.is_some() && l.cfg.concordance.is_some() && !dev && build.is_none() {
         problems.push(format!(
-            "channel {channel} ships the {} platform: pass --build <label> (or configure its build_file)",
-            ch.platform.clone().unwrap_or_default()
+            "channel {channel} ships the {} platform: pass --build <label> (or configure its build_file{})",
+            ch.platform.clone().unwrap_or_default(),
+            if ch.is_registry() { "; a registry channel uses the version only when it is a final one" } else { "" }
         ));
     }
     // Readiness gate: channels that must already hold this commit, per the ledger.
@@ -1365,11 +1384,56 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
     for p in &pins {
         plan.fact("pin", &format!("{}={}", p.name, p.commit.clone().unwrap_or_default()));
     }
+    // Checks run on the deployed commit's tree, never on this checkout: Edition writes
+    // that tree into a directory of its own once the receipt is spent (see `checktree`).
+    let has_command_checks = ch.checks.iter().any(|n| l.cfg.checks.get(n).is_some_and(|ck| ck.kind == "command"));
+    let tree_entries = if has_command_checks {
+        let Some(tree) = c.git.tree(&commit) else {
+            return refuse(&[format!("cannot read the tree of {}", short(&commit))]);
+        };
+        let limits = l.cfg.check_tree.limits();
+        let entries = match crate::checktree::list(&c.git, &tree, &limits) {
+            Ok(e) => e,
+            Err(e) => return refuse(&[format!("channel {channel}: the checks cannot run on {}: {e}", short(&commit))]),
+        };
+        let base = match crate::checktree::base_dir() {
+            Ok(b) => b,
+            Err(e) => return refuse(&[e]),
+        };
+        plan.fact("checks-tree", &tree);
+        plan.fact("checks-method", crate::checktree::METHOD);
+        plan.fact("checks-dir", &base.display().to_string());
+        plan.check_tree =
+            Some(steps::CheckTree { commit: commit.clone(), tree, base, limits, listed: entries.clone() });
+        Some(entries)
+    } else {
+        None
+    };
     let built: Result<Vec<Step>, String> = (|| {
         let mut steps = Vec::new();
+        if let Some(ct) = &plan.check_tree {
+            steps.push(Step::note(&format!(
+                "each check runs in a fresh copy of the tree of {} ({}), written by Edition into {}/<receipt>-<n>/tree after the receipt is spent and removed when the check ends; not on this checkout, and without its untracked or ignored files, git metadata (git finds no repository there), submodules or filters",
+                short(&commit),
+                short(&ct.tree),
+                ct.base.display()
+            )));
+        }
         for name in &ch.checks {
             if let Some(ck) = l.cfg.checks.get(name).filter(|ck| ck.kind == "command") {
-                steps.push(cmd_step(c, Kind::Check, &format!("check {name}"), &ck.run, &ck.env, &vals)?);
+                let mut s = cmd_step(c, Kind::Check, &format!("check {name}"), &ck.run, &ck.env, &vals)?;
+                s.in_tree = true;
+                let prog = s.argv.first().cloned().unwrap_or_default();
+                if prog.contains('/') && !std::path::Path::new(&prog).is_absolute() {
+                    let ok = tree_entries.as_ref().is_some_and(|e| crate::checktree::is_executable(e, &prog));
+                    if !ok {
+                        return Err(format!(
+                            "check {name}: {prog} is not an executable file in the tree of {}",
+                            short(&commit)
+                        ));
+                    }
+                }
+                steps.push(s);
             }
         }
         let kind = if dev { Kind::Local } else { Kind::Outward };
@@ -1394,7 +1458,8 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
         }
         steps.push(run);
         if !ch.probe.is_empty() {
-            steps.push(cmd_step(c, Kind::After, "probe", &ch.probe, &std::collections::BTreeMap::new(), &vals)?);
+            let what = if ch.probe_shares_env() { "probe (with the channel's env)" } else { "probe" };
+            steps.push(cmd_step(c, Kind::After, what, &ch.probe, &ch.probe_env(), &vals)?);
         }
         Ok(steps)
     })();
