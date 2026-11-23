@@ -59,17 +59,52 @@ pub struct Entry {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
+    format: Option<u32>,
     #[serde(default)]
     entry: Vec<Entry>,
 }
 
-pub const GENESIS: &str = "0000000000000000000000000000000000000000";
+/// The ledger format this version writes and reads. Format 2 chains entries with
+/// SHA-256 over their canonical text, independent of git's object format. Format 1 (no
+/// marker) chained them with the repository's `git hash-object`; `edition ledger
+/// migrate` re-chains it.
+pub const FORMAT: u32 = 2;
 
-pub const HEADER: &str = "# Edition ledger: what went where. Append-only; written by `edition`, never by hand.\n# A correction is a new entry; see Edition's docs/design.md.\n";
+/// The `prev` of the first entry.
+pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// The first entry's `prev` in format 1.
+pub const GENESIS_V1: &str = "0000000000000000000000000000000000000000";
+
+pub const HEADER: &str = "# Edition ledger: what went where. Append-only; written by `edition`, never by hand.\n# A correction is a new entry; see Edition's docs/design.md.\nformat = 2\n";
+
+/// The format a ledger text declares (`None` for format 1, which has no marker).
+pub fn format_of(text: &str) -> Result<Option<u32>, String> {
+    let f: File = toml::from_str(text).map_err(|e| e.to_string())?;
+    Ok(f.format)
+}
+
+/// Entries from a ledger text or a fragment of one (no format required). An explicit
+/// format other than this version's is refused.
 pub fn parse(text: &str) -> Result<Vec<Entry>, String> {
     let f: File = toml::from_str(text).map_err(|e| e.to_string())?;
-    Ok(f.entry)
+    match f.format {
+        None => Ok(f.entry),
+        Some(FORMAT) => Ok(f.entry),
+        Some(other) => Err(format!("ledger format {other} is not supported by this version of Edition")),
+    }
+}
+
+/// Entries from a whole ledger file, which must declare this version's format.
+pub fn parse_ledger(text: &str) -> Result<Vec<Entry>, String> {
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    match format_of(text)? {
+        Some(FORMAT) => parse(text),
+        Some(other) => Err(format!("ledger format {other} is not supported by this version of Edition")),
+        None => Err("this ledger has no format marker (format 1); run `edition ledger migrate`".into()),
+    }
 }
 
 pub fn load(path: &Path) -> Result<Vec<Entry>, String> {
@@ -151,8 +186,27 @@ pub fn render(e: &Entry) -> String {
 }
 
 /// The chain hash of an entry: Git's blob hash of its canonical rendering.
+/// The chain hash of an entry: SHA-256 of its canonical rendering (format 2).
 pub fn entry_hash(git: &Git, e: &Entry) -> Result<String, String> {
+    let _ = git;
+    Ok(crate::util::sha256_hex(render(e).as_bytes()))
+}
+
+/// Format 1's chain hash: the repository's blob id of the rendering.
+pub fn entry_hash_v1(git: &Git, e: &Entry) -> Result<String, String> {
     git.hash(&render(e))
+}
+
+/// Checks a format 1 chain.
+pub fn check_chain_v1(git: &Git, entries: &[Entry]) -> Result<(), (usize, String)> {
+    let mut prev = GENESIS_V1.to_string();
+    for (i, e) in entries.iter().enumerate() {
+        if e.prev != prev {
+            return Err((i, format!("entry {} ({}) does not follow the entry before it", i + 1, e.id)));
+        }
+        prev = entry_hash_v1(git, e).map_err(|m| (i, m))?;
+    }
+    Ok(())
 }
 
 /// Checks the chain. Returns the first broken link as `(index, message)`.
@@ -169,7 +223,7 @@ pub fn check_chain(git: &Git, entries: &[Entry]) -> Result<(), (usize, String)> 
 
 /// The entry with URL credentials removed from every free-text field: nothing recorded
 /// may carry them.
-fn redacted(e: &Entry) -> Entry {
+pub fn redacted(e: &Entry) -> Entry {
     let r = crate::util::redact;
     let o = |v: &Option<String>| v.as_deref().map(r);
     let l = |v: &[String]| v.iter().map(|x| r(x)).collect::<Vec<_>>();

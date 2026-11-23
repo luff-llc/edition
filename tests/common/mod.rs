@@ -241,3 +241,27 @@ pub fn forge_alias(root: &Path, work: &Path) {
     git(work, &["config", "remote.origin.url", "https://github.com/example/lib.git"]);
     git(work, &["config", &format!("url.{}.insteadOf", origin.display()), "https://github.com/example/lib.git"]);
 }
+
+/// The ledger as last published to origin (empty when nothing was recorded).
+pub fn ledger_text(work: &Path) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(work)
+        .args(["show", "refs/edition/ledger:ledger.toml"])
+        .output()
+        .expect("git");
+    let local = String::from_utf8_lossy(&out.stdout).to_string();
+    let origin = work.parent().map(|r| r.join("origin.git"));
+    let remote = origin
+        .and_then(|o| {
+            Command::new("git").arg("--git-dir").arg(o).args(["show", "edition/ledger:ledger.toml"]).output().ok()
+        })
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    if remote.is_empty() {
+        local
+    } else {
+        remote
+    }
+}

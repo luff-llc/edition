@@ -5,7 +5,6 @@
 product = "quill"
 remote = "origin"
 main = "main"
-ledger = "releases/ledger.toml"
 
 # One version for both platforms. Both files must agree, and must match every tag.
 [[version_files]]

@@ -4,7 +4,6 @@
 product = "inkwell"
 remote = "origin"
 main = "main"
-ledger = "releases/ledger.toml"
 
 [tags]
 final = "v{version}"

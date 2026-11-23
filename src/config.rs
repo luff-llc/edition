@@ -219,6 +219,75 @@ pub struct ConcordanceCfg {
     pub bin: String,
 }
 
+/// Per-machine settings in `.edition/local.toml` (git-ignored, never committed).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalCfg {
+    #[serde(default)]
+    pub run: LocalRun,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalRun {
+    /// Directories put before `[run] path` on this machine only.
+    #[serde(default)]
+    pub path_prepend: Vec<String>,
+    /// Directories put after `[run] path` on this machine only.
+    #[serde(default)]
+    pub path_append: Vec<String>,
+    /// Group-writable directories this machine trusts (same rule as the committed list).
+    #[serde(default)]
+    pub trust_group_writable: Vec<String>,
+}
+
+pub const LOCAL_FILE: &str = ".edition/local.toml";
+
+/// Reads `.edition/local.toml`, if present. The file and its directory must be owned by
+/// the current user, not be links, and not be writable by group or others.
+pub fn load_local(root: &Path) -> Result<Option<LocalCfg>, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let path = root.join(LOCAL_FILE);
+    let Ok(meta) = std::fs::symlink_metadata(&path) else { return Ok(None) };
+    let uid = current_uid()?;
+    for (p, m) in [
+        (
+            path.parent().unwrap_or(root).to_path_buf(),
+            std::fs::symlink_metadata(path.parent().unwrap_or(root)).map_err(|e| e.to_string())?,
+        ),
+        (path.clone(), meta),
+    ] {
+        if m.file_type().is_symlink() || m.uid() != uid || m.permissions().mode() & 0o022 != 0 {
+            return Err(format!(
+                "{} must be owned by you, not a link, and not writable by group or others",
+                p.display()
+            ));
+        }
+    }
+    // It holds this machine's settings only: refuse it if git would commit it.
+    let git = crate::git::Git::new(root);
+    if git.is_repo() {
+        if git.is_tracked(LOCAL_FILE) {
+            return Err(format!(
+                "{LOCAL_FILE} is tracked by git; it is per-machine and must never be committed (git rm --cached it)"
+            ));
+        }
+        if !git.ok(&["check-ignore", "-q", "--", LOCAL_FILE]) {
+            return Err(format!(
+                "{LOCAL_FILE} is not ignored by git; add `.edition/` to .gitignore (or let Edition create .edition/.gitignore)"
+            ));
+        }
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let cfg: LocalCfg = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    for d in &cfg.run.trust_group_writable {
+        if !d.starts_with('/') || d.contains(['*', '?', '[']) {
+            return Err(format!("{}: trust_group_writable {d:?} must be an exact canonical path", path.display()));
+        }
+    }
+    Ok(Some(cfg))
+}
+
 /// How configured commands run.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -258,8 +327,12 @@ pub struct Config {
     pub remote: String,
     #[serde(default = "d_main")]
     pub main: String,
+    /// Where a pre-0.2 in-tree ledger lived; read only by `edition ledger migrate`.
     #[serde(default = "d_ledger")]
     pub ledger: String,
+    /// The orphan branch that holds the ledger.
+    #[serde(default = "d_ledger_branch")]
+    pub ledger_branch: String,
     #[serde(default)]
     pub tags: Tags,
     #[serde(default)]
@@ -315,6 +388,9 @@ fn d_remote() -> String {
 fn d_main() -> String {
     "main".into()
 }
+fn d_ledger_branch() -> String {
+    "edition/ledger".into()
+}
 fn d_ledger() -> String {
     "releases/ledger.toml".into()
 }
@@ -351,10 +427,12 @@ pub struct Loaded {
     pub trusted_dirs: Vec<String>,
     /// Default directories skipped for being group-writable.
     pub skipped_dirs: Vec<String>,
+    /// `PATH` entries added by `.edition/local.toml` on this machine.
+    pub local_dirs: Vec<String>,
 }
 
 /// The effective user id, without libc: the owner of a file this process just created.
-fn current_uid() -> Result<u32, String> {
+pub fn current_uid() -> Result<u32, String> {
     use std::os::unix::fs::MetadataExt;
     static UID: std::sync::OnceLock<Result<u32, String>> = std::sync::OnceLock::new();
     UID.get_or_init(|| {
@@ -545,12 +623,37 @@ impl Loaded {
             run_path: String::new(),
             trusted_dirs: Vec::new(),
             skipped_dirs: Vec::new(),
+            local_dirs: Vec::new(),
         };
         loaded.validate()?;
-        let rp = checked_run_path(loaded.cfg.run.path.as_deref(), &loaded.cfg.run.trust_group_writable)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        loaded.run_path = rp.path;
-        loaded.trusted_dirs = rp.trusted;
+        let local = load_local(&loaded.root)?.unwrap_or_default();
+        let mut trust = loaded.cfg.run.trust_group_writable.clone();
+        trust.extend(local.run.trust_group_writable.iter().cloned());
+        let rp =
+            checked_run_path(loaded.cfg.run.path.as_deref(), &trust).map_err(|e| format!("{}: {e}", path.display()))?;
+        // Local entries follow exactly the same rule as configured ones, and are refused,
+        // never skipped, when they fail it.
+        let local_err = |e: String| format!("{LOCAL_FILE}: {e}");
+        let pre = checked_run_path(Some(&local.run.path_prepend.join(":")), &trust).map_err(local_err)?;
+        let post = checked_run_path(Some(&local.run.path_append.join(":")), &trust).map_err(local_err)?;
+        let mut dirs: Vec<String> = Vec::new();
+        for part in [&pre.path, &rp.path, &post.path] {
+            for d in part.split(':').filter(|d| !d.is_empty()) {
+                if !dirs.iter().any(|x| x == d) {
+                    dirs.push(d.to_string());
+                }
+            }
+        }
+        loaded.local_dirs =
+            pre.path.split(':').chain(post.path.split(':')).filter(|d| !d.is_empty()).map(str::to_string).collect();
+        loaded.run_path = dirs.join(":");
+        let mut trusted = rp.trusted;
+        for t in pre.trusted.into_iter().chain(post.trusted) {
+            if !trusted.contains(&t) {
+                trusted.push(t);
+            }
+        }
+        loaded.trusted_dirs = trusted;
         loaded.skipped_dirs = rp.skipped_group;
         Ok(loaded)
     }
@@ -577,6 +680,33 @@ impl Loaded {
         need(&self.hotfix_branch, &["version"], "lines.hotfix_branch", &mut errs);
         if !matches!(c.tags.prerelease_files.as_str(), "base" | "full") {
             errs.push("tags.prerelease_files must be `base` or `full`".into());
+        }
+        if !crate::util::valid_ref(&c.ledger_branch)
+            || c.ledger_branch == c.main
+            || self.line_branch.matches(&c.ledger_branch).is_some()
+        {
+            errs.push(format!("ledger_branch `{}` must be a branch name of its own", c.ledger_branch));
+        }
+        // Paths in the configuration stay inside the repository: `bump` writes version
+        // files, and `ledger migrate` reads the legacy ledger.
+        let inside = |p: &str| {
+            let path = Path::new(p);
+            !p.is_empty()
+                && path.is_relative()
+                && path.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+        };
+        if !inside(&c.ledger) {
+            errs.push(format!("ledger `{}` must be a relative path inside the repository", c.ledger));
+        }
+        for vf in &c.version_files {
+            if !inside(&vf.path) {
+                errs.push(format!("version_files path `{}` must be a relative path inside the repository", vf.path));
+            }
+        }
+        for p in &c.pins {
+            if !inside(&p.file) {
+                errs.push(format!("pin {}: file `{}` must be a relative path inside the repository", p.name, p.file));
+            }
         }
         if c.product.trim().is_empty() {
             errs.push("product must not be empty".into());

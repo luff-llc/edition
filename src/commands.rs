@@ -25,7 +25,12 @@ pub struct Ctx {
 
 pub type Res = Result<i32, String>;
 
+/// Content findings for a ledger entry: the allowed ones as `(id, description)`, and the
+/// blocking ones as messages.
+type Findings = (Vec<(String, String)>, Vec<String>);
+
 /// A ledger entry to write for the outward step at `index` once the plan has run.
+#[derive(Clone)]
 struct Record {
     index: usize,
     entry: Entry,
@@ -57,22 +62,55 @@ impl Ctx {
 
     /// Binds a plan to the remote's resolved URLs: reads and re-checks go to the fetch
     /// URL, pushes to the push URL, and all three URLs are part of the plan hash.
-    fn bind(&self, plan: &mut Plan, view: &RemoteView) {
+    fn bind(&self, plan: &mut Plan, view: &RemoteView) -> Result<(), String> {
+        let pending = crate::pending::Pending::at(&self.l.root).list()?;
+        if let Some((_, _, entries)) = pending.first() {
+            let what: Vec<String> = entries
+                .iter()
+                .map(|e| format!("{} ({}, {})", e.id, e.channel.as_deref().unwrap_or(&e.action), e.result))
+                .collect();
+            return Err(format!(
+                "an earlier run's outcome is not yet on the ledger: {}. Publish it with `edition ledger reconcile` (or record it as abandoned with `edition ledger reconcile --abandon`) before running another outward plan",
+                what.join(", ")
+            ));
+        }
+        self.bind_unchecked(plan, view)
+    }
+
+    fn bind_unchecked(&self, plan: &mut Plan, view: &RemoteView) -> Result<(), String> {
         plan.remote = view.fetch_url.clone();
         plan.fact("fetch-url", &view.fetch_url);
         plan.fact("push-url", &view.push_url);
         plan.fact("configured-url", &view.raw_url);
+        // The ledger is read from, and will be pushed to, the same remote.
+        self.store().sync(&view.fetch_url)?;
+        plan.record_to = Some((self.l.cfg.ledger_branch.clone(), view.push_url.clone()));
+        Ok(())
     }
 
-    /// Outward plans run from a clean checkout on a branch, so the ledger is committed
-    /// on top of exactly what was checked.
+    pub fn store(&self) -> crate::ledger_store::Store<'_> {
+        crate::ledger_store::Store::new(&self.git, &self.l.cfg.ledger_branch)
+    }
+
+    /// Ledger entries: synchronised with the remote when online, else as last seen.
+    fn entries(&self, view: Option<&RemoteView>) -> Result<Vec<Entry>, String> {
+        if let Some(v) = view.filter(|v| v.online()) {
+            self.store().sync(&v.fetch_url)?;
+        }
+        self.store().load_local()
+    }
+
+    /// Outward plans run from a clean checkout on a branch, so the configuration and
+    /// version files are exactly what was committed.
     fn clean_problems(&self) -> Vec<String> {
         let mut p = Vec::new();
         if self.git.is_detached() {
-            p.push("HEAD is detached; check out a branch before running an outward plan".into());
+            p.push(format!(
+                "HEAD is detached; check out a branch first (a branch at the same commit as the remote tip is enough, for example `git switch -c release-run {}/{}`)",
+                self.l.cfg.remote, self.l.cfg.main
+            ));
         }
-        let ledger = self.l.cfg.ledger.clone();
-        let dirty: Vec<String> = self.git.dirty_paths().into_iter().filter(|d| *d != ledger).collect();
+        let dirty: Vec<String> = self.git.dirty_paths();
         if !dirty.is_empty() {
             p.push(format!("the working tree has uncommitted changes: {}", dirty.join(", ")));
         }
@@ -190,7 +228,7 @@ impl Ctx {
         }
     }
 
-    fn record(&self, e: &Entry) -> Result<Entry, String> {
+    fn record(&self, e: &Entry, plan: &Plan) -> Result<Entry, String> {
         // Nothing that reaches the ledger may carry credentials from a URL.
         let r = crate::util::redact;
         let mut e = e.clone();
@@ -202,7 +240,25 @@ impl Ctx {
         e.target = e.target.as_deref().map(r);
         e.note = e.note.as_deref().map(r);
         let e = &e;
-        let written = ledger::append(&self.git, &self.l.ledger_path(), e)?;
+        let Some((branch, push_url)) = &plan.record_to else {
+            return Err("this plan has no ledger destination".into());
+        };
+        // The ledger branch goes to the same remote: a public one gets the same scan.
+        // Only findings allowed when the plan was made (and so bound in its receipt) may
+        // pass; anything new blocks and the outcome stays pending.
+        // Every finding in the final entry must have been allowed in the plan the receipt
+        // was issued for; an id given on this command line counts for nothing here.
+        let blocked: Vec<String> = self
+            .ledger_finding_list(std::slice::from_ref(e))
+            .into_iter()
+            .filter(|f| !plan.allowed_findings.contains(&f.id))
+            .map(|f| format!("{} {} [{}] {} (not allowed when the plan was made)", f.id, f.place, f.pattern, f.excerpt))
+            .collect();
+        if !blocked.is_empty() {
+            return Err(format!("the ledger entry matches the content deny-list: {}", blocked.join("; ")));
+        }
+        let written = self.store().append(&plan.remote, push_url, e)?;
+        let _ = branch;
         let kind = if e.action == "deploy" { "channel-updated" } else { "ref-published" };
         crate::util::emit_event(
             kind,
@@ -215,12 +271,54 @@ impl Ctx {
                 ("by", &e.by),
             ],
         );
-        crate::say!("recorded {} ({}) in {}", e.id, e.result, self.l.cfg.ledger);
+        crate::say!("recorded {} ({}) on the {} branch", e.id, e.result, self.l.cfg.ledger_branch);
         Ok(written)
     }
 
+    /// Scans ledger entries bound for a public remote. Returns the findings allowed by
+    /// `--allow-finding` as `(id, description)` and the blocking ones as messages. The
+    /// finding's place names the action and channel, not the entry id, so it is the
+    /// same when planned and when applied.
+    /// Every content finding in ledger entries bound for a public remote, with no
+    /// allowance applied.
+    fn ledger_finding_list(&self, entries: &[Entry]) -> Vec<crate::content::Finding> {
+        if !self.l.is_public(&self.l.cfg.remote) {
+            return Vec::new();
+        }
+        let scanner = crate::content::Scanner::new(&self.l);
+        let mut found = Vec::new();
+        for e in entries {
+            let place = format!("ledger entry ({} {})", e.action, e.channel.as_deref().unwrap_or(&e.ref_));
+            // `overrides` is Edition's own record of the findings allowed; it quotes the
+            // patterns, so it is not scanned itself.
+            let mut scanned = ledger::redacted(e);
+            scanned.overrides.clear();
+            for line in ledger::render(&scanned).lines() {
+                scanner.scan_line(&place, line, &mut found);
+            }
+        }
+        crate::content::identify(&self.git, found)
+    }
+
+    fn ledger_findings(&self, plan: &Plan, entries: &[Entry]) -> Result<Findings, String> {
+        let _ = plan;
+        let mut allowed = Vec::new();
+        let mut blocked = Vec::new();
+        for f in self.ledger_finding_list(entries) {
+            if self.allow_findings.contains(&f.id) {
+                allowed.push((f.id.clone(), format!("{} {} [{}]", f.id, f.place, f.pattern)));
+            } else {
+                blocked.push(format!(
+                    "{} {} [{}] {} (allow it for this run with --allow-finding {})",
+                    f.id, f.place, f.pattern, f.excerpt, f.id
+                ));
+            }
+        }
+        Ok((allowed, blocked))
+    }
+
     fn receipt_used(&self) -> impl Fn(&str) -> bool {
-        let entries = ledger::load(&self.l.ledger_path()).unwrap_or_default();
+        let entries = self.store().load_local().unwrap_or_default();
         move |r: &str| entries.iter().any(|e| e.receipt.as_deref() == Some(r))
     }
 
@@ -235,40 +333,125 @@ impl Ctx {
         plan.tool_env = self.git.env.clone();
         plan.trusted_dirs = self.l.trusted_dirs.clone();
         plan.skipped_dirs = self.l.skipped_dirs.clone();
+        plan.local_dirs = self.l.local_dirs.clone();
         if let Err(e) = plan.resolve() {
             return refuse(&[e]);
         }
-        let plan = &plan;
-        match steps::execute(plan, &self.mode, &self.git, &self.l.root, &digest, self.l.receipt_ttl(), &used)? {
-            Ran::DryRun => Ok(0),
-            Ran::Ran { outcomes, receipt, stopped } => {
-                let ran: Vec<String> = outcomes.iter().map(|o| o.describe()).collect();
-                for r in records {
-                    let mut e = r.entry;
-                    let own = outcomes.iter().find(|o| o.index == r.index);
-                    let later_failed = outcomes.iter().any(|o| o.index > r.index && !o.ok());
-                    e.result = match own {
-                        Some(o) if o.ok() && (later_failed || stopped.is_some()) => "partial".into(),
-                        Some(o) if o.ok() => "ok".into(),
-                        _ => "failed".into(),
-                    };
-                    e.command = vec![plan.steps[r.index].description()];
-                    e.steps = ran.clone();
-                    if let Some(why) = &stopped {
-                        e.steps.push(format!("stopped: {why}"));
+        // The prospective ledger entries are scanned while the plan is made, so every
+        // override is part of the receipt.
+        let mut overrides = overrides.to_vec();
+        if plan.record_to.is_some() && !records.is_empty() {
+            let prospective = finalize(&plan, &records, &[], None, None, &overrides, true);
+            match self.ledger_findings(&plan, &prospective) {
+                Ok((allowed, blocked)) => {
+                    if !blocked.is_empty() {
+                        return refuse(&blocked);
                     }
-                    if let Some(r) = &receipt {
-                        e.id = format!("{}/{}", e.id, &r[..8.min(r.len())]);
+                    for (id, text) in allowed {
+                        plan.fact("allowed-ledger-finding", &id);
+                        plan.allowed_findings.push(id);
+                        overrides.push(text);
                     }
-                    e.receipt = receipt.clone();
-                    e.overrides = overrides.to_vec();
-                    self.record(&e)?;
                 }
-                let all_ok = stopped.is_none() && outcomes.iter().all(|o| o.ok());
-                Ok(if all_ok { 0 } else { 1 })
+                Err(e) => return refuse(&[e]),
             }
         }
+        let overrides = &overrides[..];
+        let plan = &plan;
+        let pending = crate::pending::Pending::at(&self.l.root);
+        // Run state is created only once the receipt has been validated and spent (the
+        // first call of `on_step`), and only from that validated receipt. Then it is
+        // rewritten after every step, so an outcome survives a crash or an outage.
+        let records_apply = self.mode.apply && !records.is_empty();
+        let created = std::cell::RefCell::new(None::<String>);
+        let mut on_step = |outcomes: &[steps::Outcome]| -> Result<(), String> {
+            if !records_apply {
+                return Ok(());
+            }
+            let Some(k) = self.mode.confirm.as_deref().filter(|k| crate::util::valid_receipt(k)) else {
+                return Err("no validated receipt for the pending record".into());
+            };
+            pending.write(k, &finalize(plan, &records, outcomes, None, Some(k), overrides, true))?;
+            *created.borrow_mut() = Some(k.to_string());
+            Ok(())
+        };
+        let ran = steps::execute(
+            plan,
+            &self.mode,
+            &self.git,
+            &self.l.root,
+            &digest,
+            self.l.receipt_ttl(),
+            &used,
+            &mut on_step,
+        );
+        let key = created.borrow().clone();
+        let (outcomes, receipt, stopped) = match ran {
+            Err(e) => {
+                // A refused receipt created nothing; a later failure keeps the record.
+                return Err(e);
+            }
+            Ok(Ran::DryRun) => return Ok(0),
+            Ok(Ran::Ran { outcomes, receipt, stopped }) => (outcomes, receipt, stopped),
+        };
+        let entries = finalize(plan, &records, &outcomes, stopped.as_deref(), receipt.as_deref(), overrides, false);
+        if let Some(k) = &key {
+            pending.write(k, &entries)?;
+        }
+        for e in &entries {
+            if let Err(err) = self.record(e, plan) {
+                return Err(format!(
+                    "{err}\nThe outcome is kept in .edition/pending and nothing will be re-run: publish it with `edition ledger reconcile`."
+                ));
+            }
+        }
+        if let Some(k) = &key {
+            pending.remove(k)?;
+        }
+        let all_ok = stopped.is_none() && outcomes.iter().all(|o| o.ok());
+        Ok(if all_ok { 0 } else { 1 })
     }
+}
+
+/// The ledger entries for a run so far. An entry is `ok` when its step and everything
+/// after it succeeded, `partial` when its step succeeded and a later one failed, and
+/// `failed` when its step failed or never ran. While the run is still going
+/// (`in_progress`), an entry whose step has not finished is `unknown`.
+fn finalize(
+    plan: &Plan,
+    records: &[Record],
+    outcomes: &[steps::Outcome],
+    stopped: Option<&str>,
+    receipt: Option<&str>,
+    overrides: &[String],
+    in_progress: bool,
+) -> Vec<Entry> {
+    let ran: Vec<String> = outcomes.iter().map(|o| o.describe()).collect();
+    records
+        .iter()
+        .map(|r| {
+            let mut e = r.entry.clone();
+            let own = outcomes.iter().find(|o| o.index == r.index);
+            let later_failed = outcomes.iter().any(|o| o.index > r.index && !o.ok());
+            e.result = match own {
+                None if in_progress => "unknown".into(),
+                Some(o) if o.ok() && (later_failed || stopped.is_some()) => "partial".into(),
+                Some(o) if o.ok() => "ok".into(),
+                _ => "failed".into(),
+            };
+            e.command = vec![plan.steps[r.index].description()];
+            e.steps = ran.clone();
+            if let Some(why) = stopped {
+                e.steps.push(format!("stopped: {why}"));
+            }
+            if let Some(rc) = receipt {
+                e.id = format!("{}/{}", e.id, &rc[..8.min(rc.len())]);
+            }
+            e.receipt = receipt.map(str::to_string);
+            e.overrides = overrides.to_vec();
+            e
+        })
+        .collect()
 }
 
 fn refuse(problems: &[String]) -> Res {
@@ -285,6 +468,19 @@ pub fn status(c: &Ctx) -> Res {
     let l = &c.l;
     let view = c.view()?;
     crate::say!("Edition: {} ({})", l.cfg.product, l.root.display());
+    for (_, _, entries) in crate::pending::Pending::at(&l.root).list()? {
+        for e in entries {
+            crate::say!(
+                "UNRECONCILED  {} ({}, {}): not yet on the ledger; run `edition ledger reconcile`",
+                e.id,
+                e.channel.as_deref().unwrap_or(&e.action),
+                e.result
+            );
+        }
+    }
+    if !l.local_dirs.is_empty() {
+        crate::say!("local path entries: {}", l.local_dirs.join(", "));
+    }
     let main = &l.cfg.main;
     match view.branch(main) {
         Some(tip) => {
@@ -320,14 +516,21 @@ pub fn status(c: &Ctx) -> Res {
     if !any {
         crate::say!("line   none");
     }
-    let entries = ledger::load(&l.ledger_path())?;
+    let entries = c.entries(Some(&view))?;
     let current = ledger::current_by_channel(&entries);
     crate::say!("\nchannels:");
     for (name, ch) in &l.cfg.channels {
         let held = current
             .iter()
             .find(|(n, _)| n == name)
-            .map(|(_, e)| format!("{} ({}) {}", e.ref_, short(&e.commit), e.at))
+            .map(|(_, e)| {
+                let freshness = match (ch.tier, view.branch(&l.cfg.main)) {
+                    (Tier::Staging, Some(tip)) if tip == e.commit => ", current",
+                    (Tier::Staging, Some(_)) => ", behind main",
+                    _ => "",
+                };
+                format!("{} ({}) {}{freshness}", e.ref_, short(&e.commit), e.at)
+            })
             .unwrap_or_else(
                 || if ch.tier == Tier::Dev { "not recorded (dev)".into() } else { "nothing recorded".into() },
             );
@@ -474,7 +677,7 @@ pub fn bump(c: &Ctx, version: &str) -> Res {
     let mut changes: Vec<(std::path::PathBuf, String, usize)> = Vec::new();
     for vf in &l.cfg.version_files {
         let path = l.root.join(&vf.path);
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let text = crate::safefs::read(&l.root, &vf.path)?;
         let pat = FilePattern::parse(&vf.pattern, &["version"])?;
         let base = changes.iter().rev().find(|(p, _, _)| *p == path).map(|(_, t, _)| t.clone()).unwrap_or(text);
         let (out, n) = pat.replace_all(&base, vf.after.as_deref(), &v.to_string());
@@ -494,7 +697,8 @@ pub fn bump(c: &Ctx, version: &str) -> Res {
         return Ok(0);
     }
     for (p, out, _) in &changes {
-        std::fs::write(p, out).map_err(|e| format!("{}: {e}", p.display()))?;
+        let rel = p.strip_prefix(&l.root).map(|r| r.display().to_string()).unwrap_or_default();
+        crate::safefs::replace(&l.root, &rel, out)?;
     }
     crate::say!("written; review with git diff, then commit (lock files may need regenerating by their tool)");
     Ok(0)
@@ -549,7 +753,9 @@ pub fn cut(c: &Ctx, line: &str) -> Res {
         Err(e) => problems.push(e),
     }
     let mut plan = Plan::new(&format!("Cut the {line} line from {}", short(&from_commit)), &l.cfg.remote);
-    c.bind(&mut plan, &view);
+    if let Err(e) = c.bind(&mut plan, &view) {
+        return refuse(&[e]);
+    }
     let (content, overrides) = c.content_gate(&view, std::slice::from_ref(&from_commit), &mut plan);
     problems.extend(content);
     if !problems.is_empty() {
@@ -700,7 +906,9 @@ fn tag_plan(c: &Ctx, version: &str, pre: bool) -> Res {
     let Some(t) = tag_parts(c, &view, version, pre, &mut problems) else { return refuse(&problems) };
     let title = format!("{} {} at {}", if pre { "Pre-release" } else { "Release" }, t.name, short(&t.commit));
     let mut plan = Plan::new(&title, &c.l.cfg.remote);
-    c.bind(&mut plan, &view);
+    if let Err(e) = c.bind(&mut plan, &view) {
+        return refuse(&[e]);
+    }
     let (content, overrides) = c.content_gate(&view, std::slice::from_ref(&t.commit), &mut plan);
     problems.extend(content);
     if !problems.is_empty() {
@@ -772,7 +980,9 @@ pub fn hotfix_finish(c: &Ctx, version: &str) -> Res {
         return refuse(&[format!("{} has no {} branch", l.cfg.remote, l.cfg.main)]);
     };
     let mut plan = Plan::new(&format!("Finish hotfix {} at {}", t.name, short(&t.commit)), &l.cfg.remote);
-    c.bind(&mut plan, &view);
+    if let Err(e) = c.bind(&mut plan, &view) {
+        return refuse(&[e]);
+    }
     let (content, overrides) = c.content_gate(&view, std::slice::from_ref(&t.commit), &mut plan);
     problems.extend(content);
     if !problems.is_empty() {
@@ -856,7 +1066,9 @@ pub fn forward(c: &Ctx) -> Res {
         return refuse(&[format!("{} has no {} branch", l.cfg.remote, l.cfg.main)]);
     };
     let mut plan = Plan::new("Forward merges", &l.cfg.remote);
-    c.bind(&mut plan, &view);
+    if let Err(e) = c.bind(&mut plan, &view) {
+        return refuse(&[e]);
+    }
     plan.fact("action", "forward");
     let mut records = Vec::new();
     for (name, tip) in &view.branches {
@@ -1059,7 +1271,7 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
     }
     // Readiness gate: channels that must already hold this commit, per the ledger.
     if !ch.requires.is_empty() {
-        let entries = ledger::load(&l.ledger_path())?;
+        let entries = c.entries(Some(&view))?;
         for req in &ch.requires {
             let held = entries.iter().any(|e| {
                 e.action == "deploy"
@@ -1115,7 +1327,9 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
     let title = format!("Deploy {r} ({}) to {channel} [{} tier, {}]", short(&commit), ch.tier.name(), ch.target);
     let mut plan = Plan::new(&title, &l.cfg.remote);
     if !dev {
-        c.bind(&mut plan, &view);
+        if let Err(e) = c.bind(&mut plan, &view) {
+            return refuse(&[e]);
+        }
     }
     for (k, v) in [
         ("action", "deploy"),
@@ -1195,7 +1409,7 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
         }
     }
     if !dev {
-        steps_list.push(Step::note(&format!("append an entry to {}", l.cfg.ledger)));
+        steps_list.push(Step::note(&format!("append an entry to the {} branch", l.cfg.ledger_branch)));
     }
     plan.steps = steps_list;
     if dev {
@@ -1230,7 +1444,8 @@ pub fn deploy(c: &Ctx, channel: &str, r: &str) -> Res {
 /// commit must carry a release tag; promote never tags anything itself.
 pub fn promote(c: &Ctx, from: &str, to: &str) -> Res {
     let l = &c.l;
-    let entries = ledger::load(&l.ledger_path())?;
+    let view = c.view()?;
+    let entries = c.entries(Some(&view))?;
     let current = ledger::current_by_channel(&entries);
     let Some((_, held)) = current.iter().find(|(n, _)| n == from) else {
         return refuse(&[format!("the ledger records nothing on {from}")]);
@@ -1268,7 +1483,8 @@ pub fn promote(c: &Ctx, from: &str, to: &str) -> Res {
 // ---------------------------------------------------------------- ledger
 
 pub fn ledger_cmd(c: &Ctx, channel: Option<&str>) -> Res {
-    let entries = ledger::load(&c.l.ledger_path())?;
+    let view = c.view()?;
+    let entries = c.entries(Some(&view))?;
     let mut n = 0;
     for e in entries.iter().filter(|e| channel.is_none_or(|ch| e.channel.as_deref() == Some(ch))) {
         n += 1;
@@ -1284,7 +1500,7 @@ pub fn ledger_cmd(c: &Ctx, channel: Option<&str>) -> Res {
         );
     }
     if n == 0 {
-        crate::say!("(no entries in {})", c.l.cfg.ledger);
+        crate::say!("(no entries on the {} branch)", c.l.cfg.ledger_branch);
     }
     Ok(0)
 }
@@ -1325,4 +1541,200 @@ pub fn hooks_install(c: &Ctx) -> Res {
     }
     crate::say!("installed");
     Ok(0)
+}
+
+// ---------------------------------------------------------------- ledger migrate
+
+/// Moves an in-tree ledger file (from before the ledger branch) to the ledger branch:
+/// one commit per entry, published with a push that requires the branch to be absent.
+pub fn ledger_migrate(c: &Ctx) -> Res {
+    let l = &c.l;
+    let file = l.root.join(&l.cfg.ledger);
+    let _ = &file;
+    let text = crate::safefs::read(&l.root, &l.cfg.ledger)
+        .map_err(|e| format!("there is no in-tree ledger to migrate at {} ({e})", l.cfg.ledger))?;
+    let format = ledger::format_of(&text).map_err(|e| format!("{}: {e}", l.cfg.ledger))?;
+    let entries = ledger::parse(&text).map_err(|e| format!("{}: {e}", l.cfg.ledger))?;
+    let checked = match format {
+        None => ledger::check_chain_v1(&c.git, &entries),
+        Some(_) => ledger::check_chain(&c.git, &entries),
+    };
+    if let Err((_, m)) = checked {
+        return refuse(&[format!("{}: the hash chain is broken ({m}); it cannot be migrated as it is", l.cfg.ledger)]);
+    }
+    // Format 1 chained entries with git object hashes; format 2 uses SHA-256. Entries
+    // keep everything but `prev`, which is re-derived, and a final entry records that.
+    let mut entries = entries;
+    let mut prev = ledger::GENESIS.to_string();
+    for e in entries.iter_mut() {
+        e.prev = prev.clone();
+        prev = ledger::entry_hash(&c.git, e)?;
+    }
+    if format.is_none() && !entries.is_empty() {
+        let at = now_utc();
+        entries.push(Entry {
+            id: format!("{at}/migrate/{}", &crate::util::sha256_hex(text.as_bytes())[..10]),
+            at,
+            by: c.by.clone(),
+            action: "migrate".into(),
+            product: l.cfg.product.clone(),
+            ref_: l.cfg.ledger_branch.clone(),
+            commit: c.git.resolve("HEAD").unwrap_or_default(),
+            result: "ok".into(),
+            prev: prev.clone(),
+            note: Some(format!(
+                "re-chained {} entries from ledger format 1 (git object hashes) to format 2 (SHA-256); in-tree ledger sha256 {}",
+                entries.len(),
+                crate::util::sha256_hex(text.as_bytes())
+            )),
+            ..Entry::default()
+        });
+    }
+    let mut problems = c.input_problems();
+    problems.extend(c.clean_problems());
+    let view = c.live_view()?;
+    let branch = l.cfg.ledger_branch.clone();
+    if view.branch(&branch).is_some() {
+        problems.push(format!("{} already has a {branch} branch; nothing to migrate onto", view.remote));
+    }
+    if !problems.is_empty() {
+        return refuse(&problems);
+    }
+    let staging = "refs/edition/ledger-migrate";
+    let mut plan = Plan::new(
+        &format!("Move {} ledger entries from {} to the {branch} branch", entries.len(), l.cfg.ledger),
+        &l.cfg.remote,
+    );
+    plan.remote = view.fetch_url.clone();
+    plan.fact("fetch-url", &view.fetch_url);
+    plan.fact("push-url", &view.push_url);
+    plan.fact("ledger-sha256", &crate::util::sha256_hex(text.as_bytes()));
+    plan.steps = vec![
+        Step::note(&format!(
+            "build {branch} locally: one commit per entry{}",
+            if format.is_none() {
+                ", re-chained from format 1 with SHA-256, plus an entry recording the migration"
+            } else {
+                ""
+            }
+        )),
+        c.git_step(
+            Kind::Outward,
+            &format!("publish {branch}"),
+            &[
+                "push",
+                "--atomic",
+                &format!("--force-with-lease=refs/heads/{branch}:"),
+                &view.push_url,
+                &format!("{staging}:refs/heads/{branch}"),
+            ],
+        )
+        .expecting(&format!("refs/heads/{branch}"), None)
+        .to(&view.push_url),
+        Step::note(&format!("then remove {} in an ordinary commit", l.cfg.ledger)),
+    ];
+    if c.mode.apply {
+        c.store().build_history(&entries, staging)?;
+    }
+    let code = c.run(&plan, Vec::new(), &[])?;
+    if c.mode.apply && code == 0 {
+        if let Some(tip) = c.git.resolve(staging) {
+            c.git.run(&["update-ref", crate::ledger_store::CACHE, &tip])?;
+        }
+        crate::say!("migrated; remove {} from the tree in an ordinary commit", l.cfg.ledger);
+    }
+    Ok(code)
+}
+
+// ---------------------------------------------------------------- ledger reconcile
+
+/// Publishes outcomes kept in `.edition/pending` without running anything again. With
+/// `abandon`, they are published with the result `abandoned`.
+pub fn ledger_reconcile(c: &Ctx, abandon: bool) -> Res {
+    let l = &c.l;
+    let pending = crate::pending::Pending::at(&l.root);
+    let runs = pending.list()?;
+    if runs.is_empty() {
+        crate::say!("Nothing is pending.");
+        return Ok(0);
+    }
+    let mut problems = c.input_problems();
+    problems.extend(c.clean_problems());
+    let view = c.live_view()?;
+    if !problems.is_empty() {
+        return refuse(&problems);
+    }
+    let count: usize = runs.iter().map(|(_, _, e)| e.len()).sum();
+    let verb = if abandon { "Record as abandoned" } else { "Publish" };
+    let mut plan = Plan::new(&format!("{verb} {count} pending ledger outcome(s)"), &l.cfg.remote);
+    if let Err(e) = c.bind_unchecked(&mut plan, &view) {
+        return refuse(&[e]);
+    }
+    plan.fact("abandon", if abandon { "yes" } else { "no" });
+    // What will be published, decided now so the scan and its overrides are part of
+    // the receipt.
+    let mut publish: Vec<(String, Vec<Entry>)> = Vec::new();
+    for (key, _, entries) in &runs {
+        let mut out = Vec::new();
+        for e in entries {
+            let mut e = e.clone();
+            if abandon {
+                e.note = Some(format!("abandoned: the outcome was {} when Edition stopped", e.result));
+                e.result = "abandoned".into();
+                e.id = format!("{}/abandoned", e.id);
+            } else if e.result == "unknown" {
+                e.note = Some("Edition stopped before this step finished; its effect is unknown".into());
+            }
+            out.push(e);
+        }
+        publish.push((key.clone(), out));
+    }
+    let all: Vec<Entry> = publish.iter().flat_map(|(_, es)| es.clone()).collect();
+    let (allowed, blocked) = match c.ledger_findings(&plan, &all) {
+        Ok(x) => x,
+        Err(e) => return refuse(&[e]),
+    };
+    if !blocked.is_empty() {
+        return refuse(&blocked);
+    }
+    let override_text: Vec<String> = allowed.iter().map(|(_, t)| t.clone()).collect();
+    for (id, _) in &allowed {
+        plan.fact("allowed-ledger-finding", id);
+        plan.allowed_findings.push(id.clone());
+    }
+    for (key, text, entries) in &runs {
+        plan.fact("pending", &format!("{key} {}", crate::util::sha256_hex(text.as_bytes())));
+        for e in entries {
+            plan.steps.push(Step::note(&format!(
+                "{} {} ({}, {})",
+                if abandon { "abandon" } else { "publish" },
+                e.id,
+                e.channel.as_deref().unwrap_or(&e.action),
+                e.result
+            )));
+        }
+    }
+    let digest = c.config_digest()?;
+    let used = c.receipt_used();
+    plan.run_path = l.run_path();
+    plan.tool_env = c.git.env.clone();
+    let mut no_steps = |_: &[steps::Outcome]| -> Result<(), String> { Ok(()) };
+    match steps::execute(&plan, &c.mode, &c.git, &l.root, &digest, l.receipt_ttl(), &used, &mut no_steps)? {
+        Ran::DryRun => Ok(0),
+        Ran::Ran { .. } => {
+            for (key, entries) in &publish {
+                for e in entries {
+                    let mut e = e.clone();
+                    for t in &override_text {
+                        if !e.overrides.contains(t) {
+                            e.overrides.push(t.clone());
+                        }
+                    }
+                    c.record(&e, &plan)?;
+                }
+                pending.remove(key)?;
+            }
+            Ok(0)
+        }
+    }
 }

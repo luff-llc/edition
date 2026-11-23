@@ -200,6 +200,13 @@ pub struct Plan {
     /// Default `PATH` directories skipped for being group-writable (named when a program
     /// is not found).
     pub skipped_dirs: Vec<String>,
+    /// Where the ledger entry is published: `(branch, push URL)`. The push is a
+    /// compare-and-swap on that branch, run after the plan's steps.
+    pub record_to: Option<(String, String)>,
+    /// Per-machine `PATH` entries from `.edition/local.toml` (printed and hashed).
+    pub local_dirs: Vec<String>,
+    /// Content findings in the prospective ledger entries that this plan allows.
+    pub allowed_findings: Vec<String>,
 }
 
 impl Plan {
@@ -231,8 +238,9 @@ impl Plan {
         self.facts.push(format!("{k}={v}"));
     }
 
+    /// A plan is outward if a step leaves the machine or it publishes to the ledger.
     pub fn has_outward(&self) -> bool {
-        self.steps.iter().any(|s| s.kind == Kind::Outward)
+        self.steps.iter().any(|s| s.kind == Kind::Outward) || self.record_to.is_some()
     }
 
     pub fn print(&self) {
@@ -240,8 +248,18 @@ impl Plan {
         if !self.trusted_dirs.is_empty() {
             crate::say!("  trusting group-writable PATH directories: {}", self.trusted_dirs.join(", "));
         }
+        if !self.local_dirs.is_empty() {
+            crate::say!("  local path entries: {}", self.local_dirs.join(", "));
+        }
+        if !self.allowed_findings.is_empty() {
+            crate::say!("  allowing content findings in the ledger entry: {}", self.allowed_findings.join(", "));
+        }
         for s in &self.steps {
             crate::say!("{}", s.display());
+        }
+        if let Some((branch, url)) = &self.record_to {
+            crate::say!("  [OUTWARD] record the outcome on the {branch} branch (compare-and-swap)");
+            crate::say!("      destination: {url}");
         }
     }
 
@@ -253,6 +271,12 @@ impl Plan {
         t.push_str(&format!("config {config_digest}\nremote {}\nrun-path {:?}\n", self.remote, self.run_path));
         for d in &self.trusted_dirs {
             t.push_str(&format!("trusted-group-writable {d:?}\n"));
+        }
+        for d in &self.local_dirs {
+            t.push_str(&format!("local-path {d:?}\n"));
+        }
+        if let Some((branch, url)) = &self.record_to {
+            t.push_str(&format!("record {branch:?} {url:?}\n"));
         }
         for f in &self.facts {
             t.push_str(&format!("fact {f:?}\n"));
@@ -345,6 +369,48 @@ const O_DIRECTORY: i32 = 0o40_000;
 )))]
 compile_error!("Edition knows O_NOFOLLOW and O_DIRECTORY for macOS and Linux x86_64, aarch64 and arm only");
 
+/// Creates (mode 0700) or opens `dir` without following a link, and checks through the
+/// handle that it is a directory owned by the current user that no one else can use.
+pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    if std::fs::symlink_metadata(dir).is_err() {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_DIRECTORY)
+        .open(dir)
+        .map_err(|e| format!("{} must be a private directory, not a link: {e}", dir.display()))?;
+    let m = handle.metadata().map_err(|e| e.to_string())?;
+    let uid = crate::config::current_uid()?;
+    if !m.is_dir() || !private(&m) || m.uid() != uid {
+        return Err(format!("{} must be a private directory (mode 0700) owned by you", dir.display()));
+    }
+    Ok(())
+}
+
+/// Writes `text` to `path` (mode 0600) atomically: a new file beside it, then a rename.
+pub fn write_private(path: &Path, text: &str) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension(format!("tmp-{}", crate::util::random_hex(6)?));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW)
+        .open(&tmp)
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    f.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// `O_NOFOLLOW`, for other modules.
+pub const NOFOLLOW: i32 = O_NOFOLLOW;
+
 fn private(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     meta.permissions().mode() & 0o077 == 0
@@ -426,7 +492,7 @@ impl Receipts {
     /// Validates and spends a receipt under one lock. `used_elsewhere` reports whether
     /// the ledger already records it.
     pub fn redeem(&self, nonce: &str, plan_hash: &str, used_elsewhere: bool) -> Result<(), String> {
-        if nonce.len() != 32 || !nonce.chars().all(|c| c.is_ascii_hexdigit()) {
+        if !crate::util::valid_receipt(nonce) {
             return Err("a receipt is the 32-character value a dry run printed".into());
         }
         let mut f = self.open_locked()?;
@@ -492,6 +558,7 @@ pub fn check_expects(git: &Git, remote: &str, expects: &[Expect]) -> Option<Stri
 
 /// Prints the plan; with `--apply`, runs it. `used_in_ledger` says whether the ledger
 /// already records a receipt.
+#[allow(clippy::too_many_arguments)]
 pub fn execute(
     plan: &Plan,
     mode: &Mode,
@@ -500,6 +567,7 @@ pub fn execute(
     config_digest: &str,
     ttl_minutes: u64,
     used_in_ledger: &dyn Fn(&str) -> bool,
+    on_step: &mut dyn FnMut(&[Outcome]) -> Result<(), String>,
 ) -> Result<Ran, String> {
     plan.print();
     let outward = plan.has_outward();
@@ -523,6 +591,8 @@ pub fn execute(
         };
         receipts.redeem(nonce, &plan.digest(config_digest), used_in_ledger(nonce))?;
         receipt = Some(nonce.to_string());
+        // The receipt is valid and spent: only now may run state be created.
+        on_step(&[])?;
     }
     let mut outcomes = Vec::new();
     let mut stopped = None;
@@ -568,6 +638,10 @@ pub fn execute(
         let o = Outcome { index: i, kind: s.kind, what: s.what.clone(), code };
         let ok = o.ok();
         outcomes.push(o);
+        // The pending record follows every step, so a crash leaves what is known.
+        if let Err(e) = on_step(&outcomes) {
+            crate::warn!("edition: {e}");
+        }
         if !ok {
             crate::warn!("edition: step failed ({}), stopping", s.what);
             break;

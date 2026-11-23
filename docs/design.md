@@ -159,8 +159,38 @@ deploy script must deploy by SHA. The one remaining gap is the forward-merge pul
 request, which names a branch that can move after it is opened; Edition records the head
 SHA it checked in the ledger entry and in the pull request body.
 
-Outward plans also refuse a dirty working tree (other than the ledger) and a detached
-HEAD, so the ledger is committed on top of exactly what was checked.
+Outward plans also refuse a dirty working tree and a detached HEAD, so the configuration
+and version files are exactly what was committed. A branch at the same commit as the
+remote tip is enough.
+
+### Inputs that name files or refs
+
+- `--confirm` must be exactly 32 lowercase hex characters, checked when the arguments
+  are parsed, before the value is used for anything. A refused receipt creates and
+  removes nothing.
+- Receipt state, pending records and `local.toml` live at fixed names under the private
+  `.edition/` directory; pending file names come only from validated receipts, and
+  Edition removes only regular files it created there.
+- `ledger`, `version_files` paths and pin files must be relative paths inside the
+  repository (no `..`, not absolute): `bump` writes version files and `ledger migrate`
+  reads the legacy ledger. Every component of such a path is checked with `lstat` from
+  the repository root and a symbolic link anywhere refuses it; the file is opened with
+  `O_NOFOLLOW`; `bump` writes a new file beside the old one (same mode) and renames it
+  into place, so no write passes through a link. Before and after creating the new file,
+  and just before and just after the rename, it re-checks the path and compares the
+  parent directory's and the new file's device and inode; a change before the rename
+  aborts and removes the new file, and a change seen after it is reported. **Residual:**
+  without `openat`/`renameat` the parent is named by path at each step, so a process that
+  can write to that directory can still swap it in the moments between the last check and
+  the rename; Edition detects that afterwards but cannot prevent it. Concurrent writers to
+  the working tree are outside this boundary. The content scan
+  reads a tracked link as its target text and never follows it.
+- Ledger validation accepts only mode 100644 for `ledger.toml` and rejects any other diff
+  metadata (mode changes, renames, copies, deletions, binary changes).
+- `ledger_branch`, refs and `--at` pass the ref grammar; the ledger branch cannot be
+  `main` or a release line.
+- `EDITION_EVENTS` is the caller's chosen output path; Edition only appends to it and
+  never writes through a link.
 
 ### Commands, placeholders and secrets
 
@@ -185,6 +215,31 @@ HEAD, so the ledger is committed on top of exactly what was checked.
   variable (for example `env = { DEPLOY_TOKEN = "{var.deploy_token}" }`). The program is
   resolved to an absolute path when the plan is made, and that path is part of the plan
   hash.
+
+### Per-machine PATH
+
+A tool that lives in a directory only one machine has (for example `~/.local/bin`) is
+added in `.edition/local.toml`, which is never committed:
+
+```toml
+[run]
+path_prepend = ["~/.local/bin"]
+path_append = []
+trust_group_writable = []
+```
+
+The entries follow exactly the same directory rule as `[run] path`, with this file's
+`trust_group_writable` added to the committed one; a failing entry refuses the
+configuration. The file and `.edition/` must be owned by the user, not be links, and not
+be writable by group or others, and Edition refuses the file if git tracks it or does not
+ignore it (Edition writes `.edition/.gitignore` when it creates the directory). Plans print `local path entries: ...`, and the entries
+are part of the plan hash, so a receipt still binds what will run.
+
+A file, rather than environment variables such as `EDITION_PATH_PREPEND`, because it is
+persistent and visible per checkout, lives in the private state directory with the same
+ownership checks as the receipts, and can carry its own trust list. Edition deliberately
+distrusts ambient environment elsewhere (git, gh and configured commands all run with a
+cleared environment); a PATH that any parent process could extend would undo that.
 
 ### git and gh
 
@@ -258,34 +313,80 @@ detectable.
 
 ### The ledger
 
-`releases/ledger.toml` (configurable) is an append-only list of `[[entry]]` tables, one
-per outward action: `deploy`, `push-branch`, `push-tag`, `open-pr`. Each entry records
-the time, the actor, the channel and tier, the ref and commit, the tree hash, the
-version, platform and build, the result, the receipt, the approval, the step's configured
-command (never expanded values), every step that ran with its exit code, gate evidence,
-every pin with its tag, and any content findings explicitly allowed.
+The ledger is a file, `ledger.toml`, on its own orphan branch (`ledger_branch`, default
+`edition/ledger`), never in the product's history. Keeping it out of `main` matters: the
+staging tier accepts exactly the tip of `main`, so a ledger committed to `main` would move
+`main` with every recorded deploy, leave staging permanently one commit behind, and start
+CI for every record.
 
+It is an append-only list of `[[entry]]` tables, one per outward action: `deploy`,
+`push-branch`, `push-tag`, `open-pr`. Each entry records the time, the actor, the
+channel and tier, the ref and commit, the tree hash, the version, platform and build, the
+result, the receipt, the approval, the step's configured command (never expanded
+values), every step that ran with its exit code, gate evidence, every pin with its tag,
+and any content findings explicitly allowed. Entries are redacted before they are
+written.
+
+- **Writing.** Every plan that records ends with one more outward step, printed with the
+  plan and bound in its receipt: publish the outcome on the ledger branch of the same
+  remote. Edition builds the commit with plumbing (`hash-object`, `mktree`,
+  `commit-tree`), so the checkout is never touched, and pushes it with
+  `--force-with-lease` on the tip it read. If another recorder won the race, Edition
+  re-reads the branch, re-chains the entry and tries again (up to eight times). An entry
+  whose id is already on the branch (a push that was accepted but whose answer was lost)
+  counts as published and is never appended twice; ids embed the run's receipt. A failed
+  or partial action is recorded the same way.
+- **Pending outcomes.** Once the receipt has been validated and spent, and before the
+  first step of a recording plan runs, Edition writes the prospective entries to
+  `.edition/pending/<receipt>.toml` (a private directory, files mode 0600, written
+  atomically without following links; the name comes only from the validated receipt),
+  rewrites them after every step, and removes them once the ledger
+  push succeeds. A step that had not finished when Edition stopped is recorded as
+  `unknown`. If Edition is killed, or the remote cannot be reached or the entry is
+  blocked by the content check, the outcome survives: `status` and `verify` report it as
+  unreconciled, every new outward plan is refused, and `edition ledger reconcile` (a dry
+  run, then the receipt) publishes it without running anything again;
+  `reconcile --abandon` records it as `abandoned` instead.
 - **Results.** `ok`: the step and everything after it succeeded. `partial`: the outward
   step succeeded and a later step (a probe, a Concordance record) failed, or a later
   outward step was stopped. `failed`: the outward step failed, a check before it failed,
   or a remote expectation stopped it.
-- **Hash chain.** Each entry's `prev` is Git's hash of the previous entry's canonical
-  text (the first entry's is all zeros). Appends take a lock (`ledger.toml.lock`), check
-  the existing chain, and refuse to extend a broken one.
-- **History.** `verify` checks the chain, and that along the first-parent history of
-  `main` (then HEAD, then the working copy) every committed version of the ledger is a
-  prefix of the next. An edit, removal or reordering is reported with the first commit
-  that introduced it.
-- **Anchor.** `verify --online` reads the ledger on the remote's default branch and
-  requires the local ledger to extend it; offline it says the anchor is unverified. The
-  anchor is only as strong as that branch: whoever can rewrite the remote default branch
-  can rewrite the ledger. Protect it (no force pushes, required reviews).
+- **Hash chain and format.** The file starts with `format = 2`. Each entry's `prev` is
+  the SHA-256 of the previous entry's canonical text (64 zeros for the first), computed
+  by Edition itself, so the chain is the same in SHA-1 and SHA-256 git repositories. A
+  broken chain is never extended, and a file without the marker or with another format
+  is refused. Format 1 (no marker, chained with the repository's `git hash-object`) is
+  converted by `edition ledger migrate`, which re-chains the entries (keeping everything
+  else) and appends an entry recording the migration.
+- **History.** Each commit on the branch appends one entry; `verify` checks the chain and
+  that along the branch's first-parent history every version is a prefix of the next,
+  naming the first commit that edited, removed or reordered an entry.
+- **Anchor and validation.** Edition keeps the last remote tip it saw in
+  `refs/edition/ledger`. Every outward plan and `verify --online` read the remote branch
+  and refuse a tip that does not descend from it (a force push, a deletion). When the tip
+  has moved, every new first-parent commit is validated as an exact one-entry extension
+  of its parent: the tree holds only `ledger.toml`, the text is the parent's text plus
+  one rendered entry, the entry chains to the one before and repeats no id, and a merge
+  or a second root is refused. A branch seen for the first time is validated from its
+  first commit, which must start at the genesis value. A missing or unreadable file fails
+  closed, and the refusal names the commit. Validation reads one `git log -p` stream and
+  checks each commit's appended lines against a running chain state, so its cost is
+  linear: a first sync of a 5,000-entry branch took about 4.6 s in a debug build on an
+  Apple-silicon laptop (`validation_cost_for_5000_entries`, run with `--ignored`). Offline, `verify` says the anchor is
+  unverified. The anchor is only as strong as the remote: protect the ledger branch
+  against force pushes and deletion.
+- **Reading.** `status`, `ledger`, `promote` and the `requires` gate read the branch
+  (synchronised first when the remote is read, as it always is for outward plans).
 - Dev-tier deploys are never recorded.
 - `verify` checks every successful entry: its commit is reachable from the remote; a
   staging entry's commit is on `main`; a prod entry's ref is a release tag at that commit.
-- "What is deployed where" is the latest successful entry per channel.
-
-The ledger is committed with the repository's other changes, through its normal review.
+- "What is deployed where" is the latest successful entry per channel; `status` also says
+  whether each staging channel is current with `main`.
+- **Migration.** A repository with an in-tree ledger file (`ledger`, default
+  `releases/ledger.toml`) gets a warning from `verify`; `edition ledger migrate` (a dry run
+  first, then the receipt) publishes it as the ledger branch, one commit per entry, with a
+  push that requires the branch not to exist. Remove the file afterwards in an ordinary
+  commit.
 
 ### Content check
 
@@ -314,6 +415,15 @@ in `[content] allow_paths` or it is allowed by id for one run.
   not on a release tag.
 - **`verify`** scans the tracked tree and commits not yet on each public remote, and
   fails on a finding when the action is `block`.
+- **The ledger branch** is pushed to the same remote. Its entries carry configuration
+  and user text (targets, notes), so for a public remote the prospective entry is
+  scanned while the plan is made (for every recording plan and for `ledger reconcile`).
+  A finding refuses the plan unless it is allowed by id with `--allow-finding`; allowed
+  findings are printed with the plan, part of its hash, and recorded in the entry. The
+  final entry is scanned again before the push, and a finding that was not allowed when
+  the plan was made blocks it; the outcome stays pending. At that point an id given on
+  the command line counts for nothing: only the allowances bound in the receipt do. The
+  entry's own `overrides` list (which quotes the allowed patterns) is not scanned.
 
 ## How it fits with other tools
 
@@ -351,7 +461,9 @@ offset. Edition never reads it back.
 
 | Key | Meaning |
 | --- | --- |
-| `product`, `remote`, `main`, `ledger` | product name; the remote (default `origin`); the main branch; the ledger path |
+| `product`, `remote`, `main` | product name; the remote (default `origin`); the main branch |
+| `ledger_branch` | the orphan branch that holds the ledger (default `edition/ledger`) |
+| `ledger` | where an in-tree ledger from before the ledger branch lives, for `edition ledger migrate` (default `releases/ledger.toml`) |
 | `[tags] final`, `prerelease`, `prerelease_files` | tag templates (`v{version}`, `v{version}-rc.{n}`); what version files say at a candidate (`base` or `full`) |
 | `[lines] branch`, `dev_suffix`, `hotfix_branch` | `release/{line}`; `dev`; `hotfix/{version}` |
 | `[[version_files]] path`, `pattern`, `after` | where the version is stated |
