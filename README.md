@@ -138,12 +138,26 @@ app: [examples/library](examples/library/edition.toml) and
 [examples/app](examples/app/edition.toml). Every key is described in
 [docs/design.md](docs/design.md#configuration).
 
+## Authentication
+
+Edition pushes and reads with git and gh as you have set them up:
+
+- HTTPS remotes use git's configured credential helper, from the system, global or
+  repository configuration (for example `osxkeychain` from Homebrew's or Apple's git).
+- SSH remotes use your ssh agent through `SSH_AUTH_SOCK`, which Edition passes through.
+- gh uses its stored login, or a token variable you declare in `[run] tool_env` (such as
+  `GH_TOKEN` or `GH_ENTERPRISE_TOKEN`).
+
+Before git contacts a remote, Edition refuses if any git configuration file it would read
+is writable by group or others or owned by another user, and every plan binds those files
+so an edit between dry run and apply invalidates the receipt.
+
 ## Residual risks
 
 - Same-UID access to receipt state: any process running as you can read and write
   `.edition/`, as it can the repository.
-- Trust in your global git, ssh and credential-helper configuration, which Edition uses
-  as it is.
+- Trust in your system and global git configuration, ssh configuration and credential
+  helpers, which Edition uses as they are.
 - Pull-request heads are mutable: Edition records the head SHA it checked, but the branch
   can move after the pull request is opened.
 - Ledger anchoring depends on a protected remote ledger branch.

@@ -207,6 +207,8 @@ pub struct Plan {
     pub local_dirs: Vec<String>,
     /// Content findings in the prospective ledger entries that this plan allows.
     pub allowed_findings: Vec<String>,
+    /// The audited git configuration this plan was made with (bound through `facts`).
+    pub git_config: crate::gitcfg::Chain,
 }
 
 impl Plan {
@@ -250,6 +252,16 @@ impl Plan {
         }
         if !self.local_dirs.is_empty() {
             crate::say!("  local path entries: {}", self.local_dirs.join(", "));
+        }
+        if !self.git_config.files.is_empty() {
+            let files: Vec<String> =
+                self.git_config.files.iter().map(|f| format!("{} ({})", f.path, f.scope)).collect();
+            crate::say!("  git configuration bound: {}", files.join(", "));
+            if !self.git_config.sensitive.is_empty() {
+                let keys: Vec<String> =
+                    self.git_config.sensitive.iter().map(|(s, k, _)| format!("{k} ({s})")).collect();
+                crate::say!("  git settings bound: {}", keys.join(", "));
+            }
         }
         if !self.allowed_findings.is_empty() {
             crate::say!("  allowing content findings in the ledger entry: {}", self.allowed_findings.join(", "));

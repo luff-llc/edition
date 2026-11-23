@@ -28,6 +28,9 @@ pub const TOOL_VARS: &[&str] = &[
 pub const SAFE_CONFIG: &[&str] =
     &["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.ext.allow=never"];
 
+/// One setting as git reports it: `(scope, origin file if any, key, value)`.
+pub type ConfigSetting = (String, Option<String>, String, String);
+
 /// Names that may never be passed through to git or gh, even when declared.
 pub fn forbidden_tool_var(name: &str) -> bool {
     name.starts_with("GIT_") || matches!(name, "GH_HOST" | "GH_REPO" | "GH_CONFIG_DIR" | "PATH")
@@ -43,7 +46,6 @@ pub fn tool_env(path: &str, declared: &[String]) -> Vec<(String, String)> {
             env.push((k, v));
         }
     }
-    env.push(("GIT_CONFIG_NOSYSTEM".into(), "1".into()));
     env.push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
     env.push(("LC_ALL".into(), "C".into()));
     env
@@ -117,6 +119,30 @@ impl Git {
             .args(["-c", "color.ui=false", "-c", "log.showSignature=false", "-c", "core.pager=cat"])
             .args(args);
         c
+    }
+
+    /// Every effective setting with its scope and origin
+    /// (`git config --list --show-scope --show-origin -z`).
+    pub fn config_settings(&self) -> Result<Vec<ConfigSetting>, String> {
+        let out = self.run(&["config", "--list", "--show-scope", "--show-origin", "-z"])?;
+        let mut v = Vec::new();
+        let fields: Vec<&str> = out.split('\0').collect();
+        let mut i = 0;
+        while i + 2 < fields.len() {
+            let (scope, origin, kv) = (fields[i], fields[i + 1], fields[i + 2]);
+            i += 3;
+            if scope.is_empty() {
+                break;
+            }
+            let (k, val) = kv.split_once('\n').unwrap_or((kv, ""));
+            v.push((
+                scope.to_string(),
+                origin.strip_prefix("file:").map(str::to_string),
+                k.to_string(),
+                val.to_string(),
+            ));
+        }
+        Ok(v)
     }
 
     /// `(fetch URL, push URL, configured URL)` of a remote, after `insteadOf`,

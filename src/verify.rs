@@ -48,6 +48,9 @@ pub fn run(l: &Loaded, online: bool) -> Report {
         }
     };
     if !online {
+        if let Err(e) = crate::gitcfg::audit(&git) {
+            r.warnings.push(format!("{e} (offline, so nothing contacted it)"));
+        }
         r.warnings.push(format!(
             "offline: tags are not checked against {} (pass --online to read it with git ls-remote)",
             l.cfg.remote

@@ -77,7 +77,22 @@ impl Ctx {
         self.bind_unchecked(plan, view)
     }
 
+    /// Binds the audited git configuration chain in the plan: every file's identity
+    /// and every setting that changes how git reaches a remote or signs.
+    fn bind_config(&self, plan: &mut Plan, view: &RemoteView) -> Result<(), String> {
+        let chain = view.config.clone().ok_or("the git configuration was not audited")?;
+        for f in &chain.files {
+            plan.fact("git-config-file", &format!("{} {} {}", f.scope, f.path, f.identity));
+        }
+        for (scope, key, value) in &chain.sensitive {
+            plan.fact("git-config", &format!("{scope} {key}={value}"));
+        }
+        plan.git_config = chain;
+        Ok(())
+    }
+
     fn bind_unchecked(&self, plan: &mut Plan, view: &RemoteView) -> Result<(), String> {
+        self.bind_config(plan, view)?;
         plan.remote = view.fetch_url.clone();
         plan.fact("fetch-url", &view.fetch_url);
         plan.fact("push-url", &view.push_url);
@@ -1608,6 +1623,9 @@ pub fn ledger_migrate(c: &Ctx) -> Res {
     plan.remote = view.fetch_url.clone();
     plan.fact("fetch-url", &view.fetch_url);
     plan.fact("push-url", &view.push_url);
+    if let Err(e) = c.bind_config(&mut plan, &view) {
+        return refuse(&[e]);
+    }
     plan.fact("ledger-sha256", &crate::util::sha256_hex(text.as_bytes()));
     plan.steps = vec![
         Step::note(&format!(

@@ -248,10 +248,45 @@ Edition's own git and gh calls, read-only or outward, are bound the same way:
 - They run with a cleared environment: `PATH` (from `[run] path` or the default), `HOME`,
   `LANG`, `TMPDIR`, `SSH_AUTH_SOCK`, the git author and committer identity variables, and
   only those variables listed in `[run] tool_env` (such as `GH_TOKEN`,
-  `GH_ENTERPRISE_TOKEN`, `GPG_TTY` or `GNUPGHOME`). `GIT_*` variables, `GH_HOST`,
-  `GH_REPO` and `GH_CONFIG_DIR` can never be passed through, so
-  `GIT_DIR`, `GIT_CONFIG_*`, `GIT_SSH_COMMAND` and the like in the caller's environment
-  have no effect. `GIT_CONFIG_NOSYSTEM=1` is set.
+  `GH_ENTERPRISE_TOKEN`, `GPG_TTY` or `GNUPGHOME`). `GIT_*` variables (including
+  `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_COUNT`), `GH_HOST`, `GH_REPO`
+  and `GH_CONFIG_DIR` can never be passed through, so `GIT_DIR`, `GIT_SSH_COMMAND` and
+  the like in the caller's environment have no effect.
+- **Trust base.** Git reads its default system file (for example Homebrew's
+  `/opt/homebrew/etc/gitconfig`, or Apple's git's, where stock macOS setups keep
+  `credential.helper = osxkeychain`), the global file chosen by `HOME`, the repository's
+  own file and every file they include. Before any git operation that can contact a
+  remote or run a helper (`status --online`, `verify --online`, and every outward plan),
+  Edition enumerates that chain explicitly and refuses outright if any file in it is
+  writable by its group or others or owned by a user other than root or you; it does not
+  judge which settings in such a file are harmless. The chain is: the system, global and
+  XDG files as `git var GIT_CONFIG_SYSTEM` and `GIT_CONFIG_GLOBAL` report them for the
+  environment Edition gives git (reported whether or not the files exist; this needs
+  git 2.42 or later, and Edition refuses when git cannot answer); the repository's
+  `config`, and `config.worktree` when `extensions.worktreeConfig` is set; every file
+  `git config --list --show-origin` names (which also catches files such as Apple git's
+  built-in configuration); and, recursively, every `include.path` and `includeIf.*.path`
+  target in each of those files, read with git's own parser
+  (`git config --file F --no-includes --list -z`, so continuation lines, quoting,
+  escapes, comments and CRLF mean exactly what they mean to git; a file git cannot parse
+  fails closed) and resolved as git resolves them (`~/` from `HOME`, relative paths from
+  the including file), so a file that contributes nothing yet is still checked. Every
+  `includeIf` target is audited whatever its condition, so a later change of branch or
+  directory stays inside the boundary. A target that does not exist yet is bound as
+  missing, and refused if the nearest existing directory above it lets others create it.
+  Cyclic includes, chains deeper than git's limit of 10 and unresolvable targets
+  (`%(prefix)/...`) fail closed. Offline, `verify` reports the same problems as
+  warnings.
+- **Binding.** Every outward plan, including ones made only of notes such as
+  `ledger reconcile`, binds the identity of each file in the chain (path, owner, mode,
+  size, modification time and SHA-256 of its contents) and the settings that change how
+  git reaches a remote, authenticates or signs (`url.*`, `credential.*`, `http.*`,
+  `protocol.*`, `include.path`, `includeIf.*.path`, `gpg.program`, `gpg.*.program`,
+  `gpg.format`, `tag.gpgSign`, `commit.gpgSign`, `push.gpgSign`, `user.signingKey`,
+  `core.sshCommand`, `core.gitProxy`, `core.askPass`, `remote.*.url`, `pushurl`, `proxy`,
+  `receivepack`, `uploadpack`). An edit to any file between dry run and apply
+  invalidates the receipt. The plan prints the bound files and the names of the bound
+  settings.
 - Every git call forces `core.hooksPath=/dev/null`, `core.fsmonitor=false` and
   `protocol.ext.allow=never`, and names its subcommand explicitly.
 - When a plan is made, the remote is resolved to its effective fetch and push URLs (after

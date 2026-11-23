@@ -10,6 +10,7 @@ pub mod concordance;
 pub mod config;
 pub mod content;
 pub mod git;
+pub mod gitcfg;
 pub mod ledger;
 pub mod ledger_store;
 pub mod pending;
