@@ -1,0 +1,23 @@
+[package]
+name = "edition"
+description = "Release lines, tags, channels and a deploy ledger for small multi-repo shops"
+version = "0.1.0-dev"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.89"
+publish = false
+
+# Dependencies follow Concordance's policy: few, exact versions, default features off.
+# Edition shells out to `git` and to the tools it orchestrates; it links no network,
+# signing or crypto code.
+[dependencies]
+serde = { version = "=1.0.228", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "=1.0.145", default-features = false, features = ["std"] }
+toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde"] }
+
+[[bin]]
+name = "edition"
+path = "src/main.rs"
+
+[lints.clippy]
+unwrap_used = "deny"

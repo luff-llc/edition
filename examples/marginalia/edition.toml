@@ -1,0 +1,138 @@
+# Example: a suite repository that ships a podcast app ("taupe") on iOS and Android,
+# embeds the Colophon SDK, and keeps its plan in a Concordance catalog.
+#
+# Edition orchestrates the repository's own delivery scripts. It does not sign, upload
+# or hold credentials; those scripts and their approvals stay as they are.
+
+product = "taupe"
+remote = "origin"
+main = "main"
+ledger = "docs/releases/ledger.toml"
+
+[tags]
+# The suite holds several apps, so tags carry the product name.
+final = "taupe-v{version}"
+prerelease = "taupe-v{version}-rc.{n}"
+
+[lines]
+branch = "release/taupe-{line}"
+dev_suffix = "dev"
+
+# One version for both platforms. Both files must agree, and must match every tag.
+[[version_files]]
+path = "apps/suite/metadata/taupe/version.txt"
+pattern = "{version}"
+
+[[version_files]]
+path = "android/taupe/build.gradle.kts"
+pattern = 'versionName = "{version}"'
+
+# Build numbers are per platform. iOS takes its build number on the command line
+# (`--build`); Android reads it from the Gradle file.
+[platforms.ios]
+
+[platforms.android]
+build_file = "android/taupe/build.gradle.kts"
+build_pattern = "versionCode = {build}"
+
+# What a release carries, and its builds, live in Concordance.
+[concordance]
+catalog = "spec/taupe"
+release = "{version}"
+
+# The SDK this app embeds. Production builds must pin the commit of a final
+# Colophon tag that is present on Colophon's remote.
+[repos.colophon]
+path = "../colophon"
+final_tag = "v{version}"
+
+[[pins]]
+name = "colophon-sdk-swift"
+file = "tools/colophon-sdk.sh"
+pattern = "swift_commit={commit}"
+repo = "colophon"
+
+[[pins]]
+name = "colophon-sdk-native"
+file = "tools/colophon-sdk.sh"
+pattern = "native_commit={commit}"
+repo = "colophon"
+
+[remotes.origin]
+public = false
+
+[vars]
+# Path to the unsigned Android App Bundle built from the deployed commit.
+android_aab = ""
+
+[checks.rc-gate]
+run = ["python3", "tools/rc-gate.py", "."]
+note = "The repository's release-candidate gate; prints GREEN or RED with the tree hash."
+
+[checks.parity]
+kind = "parity"
+note = "Every item the release carries is ready on iOS and Android, per Concordance."
+
+# staging: the tip of main, on every platform.
+[channels.testflight-internal]
+tier = "staging"
+kind = "testflight"
+target = "TestFlight internal testers"
+platform = "ios"
+checks = ["rc-gate"]
+run = ["sh", "-c", "python3 tools/release-taupe.py prepare --app taupe --build {build} --commit {commit} && python3 tools/release-taupe.py archive --app taupe --build {build} --platform ios && python3 tools/release-taupe.py export --app taupe --build {build} --platform ios && python3 tools/release-taupe.py upload --app taupe --build {build} --platform ios --confirm"]
+
+[channels.play-internal]
+tier = "staging"
+kind = "play"
+target = "Google Play internal testing"
+platform = "android"
+checks = ["rc-gate"]
+run = ["zsh", "tools/play-publish.sh", "sign-upload", "{var.android_aab}", "--track", "internal"]
+probe = ["zsh", "tools/play-publish.sh", "status"]
+
+# prod: final tags only. Store review builds may use a release candidate.
+[channels.testflight-external]
+tier = "prod"
+kind = "testflight"
+target = "TestFlight external testers"
+platform = "ios"
+allow_prerelease = true
+approval = "owner"
+checks = ["parity"]
+run = ["sh", "-c", "python3 tools/release-taupe.py prepare --app taupe --build {build} --commit {commit} && python3 tools/release-taupe.py archive --app taupe --build {build} --platform ios && python3 tools/release-taupe.py export --app taupe --build {build} --platform ios --app-store-eligible && python3 tools/release-taupe.py upload --app taupe --build {build} --platform ios --app-store-eligible --confirm"]
+
+[channels.play-closed]
+tier = "prod"
+kind = "play"
+target = "Google Play closed testing"
+platform = "android"
+allow_prerelease = true
+approval = "owner"
+checks = ["parity"]
+run = ["zsh", "tools/play-publish.sh", "sign-upload", "{var.android_aab}", "--track", "beta"]
+
+# App Store and Play production releases are submitted by a person in each store's
+# console. These channels record that submission against the exact tag and build,
+# after the same build has been through external testing.
+[channels.app-store]
+tier = "prod"
+kind = "app-store"
+target = "App Store"
+platform = "ios"
+approval = "owner"
+checks = ["parity"]
+requires = ["testflight-external"]
+run = ["true"]
+note = "Records a submission made in App Store Connect."
+
+[channels.play-production]
+tier = "prod"
+kind = "play"
+target = "Google Play production"
+platform = "android"
+approval = "owner"
+checks = ["parity"]
+requires = ["play-closed"]
+run = ["true"]
+note = "Records a release made in the Play Console."

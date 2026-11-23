@@ -1,0 +1,14 @@
+# Edition releases itself with Edition.
+product = "edition"
+
+[[version_files]]
+path = "Cargo.toml"
+after = "[package]"
+pattern = 'version = "{version}"'
+
+[remotes.origin]
+public = true
+
+[content]
+# The scenario tests contain deny-list examples on purpose.
+allow_paths = ["tests/**"]
