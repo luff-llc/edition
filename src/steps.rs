@@ -231,6 +231,9 @@ pub struct Plan {
     pub git_config: crate::gitcfg::Chain,
     /// The tree the `in_tree` steps run on.
     pub check_tree: Option<CheckTree>,
+    /// Lines printed with the plan, such as in-flight work it allows (each one that
+    /// decides anything is also bound through `facts`).
+    pub remarks: Vec<String>,
 }
 
 impl Plan {
@@ -290,6 +293,9 @@ impl Plan {
                     self.git_config.sensitive.iter().map(|(s, k, _)| format!("{k} ({s})")).collect();
                 crate::say!("  git settings bound: {}", keys.join(", "));
             }
+        }
+        for r in &self.remarks {
+            crate::say!("  {r}");
         }
         if !self.allowed_findings.is_empty() {
             crate::say!("  allowing content findings in the ledger entry: {}", self.allowed_findings.join(", "));

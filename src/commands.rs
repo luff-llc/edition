@@ -21,6 +21,8 @@ pub struct Ctx {
     pub note: Option<String>,
     /// Content-check findings explicitly allowed for this run (`--allow-finding`).
     pub allow_findings: Vec<String>,
+    /// In-flight work explicitly left out of this release (`--allow-in-flight`).
+    pub allow_in_flight: Vec<String>,
 }
 
 pub type Res = Result<i32, String>;
@@ -28,6 +30,13 @@ pub type Res = Result<i32, String>;
 /// Content findings for a ledger entry: the allowed ones as `(id, description)`, and the
 /// blocking ones as messages.
 type Findings = (Vec<(String, String)>, Vec<String>);
+
+/// In-flight work for a line. `prs_checked` is `None` offline, `Some(false)` when the
+/// remote names no forge repository.
+struct InFlight {
+    items: Vec<crate::inflight::Item>,
+    prs_checked: Option<bool>,
+}
 
 /// A ledger entry to write for the outward step at `index` once the plan has run.
 #[derive(Clone)]
@@ -180,6 +189,85 @@ impl Ctx {
         }
         if problems.is_empty() {
             plan.fact("content-check", &format!("{} clean", view.remote));
+        }
+        (problems, overrides)
+    }
+
+    /// Everything in flight for `version`'s line: open pull requests (from the forge)
+    /// and the changelog and version files at the line's tip. `Err` when the forge
+    /// cannot be read; the message says so.
+    fn in_flight(&self, view: &RemoteView, version: &Version, line_tip: Option<&str>) -> Result<InFlight, String> {
+        let line = version.line();
+        let released = self.tag_exists(view, &self.l.final_tag_name(&version.to_string()));
+        let mut items = Vec::new();
+        let mut prs_checked = None;
+        if view.online() {
+            match crate::inflight::pull_requests(&self.l, &self.git, view, &line) {
+                Ok(crate::inflight::Prs::Read(prs)) => {
+                    items.extend(prs);
+                    prs_checked = Some(true);
+                }
+                Ok(crate::inflight::Prs::NoForge) => prs_checked = Some(false),
+                Err(e) => return Err(format!("in-flight work for the {line} line cannot be checked: {e}")),
+            }
+        }
+        if let Some(tip) = line_tip {
+            items.extend(crate::inflight::on_line(&self.l, &self.git, tip, version, released));
+        }
+        Ok(InFlight { items, prs_checked })
+    }
+
+    /// Refuses a release while more work for its line is in flight, unless every item
+    /// is named with `--allow-in-flight`. Allowed items are bound in the plan (so in its
+    /// receipt) and returned as ledger overrides. Fails closed when the forge cannot be
+    /// read.
+    fn in_flight_gate(&self, view: &RemoteView, t: &TagParts, plan: &mut Plan) -> (Vec<String>, Vec<String>) {
+        let Ok(version) = Version::parse(&t.version) else { return (Vec::new(), Vec::new()) };
+        let line = version.line();
+        let found = match self.in_flight(view, &version, Some(&t.line_tip)) {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    vec![format!("{e}; the release is refused while it cannot be checked (fail closed)")],
+                    Vec::new(),
+                )
+            }
+        };
+        if found.prs_checked == Some(false) {
+            plan.remarks
+                .push(format!("in-flight pull requests: not checked, {}'s URL names no forge repository", view.remote));
+            plan.fact("in-flight-prs", "no-forge");
+        }
+        let mut problems = Vec::new();
+        let mut overrides = Vec::new();
+        for item in &found.items {
+            if self.allow_in_flight.iter().any(|a| item.allowed_by(a)) {
+                plan.remarks.push(format!("allowing in-flight work: {}", item.what));
+                plan.fact("allowed-in-flight", &item.id);
+                overrides.push(format!("in-flight {} allowed for {}", item.id, t.name));
+            } else {
+                problems.push(format!(
+                    "in flight for {line}: {} (fold it into this release, or leave it out with --allow-in-flight {})",
+                    item.what, item.id
+                ));
+            }
+        }
+        for a in &self.allow_in_flight {
+            if !found.items.iter().any(|i| i.allowed_by(a)) {
+                problems.push(format!("--allow-in-flight {a} names nothing in flight for {line}"));
+            }
+        }
+        if !problems.is_empty() && found.items.iter().any(|i| !self.allow_in_flight.iter().any(|a| i.allowed_by(a))) {
+            problems.insert(
+                0,
+                format!(
+                    "more work is heading for the {line} line, so {} would be replaced right away; fold it in and release the combined tree once",
+                    t.name
+                ),
+            );
+        }
+        if problems.is_empty() {
+            plan.fact("in-flight", &format!("{line} clear"));
         }
         (problems, overrides)
     }
@@ -623,6 +711,35 @@ pub fn plan(c: &Ctx, version: &str) -> Res {
             format!("{} so far, next {}", next - 1, l.pre_tag_name(&v.to_string(), next))
         }
     );
+    // In-flight work for the line: what would replace this release right after it.
+    let mut code = 0;
+    let mut held = false;
+    match c.in_flight(&view, &v, tip.as_deref()) {
+        Ok(f) => {
+            if f.items.is_empty() {
+                crate::say!("  in flight for {line}: nothing");
+            } else {
+                held = true;
+                crate::say!(
+                    "  in flight for {line} (rc, tag and hotfix finish refuse until each is folded in or allowed):"
+                );
+                for i in &f.items {
+                    crate::say!("    {:<22} {}", i.id, i.what);
+                }
+            }
+            match f.prs_checked {
+                None => crate::say!("    pull requests: not checked offline (pass --online to read them with gh)"),
+                Some(false) => {
+                    crate::say!("    pull requests: not checked, {}'s URL names no forge repository", view.remote)
+                }
+                Some(true) => {}
+            }
+        }
+        Err(e) => {
+            crate::say!("  in flight for {line}: {e}");
+            code = 1;
+        }
+    }
     if let Some(m) = view.branch(&l.cfg.main) {
         let since = c.finals_on_line(&view, &format!("{}.{}", v.major, v.minor.saturating_sub(1)));
         if let Some((prev, _)) = since.first() {
@@ -675,10 +792,13 @@ pub fn plan(c: &Ctx, version: &str) -> Res {
     if tip.is_none() {
         crate::say!("    edition cut {line}");
     }
+    if held {
+        crate::say!("    fold the in-flight work into {v} (or name each item with --allow-in-flight)");
+    }
     crate::say!("    edition rc {v}        # optional, for store review builds");
     crate::say!("    edition tag {v}");
     crate::say!("    edition deploy <prod channel> {final_name}");
-    Ok(0)
+    Ok(code)
 }
 
 // ---------------------------------------------------------------- bump
@@ -812,6 +932,8 @@ pub fn cut(c: &Ctx, line: &str) -> Res {
 /// The steps that make and publish a tag, or the reasons they cannot be built.
 struct TagParts {
     name: String,
+    /// The release version (`X.Y.Z`, never a pre-release).
+    version: String,
     commit: String,
     line_branch: String,
     line_tip: String,
@@ -886,7 +1008,7 @@ fn tag_parts(c: &Ctx, view: &RemoteView, version: &str, pre: bool, problems: &mu
         Ok(None) => {}
         Err(e) => problems.push(e),
     }
-    Some(TagParts { name, commit, line_branch: branch, line_tip })
+    Some(TagParts { name, version: v.to_string(), commit, line_branch: branch, line_tip })
 }
 
 fn push_tag_steps(c: &Ctx, t: &TagParts, push_url: &str) -> Vec<Step> {
@@ -924,8 +1046,11 @@ fn tag_plan(c: &Ctx, version: &str, pre: bool) -> Res {
     if let Err(e) = c.bind(&mut plan, &view) {
         return refuse(&[e]);
     }
-    let (content, overrides) = c.content_gate(&view, std::slice::from_ref(&t.commit), &mut plan);
+    let (content, mut overrides) = c.content_gate(&view, std::slice::from_ref(&t.commit), &mut plan);
     problems.extend(content);
+    let (in_flight, allowed) = c.in_flight_gate(&view, &t, &mut plan);
+    problems.extend(in_flight);
+    overrides.extend(allowed);
     if !problems.is_empty() {
         return refuse(&problems);
     }
@@ -998,8 +1123,11 @@ pub fn hotfix_finish(c: &Ctx, version: &str) -> Res {
     if let Err(e) = c.bind(&mut plan, &view) {
         return refuse(&[e]);
     }
-    let (content, overrides) = c.content_gate(&view, std::slice::from_ref(&t.commit), &mut plan);
+    let (content, mut overrides) = c.content_gate(&view, std::slice::from_ref(&t.commit), &mut plan);
     problems.extend(content);
+    let (in_flight, allowed) = c.in_flight_gate(&view, &t, &mut plan);
+    problems.extend(in_flight);
+    overrides.extend(allowed);
     if !problems.is_empty() {
         return refuse(&problems);
     }

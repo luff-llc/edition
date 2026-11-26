@@ -9,7 +9,7 @@ pub const USAGE: &str = "edition: release lines, tags, channels and a deploy led
 
 USAGE
   edition status                         lines, tags, what each channel holds
-  edition plan <X.Y.Z>                   what a release needs; reads Concordance
+  edition plan <X.Y.Z>                   what a release needs and what is still in flight for it
   edition bump <version>                 set every version file (local)
   edition cut <X.Y>                      create release/X.Y from main
   edition rc <X.Y.Z>                     next pre-release tag on the line
@@ -21,7 +21,8 @@ USAGE
   edition promote <from> <to>            deploy what one channel holds to another
   edition check-push <remote> [<url>]    content, version and pin checks for a push
   edition hooks install                  install the pre-push hook that runs check-push
-  edition verify [--online]              check every invariant (exit 1 on error)
+  edition verify [--online]              check every invariant (exit 1 on error); warns about
+                                         a release superseded within days of its tag
   edition ledger [--channel C]           print the ledger (from the ledger branch)
   edition ledger migrate                 move an in-tree ledger file to the ledger branch
   edition ledger reconcile [--abandon]   publish outcomes a crash or outage left unpublished
@@ -40,6 +41,8 @@ OPTIONS
   --note <text>         note recorded in the ledger
   --channel <name>      ledger filter
   --allow-finding <id>  let one named content-check finding through (recorded)
+  --allow-in-flight <ref>  release although this in-flight item (a pull request #N, or
+                        an id `plan` prints) stays out; repeatable, recorded
 
 ENVIRONMENT
   EDITION_ACTOR         recorded actor
@@ -63,6 +66,7 @@ struct Opts {
     note: Option<String>,
     channel: Option<String>,
     allow_findings: Vec<String>,
+    allow_in_flight: Vec<String>,
     abandon: bool,
     pos: Vec<String>,
 }
@@ -91,6 +95,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--note" => o.note = Some(val(a)?),
             "--channel" => o.channel = Some(val(a)?),
             "--allow-finding" => o.allow_findings.push(val(a)?),
+            "--allow-in-flight" => o.allow_in_flight.push(val(a)?),
             "--abandon" => o.abandon = true,
             s if s.starts_with('-') && s != "-" => return Err(format!("unknown option {s}")),
             s => o.pos.push(s.to_string()),
@@ -157,6 +162,7 @@ fn dispatch(o: Opts) -> Result<i32, String> {
         at: o.at.clone(),
         note: o.note.clone(),
         allow_findings: o.allow_findings.clone(),
+        allow_in_flight: o.allow_in_flight.clone(),
     };
     let p = &o.pos;
     let cmd = need(p, 0, "command")?;

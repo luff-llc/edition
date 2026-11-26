@@ -77,6 +77,54 @@ same release. Each is easy to avoid once it is checked, and easy to miss when it
 - `rc` numbers candidates itself. `tag` refuses a version that is not newer than the
   line's latest release.
 
+### In-flight work
+
+A release that is replaced by the next patch as soon as it is tagged costs every
+consumer a second test cycle and, where servers are involved, a second deploy. When the
+second change was already on its way before the first was tagged, the right release was
+one version with both. So Edition holds a release while more work for its line is in
+flight.
+
+For a version `X.Y.Z`, in-flight work is:
+
+- **Open pull requests into `release/X.Y`**, and open pull requests from the line's
+  hotfix branches (`hotfix/X.Y.W`, `hotfix/X.Y-...`, following `[lines] hotfix_branch`)
+  into any base. They are read with
+  `gh pr list --repo <host>/<owner>/<name> --state open` against the repository the
+  remote's URL names, with the same cleared environment and `GH_HOST` binding as every
+  other gh call. A repository with 500 or more open pull requests is refused rather than
+  checked partially.
+- **The changelog at the line's tip** (`changelog`, default `CHANGELOG.md`; absent is
+  fine): a section headed "Unreleased" that has entries (sub-headings alone do not
+  count), and, while `vX.Y.Z` is untagged, a heading naming a later patch of the line
+  (`## 0.5.8`, `## [0.5.8] - ...`), reported as "fold into X.Y.Z".
+- **The version files at the line's tip**, while `vX.Y.Z` is untagged, when they already
+  name a later patch of the line ("fold into X.Y.Z").
+
+`edition plan X.Y.Z` lists every item with its id: `#12` for a pull request,
+`changelog:Unreleased`, `changelog:0.5.8`, `version:0.5.8`. Offline it reads the line and
+says that pull requests were not checked; with `--online` it reads them too, and exits 1
+if they cannot be read.
+
+`edition rc`, `edition tag` and `edition hotfix finish` refuse while the list is
+non-empty, naming each item. Leaving an item out is an explicit decision:
+`--allow-in-flight <id>` (repeatable; `12` and `#12` both name pull request 12) must
+cover every item, and an allowance that names nothing in flight is refused. Each allowed
+id is printed with the plan, bound in its receipt, and recorded in the ledger entry's
+`overrides` (`in-flight #12 allowed for v0.5.7`) with the actor and the `--note`, as
+`--allow-finding` is. The check runs again when the plan is applied, so a pull request
+opened in between refuses the run.
+
+The check fails closed: if gh is missing, not signed in, or cannot reach the forge, the
+release is refused and the reason printed; no allowance gets around it. A remote whose
+URL names no forge repository (a local or self-hosted bare repository) has nowhere for a
+pull request to be open; the plan says that pull requests were not checked, and the
+changelog and version files are still checked.
+
+After the fact, `verify` warns about each final release that the next final release on
+its line superseded within `[verify] superseded_days` (default 7; 0 turns it off) of its
+tag, using the tag dates in the local clone.
+
 ### Tiers and channels
 
 A **channel** is a named place a build can go: a staging server, a production server,
@@ -553,6 +601,7 @@ offset. Edition never reads it back.
 | `[tags] final`, `prerelease`, `prerelease_files` | tag templates (`v{version}`, `v{version}-rc.{n}`); what version files say at a candidate (`base` or `full`) |
 | `[lines] branch`, `dev_suffix`, `hotfix_branch` | `release/{line}`; `dev`; `hotfix/{version}` |
 | `[[version_files]] path`, `pattern`, `after` | where the version is stated |
+| `changelog` | the changelog read for in-flight work (default `CHANGELOG.md`; a relative path inside the repository) |
 | `[platforms.P] build_file`, `build_pattern`, `concordance` | per-platform build number; the platform's name in Concordance |
 | `[checks.C] kind`, `run`, `env`, `note` | `command` or `parity` |
 | `[channels.C] tier`, `kind`, `target`, `platform`, `checks`, `requires`, `approval`, `allow_prerelease`, `run`, `env`, `probe`, `probe_env`, `note` | a place a build can go; `kind = "registry"` publishes a library, whose build is its version |
@@ -567,7 +616,8 @@ offset. Edition never reads it back.
 | `[run] tool_env` | variables git and gh may inherit, such as `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GPG_TTY`, `GNUPGHOME` |
 | `[receipts] ttl_minutes` | receipt lifetime, 1 to 60 (default 30) |
 | `[check_tree] max_entries`, `max_file_bytes`, `max_total_bytes`, `max_listing_bytes` | limits on the tree checks run on (defaults 100 000 entries, 256 MiB, 2 GiB, 32 MiB of listing) |
-| `[verify] tags_since` | older tags are not checked against version files |
+| `[verify] tags_since` | older tags are not checked against version files (nor for being superseded) |
+| `[verify] superseded_days` | warn about a release superseded by the next patch within this many days of its tag (default 7; 0 turns it off) |
 
 Placeholders in `run`, `probe`, `env`, `probe_env` and check commands, each a whole argument or value:
 `{commit}` (the verified SHA), `{version}`, `{build}`, `{channel}`, `{target}`,
