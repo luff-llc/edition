@@ -403,6 +403,9 @@ pub struct ReceiptCfg {
 pub struct VerifyCfg {
     /// Tags older than this version are not checked against version files.
     pub tags_since: Option<String>,
+    /// A release superseded by the next patch on its line within this many days of its
+    /// tag is reported as a warning (default 7; 0 turns the check off).
+    pub superseded_days: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -425,6 +428,9 @@ pub struct Config {
     pub lines: Lines,
     #[serde(default)]
     pub version_files: Vec<VersionFile>,
+    /// The changelog read for in-flight work ("Unreleased" entries, later patches).
+    #[serde(default = "d_changelog")]
+    pub changelog: String,
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
     #[serde(default)]
@@ -469,6 +475,9 @@ fn d_dev_suffix() -> String {
 }
 fn d_hotfix() -> String {
     "hotfix/{version}".into()
+}
+fn d_changelog() -> String {
+    "CHANGELOG.md".into()
 }
 fn d_remote() -> String {
     "origin".into()
@@ -785,6 +794,9 @@ impl Loaded {
         };
         if !inside(&c.ledger) {
             errs.push(format!("ledger `{}` must be a relative path inside the repository", c.ledger));
+        }
+        if !inside(&c.changelog) {
+            errs.push(format!("changelog `{}` must be a relative path inside the repository", c.changelog));
         }
         for vf in &c.version_files {
             if !inside(&vf.path) {

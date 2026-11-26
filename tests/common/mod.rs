@@ -227,13 +227,14 @@ pub fn line_with_version(work: &Path, line: &str, version: &str) -> String {
 }
 
 /// A directory with a fake `gh` that records its arguments and `GH_HOST`, and the
-/// `[run] path` line that puts it first.
+/// `[run] path` line that puts it first. `gh pr list` prints `bin/prs.json` (an empty
+/// list when it is absent) and fails while `bin/gh-offline` exists.
 pub fn fake_gh(root: &Path) -> String {
     let bin = root.join("bin");
     executable(
         &bin,
         "gh",
-        "#!/bin/sh\nprintf 'GH_HOST=%s TOKEN=%s %s\\n' \"$GH_HOST\" \"$GH_ENTERPRISE_TOKEN\" \"$*\" >> \"$(dirname \"$0\")/gh-calls.log\"\n",
+        "#!/bin/sh\nd=\"$(dirname \"$0\")\"\nprintf 'GH_HOST=%s TOKEN=%s %s\\n' \"$GH_HOST\" \"$GH_ENTERPRISE_TOKEN\" \"$*\" >> \"$d/gh-calls.log\"\nif [ \"$1 $2\" = \"pr list\" ]; then\n  if [ -e \"$d/gh-offline\" ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi\n  if [ -e \"$d/prs.json\" ]; then cat \"$d/prs.json\"; else echo '[]'; fi\nfi\n",
     );
     format!("\n[run]\npath = \"{}:/usr/bin:/bin\"\n", bin.display())
 }

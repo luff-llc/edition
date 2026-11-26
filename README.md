@@ -52,13 +52,14 @@ cargo install --path .
 ```
 
 Edition needs `git` on `PATH`. It uses Concordance's CLI when a repository configures a
-catalog, and `gh` for forward-merge pull requests.
+catalog, and `gh` for forward-merge pull requests and to read the pull requests in flight
+for a release line.
 
 ## Use
 
 ```sh
 edition status                         # lines, tags, what each channel and platform holds
-edition plan 0.6.0                     # what the release needs; what Concordance says it carries
+edition plan 0.6.0                     # what the release needs; what is still in flight for 0.6
 edition verify --online                # every invariant; exit 1 on an error
 
 edition deploy staging-home main       # dry run: prints the plan and a receipt
@@ -67,7 +68,8 @@ edition deploy staging-home main --apply --confirm <receipt>
 edition cut 0.6                        # release/0.6 from main (then apply with its receipt)
 edition bump 0.6.0 --apply             # every version file (local only)
 edition rc 0.6.0                       # v0.6.0-rc.1, rc.2, ... rc.10 (numbered numerically)
-edition tag 0.6.0                      # v0.6.0
+edition tag 0.6.0                      # v0.6.0; refused while work for 0.6 is in flight
+edition tag 0.6.0 --allow-in-flight 12 --note "ships in 0.6.1"   # leave one item out (recorded)
 edition deploy production-home v0.6.0 --approved-by <name>
 edition promote staging-home production-home   # what staging holds, if it is tagged
 
@@ -81,6 +83,13 @@ edition ledger migrate                 # move an in-tree ledger file to the ledg
 edition ledger reconcile               # publish an outcome a crash or outage left pending
 edition --version
 ```
+
+A release is held while more work for its line is in flight, so it is not replaced
+the moment it is tagged: `rc`, `tag` and `hotfix finish` refuse while a pull request into
+`release/X.Y` or from one of the line's hotfix branches is open, or while the line's
+changelog has "Unreleased" entries or names a later patch. `plan` lists each item. The
+pull requests are read with gh, and a release is refused when they cannot be read.
+`verify` warns about a release superseded within a week of its tag.
 
 Every plan with outward steps refuses to run from a dirty tree or a detached HEAD, and
 while the remote cannot be read. Read-only commands work offline and say the remote

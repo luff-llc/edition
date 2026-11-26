@@ -351,6 +351,19 @@ impl Git {
             .collect()
     }
 
+    /// When each tag was made: the tagger date of an annotated tag, else the commit date
+    /// (seconds since the epoch).
+    pub fn tag_dates(&self) -> Vec<(String, u64)> {
+        self.run(&["for-each-ref", "--format=%(refname:strip=2) %(creatordate:unix)", "refs/tags/"])
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let (name, secs) = l.rsplit_once(' ')?;
+                Some((name.to_string(), secs.parse().ok()?))
+            })
+            .collect()
+    }
+
     /// File contents at a revision.
     pub fn show(&self, rev: &str, path: &str) -> Option<String> {
         self.run(&["show", &format!("{rev}:{path}")]).ok()

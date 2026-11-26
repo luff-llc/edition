@@ -59,6 +59,7 @@ pub fn run(l: &Loaded, online: bool) -> Report {
     main_version(l, &git, &view, &mut r);
     lines(l, &git, &view, &mut r);
     tag_versions(l, &git, &view, &mut r);
+    superseded(l, &git, &mut r);
     pins(l, &git, online, &mut r);
     ledger_checks(l, &git, &view, &mut r);
     crate::content::verify(l, &git, &mut r);
@@ -193,6 +194,48 @@ fn tag_versions(l: &Loaded, git: &Git, view: &RemoteView, r: &mut Report) {
     }
     if checked > 0 && r.errors.iter().all(|e| !e.starts_with("tag ")) {
         r.ok.push(format!("{checked} release tag(s) agree with the version files"));
+    }
+}
+
+/// Default window for `superseded`: a release replaced by the next patch within a week
+/// of its tag was most likely cut while that patch was already in flight.
+pub const SUPERSEDED_DAYS: u64 = 7;
+
+/// Warns about each final release that the next final release on its line replaced
+/// within `[verify] superseded_days` of its tag, so the pattern is visible afterwards.
+/// Tag dates are the tagger date of annotated tags, else the commit date, from the tags
+/// in this clone.
+fn superseded(l: &Loaded, git: &Git, r: &mut Report) {
+    let days = l.cfg.verify.superseded_days.unwrap_or(SUPERSEDED_DAYS);
+    if days == 0 {
+        return;
+    }
+    let since = l.cfg.verify.tags_since.as_deref().and_then(|s| Version::parse(s).ok());
+    let mut finals: Vec<(Version, String, u64)> = git
+        .tag_dates()
+        .into_iter()
+        .filter_map(|(name, at)| match policy::classify_tag(&l.final_tag, &l.pre_tag, &name) {
+            Some((v, None)) if since.as_ref().is_none_or(|s| v >= *s) => Some((v, name, at)),
+            _ => None,
+        })
+        .collect();
+    finals.sort_by(|a, b| a.0.cmp(&b.0));
+    for pair in finals.windows(2) {
+        let ((old, old_name, old_at), (new, new_name, new_at)) = (&pair[0], &pair[1]);
+        if old.line() != new.line() || new_at < old_at {
+            continue;
+        }
+        let gap = new_at - old_at;
+        if gap < days * 86_400 {
+            let after = match gap / 86_400 {
+                0 => "less than a day".to_string(),
+                1 => "1 day".to_string(),
+                n => format!("{n} days"),
+            };
+            r.warnings.push(format!(
+                "{old_name} was superseded by {new_name} {after} after it was tagged; hold a release while more work for its line is in flight (`edition plan {new}` lists it)"
+            ));
+        }
     }
 }
 
